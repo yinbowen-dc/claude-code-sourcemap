@@ -1,15 +1,21 @@
 /**
- * Plugin option storage and substitution.
+ * 插件选项存储与变量替换模块 — Claude Code 插件配置持久化层
  *
- * Plugins declare user-configurable options in `manifest.userConfig` — a record
- * of field schemas matching `McpbUserConfigurationOption`. At enable time the
- * user is prompted for values. Storage splits by `sensitive`:
- *   - `sensitive: true`  → secureStorage (keychain on macOS, .credentials.json elsewhere)
- *   - everything else    → settings.json `pluginConfigs[pluginId].options`
+ * 在 Claude Code 插件系统中，此文件负责插件用户配置选项的读写和变量替换：
+ *   用户配置选项（manifest.userConfig）→ 按敏感性分流 → 非敏感: settings.json / 敏感: keychain
  *
- * `loadPluginOptions` reads and merges both. The substitution helpers are also
- * here (moved from mcpPluginIntegration.ts) so hooks/LSP/skills don't all
- * import from MCP-specific code.
+ * 存储架构：
+ *   - 非敏感选项（sensitive !== true）→ settings.json 的 pluginConfigs[pluginId].options
+ *   - 敏感选项（sensitive === true）→ secureStorage（macOS 使用 keychain，其他平台使用 .credentials.json）
+ *   - loadPluginOptions 读取时合并两个来源，secureStorage 在键冲突时胜出
+ *
+ * 变量替换：
+ *   - ${CLAUDE_PLUGIN_ROOT}：插件版本化安装目录（更新时重建）
+ *   - ${CLAUDE_PLUGIN_DATA}：插件持久化数据目录（更新后保留）
+ *   - ${user_config.KEY}：用户配置值（MCP/LSP/hook 场景下替换；技能内容场景下敏感值替换为占位符）
+ *
+ * 注意：loadPluginOptions 使用 lodash memoize 按 pluginId 缓存，
+ * /reload-plugins 时通过 clearPluginOptionsCache 清除。
  */
 
 import memoize from 'lodash-es/memoize.js'
@@ -28,70 +34,83 @@ import {
 } from './mcpbHandler.js'
 import { getPluginDataDir } from './pluginDirectories.js'
 
+// 重新导出类型别名，供外部模块使用
 export type PluginOptionValues = UserConfigValues
 export type PluginOptionSchema = UserConfigSchema
 
 /**
- * Canonical storage key for a plugin's options in both `settings.pluginConfigs`
- * and `secureStorage.pluginSecrets`. Today this is `plugin.source` — always
- * `"${name}@${marketplace}"` (pluginLoader.ts:1400). `plugin.repository` is
- * a backward-compat alias that's set to the same string (1401); don't use it
- * for storage. UI code that manually constructs `` `${name}@${marketplace}` ``
- * produces the same key by convention — see PluginOptionsFlow, ManagePlugins.
+ * 获取插件在 settings.json 和 secureStorage 中的存储键。
  *
- * Exists so there's exactly one place to change if the key format ever drifts.
+ * 规则：存储键 = plugin.source，固定格式为 "${name}@${marketplace}"
+ * （由 pluginLoader.ts 的 :1400 行设置）。
+ * plugin.repository 是向后兼容别名，值与 source 相同，但不应用于存储。
+ *
+ * 此函数作为唯一存储键来源，未来若键格式变更只需修改此处。
+ *
+ * @param plugin - 已加载的插件对象
+ * @returns 存储键字符串
  */
 export function getPluginStorageId(plugin: LoadedPlugin): string {
   return plugin.source
 }
 
 /**
- * Load saved option values for a plugin, merging non-sensitive (from settings)
- * with sensitive (from secureStorage). SecureStorage wins on key collision.
+ * 加载插件已保存的配置选项，合并非敏感（来自 settings）和敏感（来自 secureStorage）两个来源。
+ * secureStorage 的值在键冲突时胜出。
  *
- * Memoized per-pluginId because hooks can fire per-tool-call and each call
- * would otherwise do a settings read + keychain spawn. Cache cleared via
- * `clearPluginOptionsCache` when settings change or plugins reload.
+ * 性能优化：使用 lodash memoize 按 pluginId 缓存，避免每次工具调用都重复读取：
+ *   - macOS 上 keychain 读取（security find-generic-password）约 50-100ms（同步阻塞）
+ *   - 每个 pluginId 在会话期间只读取一次
+ *   - /reload-plugins 后通过 clearPluginOptionsCache 强制刷新
  */
 export const loadPluginOptions = memoize(
   (pluginId: string): PluginOptionValues => {
+    // 读取 settings.json 中的非敏感选项
     const settings = getSettings_DEPRECATED()
     const nonSensitive =
       settings.pluginConfigs?.[pluginId]?.options ?? ({} as PluginOptionValues)
 
-    // NOTE: storage.read() spawns `security find-generic-password` on macOS
-    // (~50-100ms, synchronous). Mitigated by the memoize above (per-pluginId,
-    // session-lifetime) + keychain's own 30s TTL cache — so one blocking spawn
-    // per session per plugin-with-options. /reload-plugins clears the memoize
-    // and the next hook/MCP-load after that eats a fresh spawn.
+    // 读取 secureStorage 中的敏感选项
+    // 注意：macOS 上会阻塞约 50-100ms（spawn security 命令）
+    // memoize 保证每个插件每会话只执行一次，不影响性能
     const storage = getSecureStorage()
     const sensitive =
       storage.read()?.pluginSecrets?.[pluginId] ??
       ({} as Record<string, string>)
 
-    // secureStorage wins on collision — schema determines destination so
-    // collision shouldn't happen, but if a user hand-edits settings.json we
-    // trust the more secure source.
+    // 合并两个来源，secureStorage 胜出（更可信的来源）
     return { ...nonSensitive, ...sensitive }
   },
 )
 
+/**
+ * 清除 loadPluginOptions 的 memoize 缓存。
+ * 应在插件重新加载或设置变更后调用。
+ */
 export function clearPluginOptionsCache(): void {
   loadPluginOptions.cache?.clear?.()
 }
 
 /**
- * Save option values, splitting by `schema[key].sensitive`. Non-sensitive go
- * to userSettings; sensitive go to secureStorage. Writes are skipped if nothing
- * in that category is present.
+ * 保存插件配置选项，按敏感性分流到不同存储后端。
  *
- * Clears the load cache on success so the next `loadPluginOptions` sees fresh.
+ * 保存流程：
+ *   1. 按 schema[key].sensitive 将 values 分为 sensitive 和 nonSensitive 两组
+ *   2. 计算需要从另一存储中清除的键（防止配置漂移）
+ *   3. 先写 secureStorage（keychain 失败时不污染 settings.json）
+ *   4. 再写 settings.json（用 undefined 值标记待删除的敏感键）
+ *   5. 清除 memoize 缓存，使下次读取获取最新数据
+ *
+ * @param pluginId - 插件存储键（来自 getPluginStorageId）
+ * @param values - 要保存的配置值
+ * @param schema - 配置选项 schema（含 sensitive 标志）
  */
 export function savePluginOptions(
   pluginId: string,
   values: PluginOptionValues,
   schema: PluginOptionSchema,
 ): void {
+  // 按敏感性分组
   const nonSensitive: PluginOptionValues = {}
   const sensitive: Record<string, string> = {}
 
@@ -103,17 +122,15 @@ export function savePluginOptions(
     }
   }
 
-  // Scrub sets — see saveMcpServerUserConfig (mcpbHandler.ts) for the
-  // rationale. Only keys in THIS save are scrubbed from the other store,
-  // so partial reconfigures don't lose data.
+  // 记录本次保存中各组的键集合，用于交叉清除
   const sensitiveKeysInThisSave = new Set(Object.keys(sensitive))
   const nonSensitiveKeysInThisSave = new Set(Object.keys(nonSensitive))
 
-  // secureStorage FIRST — if keychain fails, throw before touching
-  // settings.json so old plaintext (if any) stays as fallback.
+  // 步骤 1：先写 secureStorage（原子性：keychain 失败则整体不写 settings.json）
   const storage = getSecureStorage()
   const existingInSecureStorage =
     storage.read()?.pluginSecrets?.[pluginId] ?? undefined
+  // 从 secureStorage 中删除此次改为非敏感的键（防止旧数据残留）
   const secureScrubbed = existingInSecureStorage
     ? Object.fromEntries(
         Object.entries(existingInSecureStorage).filter(
@@ -150,17 +167,14 @@ export function savePluginOptions(
     }
   }
 
-  // settings.json AFTER secureStorage — scrub sensitive keys via explicit
-  // undefined (mergeWith deletion pattern).
+  // 步骤 2：写 settings.json（用 undefined 标记从 settings 删除的敏感键）
   //
-  // TODO: getSettings_DEPRECATED returns MERGED settings across all scopes.
-  // Mutating that and writing to userSettings can leak project-scope
-  // pluginConfigs into ~/.claude/settings.json. Same pattern exists in
-  // saveMcpServerUserConfig. Safe today since pluginConfigs is only ever
-  // written here (user-scope), but will bite if we add project-scoped
-  // plugin options.
+  // TODO：getSettings_DEPRECATED 返回跨所有作用域的合并设置，
+  // 向 userSettings 写回可能导致 project-scope 的 pluginConfigs 漏入 ~/.claude/settings.json。
+  // 目前安全（pluginConfigs 只在此处写入 user 作用域），但若未来添加 project 作用域选项需修复。
   const settings = getSettings_DEPRECATED()
   const existingInSettings = settings.pluginConfigs?.[pluginId]?.options ?? {}
+  // 找出需要从 settings 中删除的键（此次已改为敏感存储）
   const keysToScrubFromSettings = Object.keys(existingInSettings).filter(k =>
     sensitiveKeysInThisSave.has(k),
   )
@@ -174,6 +188,7 @@ export function savePluginOptions(
     if (!settings.pluginConfigs[pluginId]) {
       settings.pluginConfigs[pluginId] = {}
     }
+    // 用 undefined 标记待删除的键（mergeWith 会删除 undefined 的键）
     const scrubbed = Object.fromEntries(
       keysToScrubFromSettings.map(k => [k, undefined]),
     ) as Record<string, undefined>
@@ -190,42 +205,29 @@ export function savePluginOptions(
     }
   }
 
+  // 清除 memoize 缓存，使下次读取获取最新数据
   clearPluginOptionsCache()
 }
 
 /**
- * Delete all stored option values for a plugin — both the non-sensitive
- * `settings.pluginConfigs[pluginId]` entry and the sensitive
- * `secureStorage.pluginSecrets[pluginId]` entry.
+ * 删除插件的所有已保存配置选项（非敏感 + 敏感两个存储后端）。
  *
- * Call this when the LAST installation of a plugin is uninstalled (i.e.,
- * alongside `markPluginVersionOrphaned`). Don't call on every uninstall —
- * a plugin can be installed in multiple scopes and the user's config should
- * survive removing it from one scope while it remains in another.
+ * 使用场景：插件被完全卸载时（最后一个安装实例被移除）。
+ * 注意：不应在每次作用域卸载时调用——同一插件可能安装在多个作用域，
+ * 配置应在所有作用域都卸载后才删除。
  *
- * Best-effort: keychain write failure is logged but doesn't throw, since
- * the uninstall itself succeeded and we don't want to surface a confusing
- * "uninstall failed" message for a cleanup side-effect.
+ * 删除操作是"尽力而为"的：keychain 写入失败仅记录日志，不抛出异常，
+ * 避免因清理副作用显示令人困惑的"卸载失败"消息。
+ *
+ * @param pluginId - 插件存储键
  */
 export function deletePluginOptions(pluginId: string): void {
-  // Settings side — also wipes the legacy mcpServers sub-key (same story:
-  // orphaned on uninstall, never cleaned up before this PR).
-  //
-  // Use `undefined` (not `delete`) because `updateSettingsForSource` merges
-  // via `mergeWith` — absent keys are ignored, only `undefined` triggers
-  // removal. Cast is deliberate (CLAUDE.md's 10% case): adding z.undefined()
-  // to the schema instead (like enabledPlugins:466 does) leaks
-  // `| {[k: string]: unknown}` into the public SDK type, which subsumes the
-  // real object arm and kills excess-property checks for SDK consumers. The
-  // mergeWith-deletion contract is internal plumbing — it shouldn't shape
-  // the Zod schema. enabledPlugins gets away with it only because its other
-  // arms (string[] | boolean) are non-objects that stay distinct.
+  // 从 settings.json 中删除 pluginConfigs[pluginId]
+  // 使用 undefined 值（非 delete）触发 mergeWith 的删除逻辑
   const settings = getSettings_DEPRECATED()
   type PluginConfigs = NonNullable<typeof settings.pluginConfigs>
   if (settings.pluginConfigs?.[pluginId]) {
-    // Partial<Record<K,V>> = Record<K, V | undefined> — gives us the widening
-    // for the undefined value, and Partial-of-X overlaps with X so the cast
-    // is a narrowing TS accepts (same approach as marketplaceManager.ts:1795).
+    // Partial<Record<K,V>> 允许 undefined 值，配合 mergeWith 删除语义
     const pluginConfigs: Partial<PluginConfigs> = { [pluginId]: undefined }
     const { error } = updateSettingsForSource('userSettings', {
       pluginConfigs: pluginConfigs as PluginConfigs,
@@ -238,15 +240,14 @@ export function deletePluginOptions(pluginId: string): void {
     }
   }
 
-  // Secure storage side — delete both the top-level pluginSecrets[pluginId]
-  // and any per-server composite keys `${pluginId}/${server}` (from
-  // saveMcpServerUserConfig's sensitive split). `/` prefix match is safe:
-  // plugin IDs are `name@marketplace`, never contain `/`, so
-  // startsWith(`${id}/`) can't false-positive on a different plugin.
+  // 从 secureStorage 中删除顶层 pluginSecrets[pluginId]
+  // 以及所有 per-server 复合键 `${pluginId}/${server}`（来自 saveMcpServerUserConfig）
+  // '/' 前缀匹配是安全的：插件 ID 格式为 "name@marketplace"，不含 '/'，不会误匹配其他插件
   const storage = getSecureStorage()
   const existing = storage.read()
   if (existing?.pluginSecrets) {
     const prefix = `${pluginId}/`
+    // 保留不属于此插件的所有键
     const survivingEntries = Object.entries(existing.pluginSecrets).filter(
       ([k]) => k !== pluginId && !k.startsWith(prefix),
     )
@@ -258,7 +259,7 @@ export function deletePluginOptions(pluginId: string): void {
         pluginSecrets:
           survivingEntries.length > 0
             ? Object.fromEntries(survivingEntries)
-            : undefined,
+            : undefined,  // 若无剩余键，设为 undefined（清空）
       })
       if (!result.success) {
         logForDebugging(
@@ -269,33 +270,38 @@ export function deletePluginOptions(pluginId: string): void {
     }
   }
 
+  // 清除 memoize 缓存
   clearPluginOptionsCache()
 }
 
 /**
- * Find option keys whose saved values don't satisfy the schema — i.e., what to
- * prompt for. Returns the schema slice for those keys, or empty if everything
- * validates. Empty manifest.userConfig → empty result.
+ * 找出配置值不满足 schema 的选项键——即需要提示用户填写的字段。
+ * 返回这些键的 schema 子集；若全部有效则返回空对象。
+ * manifest.userConfig 为空或未定义时直接返回空对象。
  *
- * Used by PluginOptionsFlow to decide whether to show the prompt after enable.
+ * 被 PluginOptionsFlow 用于判断插件启用后是否需要显示配置提示。
+ *
+ * @param plugin - 已加载的插件对象
+ * @returns 需要配置的选项 schema 子集
  */
 export function getUnconfiguredOptions(
   plugin: LoadedPlugin,
 ): PluginOptionSchema {
   const manifestSchema = plugin.manifest.userConfig
+  // manifest 中无配置选项时直接返回
   if (!manifestSchema || Object.keys(manifestSchema).length === 0) {
     return {}
   }
 
+  // 加载当前已保存的配置值
   const saved = loadPluginOptions(getPluginStorageId(plugin))
   const validation = validateUserConfig(saved, manifestSchema)
   if (validation.valid) {
+    // 所有字段均有效，无需重新配置
     return {}
   }
 
-  // Return only the fields that failed. validateUserConfig reports errors as
-  // strings keyed by title/key — simpler to just re-check each field here than
-  // parse error strings.
+  // 逐字段检查，找出校验失败的字段
   const unconfigured: PluginOptionSchema = {}
   for (const [key, fieldSchema] of Object.entries(manifestSchema)) {
     const single = validateUserConfig(
@@ -310,30 +316,36 @@ export function getUnconfiguredOptions(
 }
 
 /**
- * Substitute ${CLAUDE_PLUGIN_ROOT} and ${CLAUDE_PLUGIN_DATA} with their paths.
- * On Windows, normalizes backslashes to forward slashes so shell commands
- * don't interpret them as escape characters.
+ * 替换字符串中的插件内置变量：${CLAUDE_PLUGIN_ROOT} 和 ${CLAUDE_PLUGIN_DATA}。
  *
- * ${CLAUDE_PLUGIN_ROOT} — version-scoped install dir (recreated on update)
- * ${CLAUDE_PLUGIN_DATA} — persistent state dir (survives updates)
+ * 变量含义：
+ *   - ${CLAUDE_PLUGIN_ROOT}：插件的版本化安装目录（每次更新后重建）
+ *   - ${CLAUDE_PLUGIN_DATA}：插件的持久化数据目录（更新后保留）
  *
- * Both patterns use the function-replacement form of .replace(): ROOT so
- * `$`-patterns in NTFS paths ($$, $', $`, $&) aren't interpreted; DATA so
- * getPluginDataDir (which lazily mkdirs) only runs when actually present.
+ * Windows 处理：将路径中的反斜杠转换为正斜杠，防止 shell 命令将其解释为转义字符。
  *
- * Used in MCP/LSP server command/args/env, hook commands, skill/agent content.
+ * 安全细节：使用函数替换形式（.replace(pattern, () => value)），
+ * 避免路径中的 $&, $`, $' 等特殊替换模式被误解释。
+ *
+ * 使用场景：MCP/LSP 服务器的 command/args/env，hook 命令，技能/代理内容。
+ *
+ * @param value - 含变量占位符的字符串
+ * @param plugin - 包含 path（安装路径）和可选 source（存储 ID）的插件信息
+ * @returns 替换后的字符串
  */
 export function substitutePluginVariables(
   value: string,
   plugin: { path: string; source?: string },
 ): string {
+  // Windows 下统一使用正斜杠
   const normalize = (p: string) =>
     process.platform === 'win32' ? p.replace(/\\/g, '/') : p
+  // 替换 ${CLAUDE_PLUGIN_ROOT}
   let out = value.replace(/\$\{CLAUDE_PLUGIN_ROOT\}/g, () =>
     normalize(plugin.path),
   )
-  // source can be absent (e.g. hooks where pluginRoot is a skill root without
-  // a plugin context). In that case ${CLAUDE_PLUGIN_DATA} is left literal.
+  // 替换 ${CLAUDE_PLUGIN_DATA}（仅当 plugin.source 存在时替换）
+  // source 可能缺失（如 hooks 中 pluginRoot 是技能根目录，无插件上下文）
   if (plugin.source) {
     const source = plugin.source
     out = out.replace(/\$\{CLAUDE_PLUGIN_DATA\}/g, () =>
@@ -344,14 +356,18 @@ export function substitutePluginVariables(
 }
 
 /**
- * Substitute ${user_config.KEY} with saved option values.
+ * 替换字符串中的用户配置变量：${user_config.KEY}。
  *
- * Throws on missing keys — callers pass this only after `validateUserConfig`
- * succeeded, so a miss here means a plugin references a key it never declared
- * in its schema. That's a plugin authoring bug; failing loud surfaces it.
+ * 用于 MCP/LSP server 配置中的变量替换，在校验通过后调用。
+ * 若遇到未声明的键（schema 中不存在），抛出错误以暴露插件开发 bug。
  *
- * Use `substituteUserConfigInContent` for skill/agent prose — it handles
- * missing keys and sensitive-filtering instead of throwing.
+ * 注意：技能/代理内容中请使用 substituteUserConfigInContent，
+ * 该函数对敏感键做特殊处理（不暴露实际值到模型提示词中）。
+ *
+ * @param value - 含 ${user_config.KEY} 占位符的字符串
+ * @param userConfig - 用户配置值映射表
+ * @returns 替换后的字符串
+ * @throws Error 若引用了未声明的配置键
  */
 export function substituteUserConfigVariables(
   value: string,
@@ -360,6 +376,7 @@ export function substituteUserConfigVariables(
   return value.replace(/\$\{user_config\.([^}]+)\}/g, (_match, key) => {
     const configValue = userConfig[key]
     if (configValue === undefined) {
+      // 未声明的键：这是插件开发错误，应在变量替换前完成校验
       throw new Error(
         `Missing required user configuration value: ${key}. ` +
           `This should have been validated before variable substitution.`,
@@ -370,17 +387,19 @@ export function substituteUserConfigVariables(
 }
 
 /**
- * Content-safe variant for skill/agent prose. Differences from
- * `substituteUserConfigVariables`:
+ * 内容安全版本的用户配置变量替换，用于技能/代理 Markdown 内容。
  *
- *   - Sensitive-marked keys substitute to a descriptive placeholder instead of
- *     the actual value — skill/agent content goes to the model prompt, and
- *     we don't put secrets in the model's context.
- *   - Unknown keys stay literal (no throw) — matches how `${VAR}` env refs
- *     behave today when the var is unset.
+ * 与 substituteUserConfigVariables 的区别：
+ *   - 敏感键（schema[key].sensitive === true）替换为描述性占位符，
+ *     而非实际值（技能内容会进入模型提示词，不能包含密钥）
+ *   - 未知键保持原样（不抛出异常），与 ${VAR} 环境变量的默认行为一致
  *
- * A ref to a sensitive key produces obvious-looking output so plugin authors
- * notice and move the ref into a hook/MCP env instead.
+ * 若敏感键被引用，占位符会让插件作者注意到并将其移至 hook/MCP env 中。
+ *
+ * @param content - 含 ${user_config.KEY} 占位符的内容字符串
+ * @param options - 用户配置值映射表
+ * @param schema - 配置选项 schema（含 sensitive 标志）
+ * @returns 替换后的字符串
  */
 export function substituteUserConfigInContent(
   content: string,
@@ -388,11 +407,13 @@ export function substituteUserConfigInContent(
   schema: PluginOptionSchema,
 ): string {
   return content.replace(/\$\{user_config\.([^}]+)\}/g, (match, key) => {
+    // 敏感键：替换为占位符，不暴露实际值到模型提示词
     if (schema[key]?.sensitive === true) {
       return `[sensitive option '${key}' not available in skill content]`
     }
     const value = options[key]
     if (value === undefined) {
+      // 未知键：保持原样（不抛出）
       return match
     }
     return String(value)

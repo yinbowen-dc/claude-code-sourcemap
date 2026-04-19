@@ -1,15 +1,11 @@
 /**
- * Deep Link Origin Banner
+ * Deep Link 来源警告横幅模块。
  *
- * Builds the warning text shown when a session was opened by an external
- * claude-cli:// deep link. Linux xdg-open and browsers with "always allow"
- * set dispatch the link with no OS-level confirmation, so the application
- * provides its own provenance signal — mirroring claude.ai's security
- * interstitial for external-source prefills.
- *
- * The user must press Enter to submit; this banner primes them to read the
- * prompt (which may use homoglyphs or padding to hide instructions) and
- * notice which directory — and therefore which CLAUDE.md — was loaded.
+ * 在 Claude Code 系统中，该模块构建当会话由外部 `claude-cli://` 深链接打开时显示的安全警告文本。
+ * Linux xdg-open 和配置了"始终允许"的浏览器会在无 OS 确认的情况下分发链接，
+ * 因此应用自身提供来源标识——类似 claude.ai 对外部来源预填的安全插页。
+ * 用户必须按 Enter 才能提交；该横幅提示用户阅读 prompt（可能含同形字或填充内容以隐藏指令）
+ * 并注意加载的目录（以及对应的 CLAUDE.md）。
  */
 
 import { stat } from 'fs/promises'

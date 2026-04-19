@@ -1,11 +1,39 @@
+/**
+ * 状态栏配置内置 Agent 定义模块
+ *
+ * 在 Claude Code AgentTool 层中，该模块定义了内置的 statusline-setup Agent——
+ * 专门用于帮助用户配置 Claude Code 的终端状态栏（statusLine）设置。
+ *
+ * 核心功能：
+ * 1. 将用户的 shell PS1 配置转换为 statusLine 命令格式
+ * 2. 读取 ~/.zshrc / ~/.bashrc 等 shell 配置文件，提取 PS1 值
+ * 3. 将 PS1 转义序列（\u、\h、\w 等）转换为等效的 shell 命令
+ * 4. 将生成的命令写入 ~/.claude/settings.json 的 statusLine 配置项
+ *
+ * statusLine 命令通过 stdin 接收 JSON 格式的会话状态数据，包括：
+ * - 当前模型、工作目录、项目目录
+ * - 上下文窗口使用情况
+ * - Claude.ai 订阅速率限制
+ * - Vim 模式状态（可选）
+ * - Agent 信息（可选）
+ * - Worktree 信息（可选）
+ *
+ * Agent 配置：
+ * - 工具集：仅 Read 和 Edit（读取配置文件 + 更新 settings.json）
+ * - 模型：sonnet（需要一定推理能力处理 PS1 转换）
+ * - 颜色：orange
+ */
+
 import type { BuiltInAgentDefinition } from '../loadAgentsDir.js'
 
+// statusline-setup Agent 的完整系统提示
+// 包含 PS1 转换规则、statusLine 命令 JSON schema 及配置更新指引
 const STATUSLINE_SYSTEM_PROMPT = `You are a status line setup agent for Claude Code. Your job is to create or update the statusLine command in the user's Claude Code settings.
 
 When asked to convert the user's shell PS1 configuration, follow these steps:
 1. Read the user's shell configuration files in this order of preference:
    - ~/.zshrc
-   - ~/.bashrc  
+   - ~/.bashrc
    - ~/.bash_profile
    - ~/.profile
 
@@ -13,7 +41,7 @@ When asked to convert the user's shell PS1 configuration, follow these steps:
 
 3. Convert PS1 escape sequences to shell commands:
    - \\u → $(whoami)
-   - \\h → $(hostname -s)  
+   - \\h → $(hostname -s)
    - \\H → $(hostname)
    - \\w → $(pwd)
    - \\W → $(basename "$(pwd)")
@@ -89,7 +117,7 @@ How to use the statusLine command:
        "original_branch": "string" // Optional: Branch that was checked out before entering the worktree
      }
    }
-   
+
    You can use this JSON data in your command like:
    - $(cat | jq -r '.model.display_name')
    - $(cat | jq -r '.workspace.current_dir')
@@ -116,7 +144,7 @@ How to use the statusLine command:
 3. Update the user's ~/.claude/settings.json with:
    {
      "statusLine": {
-       "type": "command", 
+       "type": "command",
        "command": "your_command_here"
      }
    }
@@ -131,14 +159,20 @@ Guidelines:
   Also ensure that the user is informed that they can ask Claude to continue to make changes to the status line.
 `
 
+/**
+ * statusline-setup 内置 Agent 定义。
+ *
+ * 专门用于配置用户的 Claude Code 状态栏（statusLine）设置，
+ * 支持将 shell PS1 配置转换为 statusLine 命令并写入 settings.json。
+ */
 export const STATUSLINE_SETUP_AGENT: BuiltInAgentDefinition = {
   agentType: 'statusline-setup',
   whenToUse:
     "Use this agent to configure the user's Claude Code status line setting.",
-  tools: ['Read', 'Edit'],
+  tools: ['Read', 'Edit'], // 仅需读取配置文件和编辑 settings.json
   source: 'built-in',
   baseDir: 'built-in',
-  model: 'sonnet',
-  color: 'orange',
+  model: 'sonnet',   // 需要一定推理能力处理 PS1 转换，使用 sonnet 模型
+  color: 'orange',   // 状态栏配置 Agent 使用橙色标识
   getSystemPrompt: () => STATUSLINE_SYSTEM_PROMPT,
 }

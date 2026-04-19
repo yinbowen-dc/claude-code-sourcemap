@@ -1,3 +1,21 @@
+/**
+ * FilePermissionDialog/FilePermissionDialog.tsx
+ *
+ * 【在 Claude Code 权限系统中的位置】
+ * 本文件是文件操作权限请求的核心通用对话框组件。
+ * FileWritePermissionRequest、FileEditPermissionRequest、
+ * FilesystemPermissionRequest（Read/Glob/Grep）等均渲染此组件。
+ * 它封装了选项构建、Analytics 日志、IDE diff 集成、符号链接警告等所有通用逻辑。
+ *
+ * 【主要功能】
+ * - FilePermissionDialogProps 类型：对话框所有可配置 props
+ * - FilePermissionDialog 组件：
+ *   1. 通过 getLanguageName 派生 languageName 用于 Unary 事件
+ *   2. 调用 usePermissionRequestLogging 上报权限弹窗展示事件
+ *   3. 检测符号链接并显示警告（仅写操作时）
+ *   4. 通过 useDiffInIDE 支持在 IDE 中展示 diff
+ *   5. 渲染 PermissionDialog + Select 选项列表
+ */
 import { relative } from 'path';
 import React, { useMemo } from 'react';
 import { useDiffInIDE } from '../../../hooks/useDiffInIDE.js';
@@ -17,32 +35,43 @@ import type { WorkerBadgeProps } from '../WorkerBadge.js';
 import type { IDEDiffSupport } from './ideDiffConfig.js';
 import type { FileOperationType, PermissionOption } from './permissionOptions.js';
 import { type ToolInput, useFilePermissionDialog } from './useFilePermissionDialog.js';
+/**
+ * FilePermissionDialogProps — 文件操作权限对话框的完整 Props 类型定义
+ *
+ * 【Props 分组说明】
+ * - 基础权限请求 Props：toolUseConfirm / toolUseContext / onDone / onReject
+ * - 对话框外观定制：title / subtitle / question / content
+ * - 日志参数：completionType / languageName（可选覆盖，默认从 path 推导）
+ * - 文件操作参数：path / parseInput / operationType
+ * - IDE diff 集成：ideDiffSupport（可选，提供 IDE 差异视图能力）
+ * - Worker 标识：workerBadge（Teammate 请求时显示）
+ */
 export type FilePermissionDialogProps<T extends ToolInput = ToolInput> = {
-  // Required props from PermissionRequestProps
-  toolUseConfirm: ToolUseConfirm;
-  toolUseContext: ToolUseContext;
-  onDone: () => void;
-  onReject: () => void;
+  // 来自 PermissionRequestProps 的必填 props
+  toolUseConfirm: ToolUseConfirm;      // 工具使用确认上下文（含工具信息、输入、回调等）
+  toolUseContext: ToolUseContext;       // 工具使用上下文（含 IDE 连接信息等）
+  onDone: () => void;                  // 对话框完成后的通知回调
+  onReject: () => void;                // 用户拒绝时的通知回调
 
-  // Dialog customization
-  title: string;
-  subtitle?: React.ReactNode;
-  question?: string | React.ReactNode;
-  content?: React.ReactNode; // Can be general content or diff component
+  // 对话框外观定制
+  title: string;                       // 对话框标题（如 "Edit file"）
+  subtitle?: React.ReactNode;          // 可选副标题
+  question?: string | React.ReactNode; // 交互提问文本，默认 "Do you want to proceed?"
+  content?: React.ReactNode;           // 对话框内容区（通常为 diff 组件）
 
-  // Logging
-  completionType?: CompletionType;
-  languageName?: string; // override — derived from path when omitted
+  // 日志上报参数
+  completionType?: CompletionType;     // Unary 事件类型，默认 tool_use_single
+  languageName?: string;               // 语言名称覆盖 — 省略时从 path 自动推导
 
-  // File/directory operations
-  path: string | null;
-  parseInput: (input: unknown) => T;
-  operationType?: FileOperationType;
+  // 文件/目录操作参数
+  path: string | null;                 // 目标文件路径（null 表示不涉及具体文件）
+  parseInput: (input: unknown) => T;   // 将原始 toolUseConfirm.input 解析为类型化 T
+  operationType?: FileOperationType;  // 操作类型：'read' 或 'write'，默认 'write'
 
-  // IDE diff support
-  ideDiffSupport?: IDEDiffSupport<T>;
+  // IDE diff 支持（可选）
+  ideDiffSupport?: IDEDiffSupport<T>;  // 提供 getConfig + applyChanges 的 IDE diff 适配器
 
-  // Worker badge for teammate permission requests
+  // Teammate 权限请求时显示的 Worker 标识徽章
   workerBadge: WorkerBadgeProps | undefined;
 };
 export function FilePermissionDialog<T extends ToolInput = ToolInput>({

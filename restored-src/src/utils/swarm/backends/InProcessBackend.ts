@@ -1,3 +1,25 @@
+/**
+ * In-Process Teammate 执行后端
+ *
+ * 在 Claude Code 系统流程中的位置：
+ * 该模块实现了 TeammateExecutor 接口，是 Swarm 多智能体系统的三种后端之一。
+ * 与 TmuxBackend/ITermBackend（基于终端窗格）不同，
+ * InProcessBackend 在同一 Node.js 进程中运行 teammate，
+ * 通过 AsyncLocalStorage 实现上下文隔离。
+ *
+ * 核心特性：
+ * - 共享资源：与领导者共享 API 客户端、MCP 连接，避免重复初始化开销
+ * - 相同通信机制：使用文件邮箱（file-based mailbox）与窗格模式 teammate 保持一致
+ * - 优雅关闭：通过邮箱发送关闭请求；强制终止通过 AbortController.abort()
+ * - 无外部依赖：始终可用（isAvailable 返回 true），不需要 tmux/iTerm2
+ *
+ * 重要：使用前必须调用 setContext() 设置 ToolUseContext，
+ * 才能访问 AppState（用于任务追踪和关闭控制）。
+ *
+ * 使用方式：通过 registry.ts 的 getTeammateExecutor() 获取实例，
+ * 再通过 TeammateExecutor 接口调用。
+ */
+
 import type { ToolUseContext } from '../../../Tool.js'
 import {
   findTeammateTaskByAgentId,
@@ -23,53 +45,63 @@ import type {
 } from './types.js'
 
 /**
- * InProcessBackend implements TeammateExecutor for in-process teammates.
+ * In-Process Teammate 执行后端类。
+ * 实现 TeammateExecutor 接口，在同一 Node.js 进程中运行 teammate。
  *
- * Unlike pane-based backends (tmux/iTerm2), in-process teammates run in the
- * same Node.js process with isolated context via AsyncLocalStorage. They:
- * - Share resources (API client, MCP connections) with the leader
- * - Communicate via file-based mailbox (same as pane-based teammates)
- * - Are terminated via AbortController (not kill-pane)
- *
- * IMPORTANT: Before spawning, call setContext() to provide the ToolUseContext
- * needed for AppState access. This is intended for use via the TeammateExecutor
- * abstraction (getTeammateExecutor() in registry.ts).
+ * 与窗格模式后端（tmux/iTerm2）的主要区别：
+ * - teammate 不是单独的进程，而是同进程的异步任务
+ * - 需要 setContext() 提供 AppState 访问能力
+ * - 终止通过 AbortController 而非 kill-pane 命令
+ * - 文件邮箱通信机制与窗格模式相同，保持接口一致性
  */
 export class InProcessBackend implements TeammateExecutor {
+  /** 后端类型标识符，固定为 'in-process' */
   readonly type = 'in-process' as const
 
   /**
-   * Tool use context for AppState access.
-   * Must be set via setContext() before spawn() is called.
+   * 工具使用上下文（ToolUseContext）。
+   * 提供 AppState 访问（getAppState/setAppState），用于任务管理。
+   * 必须在 spawn() 前通过 setContext() 设置。
    */
   private context: ToolUseContext | null = null
 
   /**
-   * Sets the ToolUseContext for this backend.
-   * Called by TeammateTool before spawning to provide AppState access.
+   * 设置工具使用上下文。
+   * TeammateTool 在调用 spawn() 之前调用此方法，提供 AppState 访问入口。
+   *
+   * @param context ToolUseContext，包含 getAppState/setAppState 等方法
    */
   setContext(context: ToolUseContext): void {
     this.context = context
   }
 
   /**
-   * In-process backend is always available (no external dependencies).
+   * 检查后端是否可用。
+   * In-process 模式无外部依赖，始终返回 true。
    */
   async isAvailable(): Promise<boolean> {
     return true
   }
 
   /**
-   * Spawns an in-process teammate.
+   * 生成一个 in-process teammate。
    *
-   * Uses spawnInProcessTeammate() to:
-   * 1. Create TeammateContext via createTeammateContext()
-   * 2. Create independent AbortController (not linked to parent)
-   * 3. Register teammate in AppState.tasks
-   * 4. Start agent execution via startInProcessTeammate()
-   * 5. Return spawn result with agentId, taskId, abortController
+   * 流程：
+   * 1. 验证 context 已设置（必要前提）。
+   * 2. 调用 spawnInProcessTeammate() 完成以下工作：
+   *    - 创建 TeammateContext（AsyncLocalStorage 上下文）
+   *    - 创建独立的 AbortController（不继承父级的）
+   *    - 在 AppState.tasks 中注册任务
+   * 3. 若 spawn 成功，调用 startInProcessTeammate() 在后台启动 agent 执行循环：
+   *    - 传入 identity、taskId、prompt、toolUseContext（清空 messages 避免父会话污染）
+   *    - fire-and-forget 模式，不等待完成
+   * 4. 返回包含 agentId、taskId、abortController 的结果。
+   *
+   * @param config teammate 的完整生成配置
+   * @returns 生成结果，包含 agentId 和控制句柄
    */
   async spawn(config: TeammateSpawnConfig): Promise<TeammateSpawnResult> {
+    // 前置检查：context 未设置时无法访问 AppState
     if (!this.context) {
       logForDebugging(
         `[InProcessBackend] spawn() called without context for ${config.name}`,
@@ -84,6 +116,7 @@ export class InProcessBackend implements TeammateExecutor {
 
     logForDebugging(`[InProcessBackend] spawn() called for ${config.name}`)
 
+    // 创建 TeammateContext 并注册任务，获取 AbortController 等控制对象
     const result = await spawnInProcessTeammate(
       {
         name: config.name,
@@ -95,15 +128,14 @@ export class InProcessBackend implements TeammateExecutor {
       this.context,
     )
 
-    // If spawn succeeded, start the agent execution loop
+    // spawn 成功时启动 agent 执行循环（fire-and-forget）
     if (
       result.success &&
       result.taskId &&
       result.teammateContext &&
       result.abortController
     ) {
-      // Start the agent loop in the background (fire-and-forget)
-      // The prompt is passed through the task state and config
+      // 后台启动 agent 循环，不 await，由 AbortController 控制生命周期
       startInProcessTeammate({
         identity: {
           agentId: result.agentId,
@@ -116,9 +148,8 @@ export class InProcessBackend implements TeammateExecutor {
         taskId: result.taskId,
         prompt: config.prompt,
         teammateContext: result.teammateContext,
-        // Strip messages: the teammate never reads toolUseContext.messages
-        // (runAgent overrides it via createSubagentContext). Passing the
-        // parent's conversation would pin it for the teammate's lifetime.
+        // 清空 messages：teammate 通过 createSubagentContext 覆盖消息，
+        // 传入父会话的对话历史会将其固定在 teammate 整个生命周期内
         toolUseContext: { ...this.context, messages: [] },
         abortController: result.abortController,
         model: config.model,
@@ -133,6 +164,7 @@ export class InProcessBackend implements TeammateExecutor {
       )
     }
 
+    // 返回生成结果（含控制句柄，供领导者管理生命周期）
     return {
       success: result.success,
       agentId: result.agentId,
@@ -143,17 +175,23 @@ export class InProcessBackend implements TeammateExecutor {
   }
 
   /**
-   * Sends a message to an in-process teammate.
+   * 向 in-process teammate 发送消息。
    *
-   * All teammates use file-based mailboxes for simplicity.
+   * 与窗格模式 teammate 使用相同的文件邮箱机制，保持接口一致性。
+   *
+   * 流程：
+   * 1. 解析 agentId 为 agentName 和 teamName（格式：agentName@teamName）。
+   * 2. 调用 writeToMailbox 将消息写入文件邮箱。
+   *
+   * @param agentId 目标 teammate 的 agent ID（格式：agentName@teamName）
+   * @param message 要发送的消息内容
    */
   async sendMessage(agentId: string, message: TeammateMessage): Promise<void> {
     logForDebugging(
       `[InProcessBackend] sendMessage() to ${agentId}: ${message.text.substring(0, 50)}...`,
     )
 
-    // Parse agentId to get agentName and teamName
-    // agentId format: "agentName@teamName" (e.g., "researcher@my-team")
+    // 解析 agentId 格式：agentName@teamName（如 "researcher@my-team"）
     const parsed = parseAgentId(agentId)
     if (!parsed) {
       logForDebugging(`[InProcessBackend] Invalid agentId format: ${agentId}`)
@@ -164,13 +202,14 @@ export class InProcessBackend implements TeammateExecutor {
 
     const { agentName, teamName } = parsed
 
-    // Write to file-based mailbox
+    // 写入文件邮箱（teammate 的消息轮询循环会读取此邮箱）
     await writeToMailbox(
       agentName,
       {
         text: message.text,
         from: message.from,
         color: message.color,
+        // 未提供 timestamp 时使用当前时间
         timestamp: message.timestamp ?? new Date().toISOString(),
       },
       teamName,
@@ -180,20 +219,25 @@ export class InProcessBackend implements TeammateExecutor {
   }
 
   /**
-   * Gracefully terminates an in-process teammate.
+   * 优雅关闭 in-process teammate（发送关闭请求）。
    *
-   * Sends a shutdown request message to the teammate and sets the
-   * shutdownRequested flag. The teammate processes the request and
-   * either approves (exits) or rejects (continues working).
+   * 与窗格模式不同，in-process teammate 通过以下流程关闭：
+   * 1. 向 teammate 的邮箱发送 JSON 格式的关闭请求消息。
+   * 2. 设置 AppState 中任务的 shutdownRequested 标志。
+   * 3. teammate 处理该请求：同意则退出，拒绝（仍有工作）则继续运行。
    *
-   * Unlike pane-based teammates, in-process teammates handle their own
-   * exit via the shutdown flow - no external killPane() is needed.
+   * 幂等性：若已有关闭请求待处理，直接返回 true 不重复发送。
+   *
+   * @param agentId 目标 teammate 的 agent ID
+   * @param reason 关闭原因（可选，用于日志和 teammate 的决策参考）
+   * @returns true 表示关闭请求已成功发送（或已存在），false 表示失败
    */
   async terminate(agentId: string, reason?: string): Promise<boolean> {
     logForDebugging(
       `[InProcessBackend] terminate() called for ${agentId}: ${reason}`,
     )
 
+    // 前置检查：无 context 时无法查找任务
     if (!this.context) {
       logForDebugging(
         `[InProcessBackend] terminate() failed: no context set for ${agentId}`,
@@ -201,7 +245,7 @@ export class InProcessBackend implements TeammateExecutor {
       return false
     }
 
-    // Get current AppState to find the task
+    // 从 AppState 中查找对应的任务
     const state = this.context.getAppState()
     const task = findTeammateTaskByAgentId(agentId, state.tasks)
 
@@ -212,7 +256,7 @@ export class InProcessBackend implements TeammateExecutor {
       return false
     }
 
-    // Don't send another shutdown request if one is already pending
+    // 幂等性检查：已有关闭请求时不重复发送
     if (task.shutdownRequested) {
       logForDebugging(
         `[InProcessBackend] terminate(): shutdown already requested for ${agentId}`,
@@ -220,17 +264,17 @@ export class InProcessBackend implements TeammateExecutor {
       return true
     }
 
-    // Generate deterministic request ID
+    // 生成确定性的请求 ID（含时间戳以保证唯一性）
     const requestId = `shutdown-${agentId}-${Date.now()}`
 
-    // Create shutdown request message
+    // 创建标准格式的关闭请求消息（JSON 序列化）
     const shutdownRequest = createShutdownRequestMessage({
       requestId,
-      from: 'team-lead', // Terminate is always called by the leader
+      from: 'team-lead', // terminate 总是由领导者发起
       reason,
     })
 
-    // Send to teammate's mailbox
+    // 将关闭请求写入 teammate 的文件邮箱
     const teammateAgentName = task.identity.agentName
     await writeToMailbox(
       teammateAgentName,
@@ -242,7 +286,7 @@ export class InProcessBackend implements TeammateExecutor {
       task.identity.teamName,
     )
 
-    // Mark the task as shutdown requested
+    // 在 AppState 中标记该任务已请求关闭（用于 UI 状态显示）
     requestTeammateShutdown(task.id, this.context.setAppState)
 
     logForDebugging(
@@ -253,14 +297,18 @@ export class InProcessBackend implements TeammateExecutor {
   }
 
   /**
-   * Force kills an in-process teammate immediately.
+   * 强制终止 in-process teammate（立即终止，不等待优雅关闭）。
    *
-   * Uses the teammate's AbortController to cancel all async operations
-   * and updates the task state to 'killed'.
+   * 通过 AbortController.abort() 取消所有异步操作，
+   * 并将 AppState 中的任务状态更新为 'killed'。
+   *
+   * @param agentId 要终止的 teammate 的 agent ID
+   * @returns true 表示终止成功，false 表示失败（任务不存在或无 context）
    */
   async kill(agentId: string): Promise<boolean> {
     logForDebugging(`[InProcessBackend] kill() called for ${agentId}`)
 
+    // 前置检查：无 context 时无法查找任务
     if (!this.context) {
       logForDebugging(
         `[InProcessBackend] kill() failed: no context set for ${agentId}`,
@@ -268,7 +316,7 @@ export class InProcessBackend implements TeammateExecutor {
       return false
     }
 
-    // Get current AppState to find the task
+    // 从 AppState 中查找对应的任务
     const state = this.context.getAppState()
     const task = findTeammateTaskByAgentId(agentId, state.tasks)
 
@@ -279,7 +327,7 @@ export class InProcessBackend implements TeammateExecutor {
       return false
     }
 
-    // Kill the teammate via the existing helper function
+    // 调用 killInProcessTeammate：abort AbortController 并更新任务状态
     const killed = killInProcessTeammate(task.id, this.context.setAppState)
 
     logForDebugging(
@@ -290,14 +338,22 @@ export class InProcessBackend implements TeammateExecutor {
   }
 
   /**
-   * Checks if an in-process teammate is still active.
+   * 检查 in-process teammate 是否仍在运行。
    *
-   * Returns true if the teammate exists, has status 'running',
-   * and its AbortController has not been aborted.
+   * 判断标准：
+   * 1. AppState 中存在对应任务
+   * 2. 任务状态为 'running'
+   * 3. AbortController 信号未被中止（aborted = false）
+   *
+   * 三个条件同时满足才返回 true。
+   *
+   * @param agentId 要检查的 teammate 的 agent ID
+   * @returns true 表示仍在运行，false 表示已停止或不存在
    */
   async isActive(agentId: string): Promise<boolean> {
     logForDebugging(`[InProcessBackend] isActive() called for ${agentId}`)
 
+    // 前置检查：无 context 时无法查找任务
     if (!this.context) {
       logForDebugging(
         `[InProcessBackend] isActive() failed: no context set for ${agentId}`,
@@ -305,7 +361,7 @@ export class InProcessBackend implements TeammateExecutor {
       return false
     }
 
-    // Get current AppState to find the task
+    // 从 AppState 中查找对应的任务
     const state = this.context.getAppState()
     const task = findTeammateTaskByAgentId(agentId, state.tasks)
 
@@ -316,10 +372,12 @@ export class InProcessBackend implements TeammateExecutor {
       return false
     }
 
-    // Check if task is running and not aborted
+    // 检查运行状态和 AbortController 信号
     const isRunning = task.status === 'running'
+    // AbortController 不存在时视为已中止（保守估计）
     const isAborted = task.abortController?.signal.aborted ?? true
 
+    // 两者均满足才视为活跃
     const active = isRunning && !isAborted
 
     logForDebugging(
@@ -331,8 +389,10 @@ export class InProcessBackend implements TeammateExecutor {
 }
 
 /**
- * Factory function to create an InProcessBackend instance.
- * Used by the registry (Task #8) to get backend instances.
+ * 创建 InProcessBackend 实例的工厂函数。
+ * registry.ts 通过此函数获取后端实例，符合统一的工厂函数模式。
+ *
+ * @returns 新的 InProcessBackend 实例（未设置 context，需调用 setContext()）
  */
 export function createInProcessBackend(): InProcessBackend {
   return new InProcessBackend()

@@ -1,3 +1,23 @@
+/**
+ * TypeStep.tsx — Agent 创建向导：输入 Agent 类型标识符步骤
+ *
+ * 在 Claude Code 系统流程中的位置：
+ *   AgentTool → new-agent-creation/AgentWizard → wizard-steps/TypeStep（当前文件）
+ *
+ * 主要功能：
+ *   - 提供文本输入框，让用户输入 Agent 的唯一类型标识符（如 "test-runner"）
+ *   - 提交前使用 validateAgentType 进行格式校验（正则 /^[a-zA-Z0-9][a-zA-Z0-9-]*[a-zA-Z0-9]$/, 长度 3-50）
+ *   - 验证通过后将 agentType 写入 wizardData 并前进到下一步
+ *
+ * 键盘绑定策略：
+ *   - ESC（confirm:no）使用 "Settings" 上下文，避免与输入框中的 'n' 键冲突
+ *
+ * 依赖：
+ *   - react/compiler-runtime (_c)：React 编译器自动生成的记忆化缓存（15 个槽位）
+ *   - useKeybinding：注册上下文感知的键盘快捷键
+ *   - validateAgentType：Agent 类型标识符格式校验函数
+ *   - TextInput：支持光标偏移管理的终端文本输入组件（Ink）
+ */
 import { c as _c } from "react/compiler-runtime";
 import React, { type ReactNode, useState } from 'react';
 import { Box, Text } from '../../../../ink.js';
@@ -11,92 +31,145 @@ import { useWizard } from '../../../wizard/index.js';
 import { WizardDialogLayout } from '../../../wizard/WizardDialogLayout.js';
 import { validateAgentType } from '../../validateAgent.js';
 import type { AgentWizardData } from '../types.js';
+
+// 组件 Props 类型：接收已有 Agent 列表（当前仅用于类型约束，未在组件内使用）
 type Props = {
   existingAgents: AgentDefinition[];
 };
+
+/**
+ * TypeStep — 向导 Agent 类型标识符输入步骤。
+ *
+ * 整体流程：
+ *   1. 从 useWizard 获取 goNext / goBack / updateWizardData / wizardData
+ *   2. 初始化本地状态：agentType（预填向导已有值）、error、cursorOffset
+ *   3. 注册 ESC 键绑定（Settings 上下文），避免输入 'n' 时误触取消
+ *   4. 构建 handleSubmit 回调：trim → validateAgentType → 有错误则设置错误并返回，否则保存并 goNext()
+ *   5. 构建静态底部快捷键提示 JSX（React 编译器确保只创建一次）
+ *   6. 构建静态说明文字 JSX
+ *   7. 构建文本输入框 JSX（依赖 agentType / cursorOffset / handleSubmit）
+ *   8. 构建错误提示 JSX（依赖 error）
+ *   9. 组装最终布局并返回
+ *
+ * 注意：_props 参数（含 existingAgents）在此版本中未被使用，
+ *       仅通过向导上下文读取和更新数据。
+ */
 export function TypeStep(_props) {
+  // React 编译器生成的记忆化缓存，共 15 个槽位
   const $ = _c(15);
+
+  // 从向导上下文获取导航和数据更新方法
   const {
     goNext,
     goBack,
     updateWizardData,
     wizardData
   } = useWizard();
+
+  // 本地状态：当前输入的 agentType（优先使用已有向导数据）
   const [agentType, setAgentType] = useState(wizardData.agentType || "");
+  // 本地状态：验证错误消息（null 表示无错误）
   const [error, setError] = useState(null);
+  // 本地状态：光标在文本中的偏移量
   const [cursorOffset, setCursorOffset] = useState(agentType.length);
+
+  // ── 槽位 $[0]：静态 Settings 上下文对象（仅创建一次）─────────────────────
   let t0;
   if ($[0] === Symbol.for("react.memo_cache_sentinel")) {
     t0 = {
-      context: "Settings"
+      context: "Settings" // 使用 Settings 上下文，避免 'n' 键被截获为确认否
     };
     $[0] = t0;
   } else {
     t0 = $[0];
   }
+  // 注册 ESC 键绑定：按 ESC 返回上一步（MethodStep）
   useKeybinding("confirm:no", goBack, t0);
+
+  // ── 槽位 $[1-3]：handleSubmit 回调（依赖 goNext / updateWizardData）──────
   let t1;
   if ($[1] !== goNext || $[2] !== updateWizardData) {
+    // 任意依赖变化时，重新创建提交回调
     t1 = value => {
+      // 去除首尾空白
       const trimmedValue = value.trim();
+      // 调用校验函数，返回 null 表示通过，返回字符串表示错误消息
       const validationError = validateAgentType(trimmedValue);
+
       if (validationError) {
+        // 格式不符合要求时，显示错误并阻止前进
         setError(validationError);
         return;
       }
+
+      // 验证通过：清除错误、写入 wizard 数据、进入下一步
       setError(null);
       updateWizardData({
-        agentType: trimmedValue
+        agentType: trimmedValue // 保存去空白后的标识符
       });
       goNext();
     };
     $[1] = goNext;
     $[2] = updateWizardData;
-    $[3] = t1;
+    $[3] = t1; // 缓存新回调
   } else {
-    t1 = $[3];
+    t1 = $[3]; // 依赖未变，复用已缓存的回调
   }
   const handleSubmit = t1;
+
+  // ── 槽位 $[4]：静态底部快捷键提示 JSX（仅首次渲染时创建）────────────────
   let t2;
   if ($[4] === Symbol.for("react.memo_cache_sentinel")) {
+    // 显示三个操作提示：输入文字、Enter 继续、Esc 返回
     t2 = <Byline><KeyboardShortcutHint shortcut="Type" action="enter text" /><KeyboardShortcutHint shortcut="Enter" action="continue" /><ConfigurableShortcutHint action="confirm:no" context="Settings" fallback="Esc" description="go back" /></Byline>;
-    $[4] = t2;
+    $[4] = t2; // 写入缓存
   } else {
-    t2 = $[4];
+    t2 = $[4]; // 从缓存读取，避免重复创建
   }
+
+  // ── 槽位 $[5]：静态说明文字 JSX（仅首次渲染时创建）──────────────────────
   let t3;
   if ($[5] === Symbol.for("react.memo_cache_sentinel")) {
     t3 = <Text>Enter a unique identifier for your agent:</Text>;
-    $[5] = t3;
+    $[5] = t3; // 写入缓存
   } else {
-    t3 = $[5];
+    t3 = $[5]; // 从缓存读取
   }
+
+  // ── 槽位 $[6-9]：文本输入框 JSX（依赖 agentType / cursorOffset / handleSubmit）
   let t4;
   if ($[6] !== agentType || $[7] !== cursorOffset || $[8] !== handleSubmit) {
+    // 任意输入相关状态变化时，重建 TextInput JSX
     t4 = <Box marginTop={1}><TextInput value={agentType} onChange={setAgentType} onSubmit={handleSubmit} placeholder="e.g., test-runner, tech-lead, etc" columns={60} cursorOffset={cursorOffset} onChangeCursorOffset={setCursorOffset} focus={true} showCursor={true} /></Box>;
     $[6] = agentType;
     $[7] = cursorOffset;
     $[8] = handleSubmit;
     $[9] = t4;
   } else {
-    t4 = $[9];
+    t4 = $[9]; // 输入未变，复用缓存
   }
+
+  // ── 槽位 $[10-11]：错误提示 JSX（依赖 error）──────────────────────────
   let t5;
   if ($[10] !== error) {
+    // error 变化时重建（null 时不渲染任何内容）
     t5 = error && <Box marginTop={1}><Text color="error">{error}</Text></Box>;
     $[10] = error;
     $[11] = t5;
   } else {
     t5 = $[11];
   }
+
+  // ── 槽位 $[12-14]：最终完整布局（依赖 t4 输入框 / t5 错误提示）───────────
   let t6;
   if ($[12] !== t4 || $[13] !== t5) {
+    // 输入框或错误提示变化时，重建整个对话框
     t6 = <WizardDialogLayout subtitle="Agent type (identifier)" footerText={t2}><Box flexDirection="column">{t3}{t4}{t5}</Box></WizardDialogLayout>;
     $[12] = t4;
     $[13] = t5;
     $[14] = t6;
   } else {
-    t6 = $[14];
+    t6 = $[14]; // 两者均未变化，复用缓存的完整 JSX
   }
   return t6;
 }

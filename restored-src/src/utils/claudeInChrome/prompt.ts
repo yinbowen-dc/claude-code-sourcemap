@@ -1,3 +1,10 @@
+/**
+ * Claude in Chrome 系统提示模块。
+ *
+ * 在 Claude Code 系统中，该模块提供 Chrome 浏览器自动化的系统提示文本，
+ * 指导模型如何使用 `mcp__claude-in-chrome__*` 工具集完成浏览器操作任务，
+ * 包含 GIF 录屏、截图展示、元素交互等使用指南。
+ */
 export const BASE_CHROME_PROMPT = `# Claude in Chrome browser automation
 
 You have access to browser automation tools (mcp__claude-in-chrome__*) for interacting with web pages in Chrome. Follow these guidelines for effective browser automation.
@@ -61,9 +68,12 @@ For example, to get tab context:
 2. Then: Call mcp__claude-in-chrome__tabs_context_mcp`
 
 /**
- * Get the base chrome system prompt (without tool search instructions).
- * Tool search instructions are injected separately at request time in claude.ts
- * based on the actual tool search enabled state.
+ * 获取 Claude in Chrome 浏览器自动化的基础系统提示文本。
+ *
+ * 该函数当前直接返回 BASE_CHROME_PROMPT 常量。tool search 相关指令
+ * 由 claude.ts 在请求时根据实际启用状态单独注入，不包含在此返回值中。
+ *
+ * @returns Chrome 浏览器自动化系统提示字符串
  */
 export function getChromeSystemPrompt(): string {
   return BASE_CHROME_PROMPT

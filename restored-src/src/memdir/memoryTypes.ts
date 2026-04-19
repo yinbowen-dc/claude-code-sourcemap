@@ -1,16 +1,34 @@
 /**
- * Memory type taxonomy.
+ * @file memoryTypes.ts
+ * @description 记忆目录模块 — 记忆类型分类与系统提示文本定义
  *
- * Memories are constrained to four types capturing context NOT derivable
- * from the current project state. Code patterns, architecture, git history,
- * and file structure are derivable (via grep/git/CLAUDE.md) and should NOT
- * be saved as memories.
+ * 在 Claude Code 记忆系统中，该文件扮演两个核心角色：
  *
- * The two TYPES_SECTION_* exports below are intentionally duplicated rather
- * than generated from a shared spec — keeping them flat makes per-mode edits
- * trivial without reasoning through a helper's conditional rendering.
+ * 1. 类型系统：定义记忆的四种分类（user/feedback/project/reference），
+ *    以及从 frontmatter 原始值解析为强类型的工具函数。
+ *
+ * 2. 系统提示文本库：以只读数组常量的形式预先生成记忆行为指导文本块，
+ *    包括类型说明（个人模式/团队模式两种变体）、不应保存的内容、
+ *    访问时机、信任与验证指导、frontmatter 格式示例等。
+ *    这些常量被 memdir.ts 和 teamMemPrompts.ts 组合拼接为最终系统提示。
+ *
+ * 设计决策：两套 TYPES_SECTION 故意保持扁平化重复，而非从共享规范动态生成，
+ * 以便针对各模式进行独立编辑，无需推理生成器的条件逻辑。
+ *
+ * 被以下模块导入：memdir.ts、memoryScan.ts、teamMemPrompts.ts。
  */
 
+/**
+ * 所有合法的记忆类型值（常量元组，用于派生 MemoryType 联合类型）。
+ * 记忆类型约束记忆内容为不可从当前项目状态直接推导的信息：
+ * - user：用户角色、偏好、目标
+ * - feedback：用户对工作方式的指导（纠正和确认）
+ * - project：项目上下文（进行中的工作、目标、事故）
+ * - reference：外部系统的资源指针
+ *
+ * 代码模式、架构、git 历史、文件结构等均可通过 grep/git/CLAUDE.md 推导，
+ * 不应保存为记忆。
+ */
 export const MEMORY_TYPES = [
   'user',
   'feedback',
@@ -18,21 +36,30 @@ export const MEMORY_TYPES = [
   'reference',
 ] as const
 
+/** 记忆类型联合类型，从 MEMORY_TYPES 常量元组派生 */
 export type MemoryType = (typeof MEMORY_TYPES)[number]
 
 /**
- * Parse a raw frontmatter value into a MemoryType.
- * Invalid or missing values return undefined — legacy files without a
- * `type:` field keep working, files with unknown types degrade gracefully.
+ * 将 frontmatter 中的原始 type 值解析为强类型的 MemoryType。
+ *
+ * 容错设计：
+ * - 非字符串值（undefined、数字等）返回 undefined
+ * - 不在 MEMORY_TYPES 中的字符串（如拼写错误）返回 undefined
+ * - 旧版无 type 字段的文件正常工作（undefined 降级）
+ * - 未知类型的文件优雅降级，不影响扫描和筛选
+ *
+ * @param raw frontmatter 对象中 type 字段的原始值（类型未知）
+ * @returns   合法的 MemoryType，或 undefined（无效/缺失时）
  */
 export function parseMemoryType(raw: unknown): MemoryType | undefined {
-  if (typeof raw !== 'string') return undefined
-  return MEMORY_TYPES.find(t => t === raw)
+  if (typeof raw !== 'string') return undefined       // 非字符串直接返回 undefined
+  return MEMORY_TYPES.find(t => t === raw)            // 精确匹配，避免子串误判
 }
 
 /**
- * `## Types of memory` section for COMBINED mode (private + team directories).
- * Includes <scope> tags and team/private qualifiers in examples.
+ * 团队+私人组合模式（COMBINED）的 `## Types of memory` 文本节。
+ * 包含 <scope> 标签和 team/private 限定词，适用于双目录场景。
+ * 每种类型均说明应写入私人目录还是团队目录，以及判断依据。
  */
 export const TYPES_SECTION_COMBINED: readonly string[] = [
   '## Types of memory',
@@ -106,9 +133,9 @@ export const TYPES_SECTION_COMBINED: readonly string[] = [
 ]
 
 /**
- * `## Types of memory` section for INDIVIDUAL-ONLY mode (single directory).
- * No <scope> tags. Examples use plain `[saves X memory: …]`. Prose that
- * only makes sense with a private/team split is reworded.
+ * 个人模式（INDIVIDUAL）的 `## Types of memory` 文本节。
+ * 无 <scope> 标签，示例使用无修饰的 `[saves X memory: …]` 格式。
+ * 仅涉及个人/单目录场景的描述措辞，去除 team/private 分裂逻辑。
  */
 export const TYPES_SECTION_INDIVIDUAL: readonly string[] = [
   '## Types of memory',
@@ -178,7 +205,14 @@ export const TYPES_SECTION_INDIVIDUAL: readonly string[] = [
 ]
 
 /**
- * `## What NOT to save in memory` section. Identical across both modes.
+ * `## What NOT to save in memory` 文本节（两种模式共用，内容完全相同）。
+ *
+ * 明确列出不应保存为记忆的内容类型，防止模型将可从代码/git 直接推导的信息
+ * 存入记忆文件（这类信息会随代码更新而过时，产生陈旧记忆噪音）。
+ *
+ * 末尾特别说明：即使用户显式要求保存，这些排除规则仍然适用；
+ * 若用户要求保存 PR 列表或活动摘要，应引导其聚焦"令人惊讶或非显而易见"的部分。
+ * 此规则经过评测验证（memory-prompt-iteration case 3，0/2 → 3/3）。
  */
 export const WHAT_NOT_TO_SAVE_SECTION: readonly string[] = [
   '## What NOT to save in memory',
@@ -189,81 +223,84 @@ export const WHAT_NOT_TO_SAVE_SECTION: readonly string[] = [
   '- Anything already documented in CLAUDE.md files.',
   '- Ephemeral task details: in-progress work, temporary state, current conversation context.',
   '',
-  // H2: explicit-save gate. Eval-validated (memory-prompt-iteration case 3,
-  // 0/2 → 3/3): prevents "save this week's PR list" → activity-log noise.
+  // H2: 显式保存门控。评测验证（memory-prompt-iteration case 3，0/2→3/3）：
+  // 防止"保存本周 PR 列表"→活动日志噪音
   'These exclusions apply even when the user explicitly asks you to save. If they ask you to save a PR list or activity summary, ask what was *surprising* or *non-obvious* about it — that is the part worth keeping.',
 ]
 
 /**
- * Recall-side drift caveat. Single bullet under `## When to access memories`.
- * Proactive: verify memory against current state before answering.
+ * 记忆内容漂移免责声明：提醒模型在基于记忆回答前验证当前状态。
+ * 作为 `## When to access memories` 节中的一个独立条目使用。
  */
 export const MEMORY_DRIFT_CAVEAT =
   '- Memory records can become stale over time. Use memory as context for what was true at a given point in time. Before answering the user or building assumptions based solely on information in memory records, verify that the memory is still correct and up-to-date by reading the current state of the files or resources. If a recalled memory conflicts with current information, trust what you observe now — and update or remove the stale memory rather than acting on it.'
 
 /**
- * `## When to access memories` section. Includes MEMORY_DRIFT_CAVEAT.
+ * `## When to access memories` 文本节，包含 MEMORY_DRIFT_CAVEAT。
  *
- * H6 (branch-pollution evals #22856, case 5 1/3 on capy): the "ignore" bullet
- * is the delta. Failure mode: user says "ignore memory about X" → Claude reads
- * code correctly but adds "not Y as noted in memory" — treats "ignore" as
- * "acknowledge then override" rather than "don't reference at all." The bullet
- * names that anti-pattern explicitly.
+ * H6 说明（分支污染评测 #22856，case 5，capy 上 1/3）：
+ * 新增"ignore"条目是差异所在。失败模式：用户说"ignore memory about X"
+ * → Claude 正确读取代码但追加"not Y as noted in memory"——
+ * 将"ignore"视为"确认后覆盖"而非"完全不引用"。此条目明确命名该反模式。
  *
- * Token budget (H6a): merged old bullets 1+2, tightened both. Old 4 lines
- * were ~70 tokens; new 4 lines are ~73 tokens. Net ~+3.
+ * Token 预算（H6a）：合并旧条目 1+2，精简措辞。
+ * 旧 4 行约 70 token；新 4 行约 73 token，净增约 +3。
  */
 export const WHEN_TO_ACCESS_SECTION: readonly string[] = [
   '## When to access memories',
   '- When memories seem relevant, or the user references prior-conversation work.',
   '- You MUST access memory when the user explicitly asks you to check, recall, or remember.',
+  // 显式处理"ignore memory"指令：应完全不引用，而非"确认后覆盖"
   '- If the user says to *ignore* or *not use* memory: proceed as if MEMORY.md were empty. Do not apply remembered facts, cite, compare against, or mention memory content.',
-  MEMORY_DRIFT_CAVEAT,
+  MEMORY_DRIFT_CAVEAT, // 记忆漂移免责声明，提醒验证当前状态
 ]
 
 /**
- * `## Trusting what you recall` section. Heavier-weight guidance on HOW to
- * treat a memory once you've recalled it — separate from WHEN to access.
+ * `## Before recommending from memory` 文本节（重量级记忆信任指导）。
  *
- * Eval-validated (memory-prompt-iteration.eval.ts, 2026-03-17):
- *   H1 (verify function/file claims): 0/2 → 3/3 via appendSystemPrompt. When
- *      buried as a bullet under "When to access", dropped to 0/3 — position
- *      matters. The H1 cue is about what to DO with a memory, not when to
- *      look, so it needs its own section-level trigger context.
- *   H5 (read-side noise rejection): 0/2 → 3/3 via appendSystemPrompt, 2/3
- *      in-place as a bullet. Partial because "snapshot" is intuitively closer
- *      to "when to access" than H1 is.
+ * 与 WHEN_TO_ACCESS_SECTION 的区别：
+ * - WHEN_TO_ACCESS：何时查看记忆（访问时机）
+ * - TRUSTING_RECALL：如何对待已召回的记忆内容（使用方式）
  *
- * Known gap: H1 doesn't cover slash-command claims (0/3 on the /fork case —
- * slash commands aren't files or functions in the model's ontology).
+ * 评测验证（memory-prompt-iteration.eval.ts，2026-03-17）：
+ * - H1（验证函数/文件声明）：0/2 → 3/3（通过 appendSystemPrompt）；
+ *   作为"When to access"的条目时降至 0/3 ——
+ *   位置很关键：H1 是关于"如何使用记忆"，需要独立的节级触发上下文
+ * - H5（读取侧噪音拒绝）：0/2 → 3/3（appendSystemPrompt），2/3（原位条目）
+ *
+ * 已知缺口：H1 不覆盖 slash 命令声明（/fork case 上 0/3 ——
+ * slash 命令在模型认知中不属于文件或函数）。
+ *
+ * 标题措辞说明：
+ * "Before recommending"（行动提示，在决策点触发）比
+ * "Trusting what you recall"（抽象描述）测试结果更好（3/3 vs 0/3）。
+ * 相同正文，仅标题不同。
  */
 export const TRUSTING_RECALL_SECTION: readonly string[] = [
-  // Header wording matters: "Before recommending" (action cue at the decision
-  // point) tested better than "Trusting what you recall" (abstract). The
-  // appendSystemPrompt variant with this header went 3/3; the abstract header
-  // went 0/3 in-place. Same body text — only the header differed.
   '## Before recommending from memory',
   '',
   'A memory that names a specific function, file, or flag is a claim that it existed *when the memory was written*. It may have been renamed, removed, or never merged. Before recommending it:',
   '',
-  '- If the memory names a file path: check the file exists.',
-  '- If the memory names a function or flag: grep for it.',
+  '- If the memory names a file path: check the file exists.',        // 文件路径：验证文件是否仍存在
+  '- If the memory names a function or flag: grep for it.',            // 函数/标志：grep 验证是否仍存在
   '- If the user is about to act on your recommendation (not just asking about history), verify first.',
   '',
-  '"The memory says X exists" is not the same as "X exists now."',
+  '"The memory says X exists" is not the same as "X exists now."',    // 核心提醒：记忆≠当前事实
   '',
+  // 摘要类记忆（架构快照、活动日志）是时间点冻结，不代表当前状态
   'A memory that summarizes repo state (activity logs, architecture snapshots) is frozen in time. If the user asks about *recent* or *current* state, prefer `git log` or reading the code over recalling the snapshot.',
 ]
 
 /**
- * Frontmatter format example with the `type` field.
+ * frontmatter 格式示例（包含 type 字段），供记忆保存指导中展示给模型参考。
+ * 格式：代码块 → frontmatter 头 → 内容模板（含 Why/How to apply 结构提示）。
  */
 export const MEMORY_FRONTMATTER_EXAMPLE: readonly string[] = [
   '```markdown',
   '---',
   'name: {{memory name}}',
   'description: {{one-line description — used to decide relevance in future conversations, so be specific}}',
-  `type: {{${MEMORY_TYPES.join(', ')}}}`,
+  `type: {{${MEMORY_TYPES.join(', ')}}}`, // 动态列出所有合法类型，保持与 MEMORY_TYPES 同步
   '---',
   '',
   '{{memory content — for feedback/project types, structure as: rule/fact, then **Why:** and **How to apply:** lines}}',

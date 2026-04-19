@@ -1,3 +1,28 @@
+/**
+ * usePostCompactSurvey.tsx — 压缩后调查 Hook
+ *
+ * 在 Claude Code 系统流程中的位置：
+ *   会话压缩（Compact）完成 → REPL 检测到压缩边界消息 → usePostCompactSurvey → 在下一条消息后弹出调查
+ *
+ * 主要功能：
+ *   usePostCompactSurvey：自定义 React Hook，
+ *   在会话上下文压缩后，以 20% 概率在下一条用户/助手消息到来时弹出满意度调查。
+ *   采用"延迟显示"（deferred display）模式：先记录压缩边界 UUID，
+ *   等到新消息到来后再决定是否弹出调查，避免在压缩瞬间打断用户。
+ *
+ * 辅助函数：
+ *   hasMessageAfterBoundary：检查指定压缩边界 UUID 之后是否已有用户/助手消息。
+ *
+ * 事件追踪：
+ *   - 事件名：'tengu_post_compact_survey_event'，上报至 Statsig + OTel
+ *   - 额外携带 session_memory_compaction_enabled 字段，区分是否启用了会话记忆压缩
+ *
+ * React 编译器优化说明：
+ *   - 通过 _c(23) 创建 23 个缓存槽位，对 options 对象、effect 回调、依赖数组、返回对象进行细粒度缓存
+ *   - _temp/_temp2/_temp3/_temp4 为编译器提升的纯函数，避免在每次渲染时重新创建内联函数
+ *   - $[2] 使用 sentinel 值保护 Set 初始化，确保 seenCompactBoundaries 的初始 Set 全局唯一
+ *   - $[3] 使用 sentinel 值缓存 useSurveyState 的 options 对象（静态，永不变化）
+ */
 import { c as _c } from "react/compiler-runtime";
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { isFeedbackSurveyDisabled } from 'src/services/analytics/config.js';
@@ -10,29 +35,79 @@ import { isCompactBoundaryMessage } from '../../utils/messages.js';
 import { logOTelEvent } from '../../utils/telemetry/events.js';
 import { useSurveyState } from './useSurveyState.js';
 import type { FeedbackSurveyResponse } from './utils.js';
+// 感谢提示展示时长（毫秒）：3 秒后自动关闭
 const HIDE_THANKS_AFTER_MS = 3000;
+// Statsig 特性门控名称：压缩后调查功能开关
 const POST_COMPACT_SURVEY_GATE = 'tengu_post_compact_survey';
+// 调查弹出概率：20%，避免对用户造成过多打扰
 const SURVEY_PROBABILITY = 0.2; // Show survey 20% of the time after compaction
 
+/**
+ * hasMessageAfterBoundary
+ *
+ * 整体流程：
+ *   1. 在 messages 数组中定位压缩边界消息的下标（通过 uuid 匹配）
+ *   2. 若找不到边界消息（返回 -1），说明边界已失效，直接返回 false
+ *   3. 从边界消息的下一条开始向后遍历，找到第一条 user 或 assistant 消息则返回 true
+ *   4. 遍历完毕未命中则返回 false
+ *
+ * 在系统中的角色：
+ *   是"延迟显示"逻辑的核心判断条件：
+ *   当 pendingCompactBoundaryUuid 不为空时，usePostCompactSurvey 调用此函数
+ *   判断压缩后是否已有新消息到来，若是则决定是否（20% 概率）弹出调查。
+ */
 function hasMessageAfterBoundary(messages: Message[], boundaryUuid: string): boolean {
+  // 找到压缩边界消息的位置
   const boundaryIndex = messages.findIndex(msg => msg.uuid === boundaryUuid);
+  // 边界消息不存在（可能已被清理），直接视为无效
   if (boundaryIndex === -1) {
     return false;
   }
 
   // Check if there's a user or assistant message after the boundary
+  // 从边界消息后一位开始遍历，寻找用户或助手消息
   for (let i = boundaryIndex + 1; i < messages.length; i++) {
     const msg = messages[i];
+    // 找到 user 或 assistant 类型的消息，说明压缩后已有新交互
     if (msg && (msg.type === 'user' || msg.type === 'assistant')) {
       return true;
     }
   }
+  // 边界后没有任何用户/助手消息，调查还不应弹出
   return false;
 }
+/**
+ * usePostCompactSurvey
+ *
+ * 整体流程：
+ *   1. 解析参数：hasActivePrompt（是否有权限/询问弹窗活跃）、enabled（是否启用，默认 true）
+ *   2. 初始化状态：
+ *      - gateEnabled（Statsig 门控结果，null = 尚未查询）
+ *      - seenCompactBoundaries（已处理过的压缩边界 UUID 集合，$[2] 使用 sentinel 值保护初始 Set 全局唯一）
+ *      - pendingCompactBoundaryUuid（"延迟等待"的压缩边界 UUID，为 null 表示当前无待处理边界）
+ *   3. 通过 _temp/_temp2（hoisted 函数）配置 onOpen/onSelect 回调，$[3] 使用 sentinel 值缓存 options 对象（永不变化）
+ *   4. 调用 useSurveyState 获取调查状态机（state/open/handleSelect 等）
+ *   5. useEffect #1（依赖 enabled）：查询 Statsig 门控，将结果存入 gateEnabled
+ *   6. useMemo（依赖 messages）：从消息列表中提取所有压缩边界 UUID，构成 currentCompactBoundaries Set
+ *   7. useEffect #2（主逻辑，依赖 8 个变量）：
+ *      a. 各类前置条件检查（enabled/state/isLoading/hasActivePrompt/gateEnabled/env 变量）
+ *      b. 若 pendingCompactBoundaryUuid 非空：检查该边界后是否已有新消息
+ *         - 有新消息 → 清空 pending，以 20% 概率调用 open() 弹出调查
+ *      c. 检测新出现的压缩边界（未在 seenCompactBoundaries 中）：
+ *         - 更新 seenCompactBoundaries，将最新边界 UUID 存入 pendingCompactBoundaryUuid
+ *   8. 缓存并返回 { state, lastResponse, handleSelect }（$[19-22] 缓存）
+ *
+ * 在系统中的角色：
+ *   提供"压缩后满意度调查"的完整状态，供 FeedbackSurveyView 渲染调查 UI。
+ *   采用"延迟显示"模式确保调查不在压缩瞬间打断用户，而是在下一条消息到来后才弹出。
+ */
 export function usePostCompactSurvey(messages, isLoading, t0, t1) {
+  // React 编译器生成的 23 槽缓存，对 options/effect 回调/依赖数组/返回对象进行细粒度记忆化
   const $ = _c(23);
+  // t0 为 hasActivePrompt 参数，默认 false（无活跃权限/询问弹窗）
   const hasActivePrompt = t0 === undefined ? false : t0;
   let t2;
+  // $[0] 缓存 t1（options 对象引用），引用不变时跳过解构
   if ($[0] !== t1) {
     t2 = t1 === undefined ? {} : t1;
     $[0] = t1;
@@ -43,20 +118,29 @@ export function usePostCompactSurvey(messages, isLoading, t0, t1) {
   const {
     enabled: t3
   } = t2;
+  // enabled 默认为 true，允许外部传入 false 完全禁用调查
   const enabled = t3 === undefined ? true : t3;
+  // gateEnabled：null = 门控状态未知，true/false = Statsig 门控已查询
   const [gateEnabled, setGateEnabled] = useState(null);
   let t4;
+  // $[2] 使用 sentinel 值保护 seenCompactBoundaries 的初始 Set，
+  // 确保整个组件生命周期内只初始化一次（不会因每次渲染重建 Set）
   if ($[2] === Symbol.for("react.memo_cache_sentinel")) {
     t4 = new Set();
     $[2] = t4;
   } else {
     t4 = $[2];
   }
+  // seenCompactBoundaries：记录已处理过的压缩边界 UUID，防止重复触发调查
   const seenCompactBoundaries = useRef(t4);
+  // pendingCompactBoundaryUuid：记录"正在等待下一条消息"的压缩边界 UUID
   const pendingCompactBoundaryUuid = useRef(null);
+  // onOpen/onSelect 直接引用 hoisted 函数（_temp/_temp2），引用稳定，无需 useCallback
   const onOpen = _temp;
   const onSelect = _temp2;
   let t5;
+  // $[3] 使用 sentinel 值缓存 useSurveyState 的 options 对象：
+  // hideThanksAfterMs/onOpen/onSelect 均为稳定值，options 对象永不重建
   if ($[3] === Symbol.for("react.memo_cache_sentinel")) {
     t5 = {
       hideThanksAfterMs: HIDE_THANKS_AFTER_MS,
@@ -67,6 +151,7 @@ export function usePostCompactSurvey(messages, isLoading, t0, t1) {
   } else {
     t5 = $[3];
   }
+  // 获取调查状态机：state（当前状态）、open（触发弹出）、handleSelect（处理用户选择）
   const {
     state,
     lastResponse,
@@ -75,11 +160,14 @@ export function usePostCompactSurvey(messages, isLoading, t0, t1) {
   } = useSurveyState(t5);
   let t6;
   let t7;
+  // useEffect #1：仅依赖 enabled，在挂载或 enabled 变化时查询 Statsig 门控
   if ($[4] !== enabled) {
     t6 = () => {
+      // 若 hook 被禁用，跳过门控查询
       if (!enabled) {
         return;
       }
+      // 查询 Statsig 缓存的门控结果并存入 gateEnabled state
       setGateEnabled(checkStatsigFeatureGate_CACHED_MAY_BE_STALE(POST_COMPACT_SURVEY_GATE));
     };
     t7 = [enabled];
@@ -92,6 +180,8 @@ export function usePostCompactSurvey(messages, isLoading, t0, t1) {
   }
   useEffect(t6, t7);
   let t8;
+  // useMemo：从消息列表提取所有压缩边界 UUID → Set（仅 messages 变化时重新计算）
+  // _temp3 = msg => isCompactBoundaryMessage(msg)，_temp4 = msg => msg.uuid
   if ($[7] !== messages) {
     t8 = new Set(messages.filter(_temp3).map(_temp4));
     $[7] = messages;
@@ -99,41 +189,55 @@ export function usePostCompactSurvey(messages, isLoading, t0, t1) {
   } else {
     t8 = $[8];
   }
+  // currentCompactBoundaries：当前消息列表中所有压缩边界的 UUID 集合
   const currentCompactBoundaries = t8;
   let t10;
   let t9;
+  // useEffect #2（主逻辑）：依赖 8 个变量，任一变化时重新评估是否弹出调查
   if ($[9] !== currentCompactBoundaries || $[10] !== enabled || $[11] !== gateEnabled || $[12] !== hasActivePrompt || $[13] !== isLoading || $[14] !== messages || $[15] !== open || $[16] !== state) {
     t9 = () => {
+      // 前置条件 1：hook 被禁用时直接返回
       if (!enabled) {
         return;
       }
+      // 前置条件 2：调查已在展示中，或正在加载（避免在 loading 期间弹出）
       if (state !== "closed" || isLoading) {
         return;
       }
+      // 前置条件 3：有活跃的权限/询问弹窗，避免 UI 冲突
       if (hasActivePrompt) {
         return;
       }
+      // 前置条件 4：Statsig 门控未开启
       if (gateEnabled !== true) {
         return;
       }
+      // 前置条件 5：全局反馈调查被禁用（由策略或配置控制）
       if (isFeedbackSurveyDisabled()) {
         return;
       }
+      // 前置条件 6：环境变量明确禁用反馈调查
       if (isEnvTruthy(process.env.CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY)) {
         return;
       }
+      // "延迟显示"逻辑：如果有待处理的压缩边界，检查其后是否已有新消息
       if (pendingCompactBoundaryUuid.current !== null) {
         if (hasMessageAfterBoundary(messages, pendingCompactBoundaryUuid.current)) {
+          // 新消息已到达，清空 pending 标志
           pendingCompactBoundaryUuid.current = null;
+          // 以 20% 概率弹出满意度调查
           if (Math.random() < SURVEY_PROBABILITY) {
             open();
           }
           return;
         }
       }
+      // 检测新出现的压缩边界（未在 seenCompactBoundaries 中的 UUID）
       const newBoundaries = Array.from(currentCompactBoundaries).filter(uuid => !seenCompactBoundaries.current.has(uuid));
       if (newBoundaries.length > 0) {
+        // 将所有当前边界标记为"已见"，防止下次重复处理
         seenCompactBoundaries.current = new Set(currentCompactBoundaries);
+        // 记录最新的压缩边界 UUID，等待下一条消息到来后再决定是否弹出调查
         pendingCompactBoundaryUuid.current = newBoundaries[newBoundaries.length - 1];
       }
     };
@@ -154,6 +258,7 @@ export function usePostCompactSurvey(messages, isLoading, t0, t1) {
   }
   useEffect(t9, t10);
   let t11;
+  // 缓存返回对象：仅在 state/lastResponse/handleSelect 三者之一变化时重建对象
   if ($[19] !== handleSelect || $[20] !== lastResponse || $[21] !== state) {
     t11 = {
       state,
@@ -169,20 +274,47 @@ export function usePostCompactSurvey(messages, isLoading, t0, t1) {
   }
   return t11;
 }
+/**
+ * _temp4（编译器提升函数）
+ *
+ * 原始源码：msg => msg.uuid
+ * 角色：useMemo 内 .map() 的迭代函数，从消息对象中提取 uuid 字符串，
+ *       用于将压缩边界消息列表转换为 UUID 集合（currentCompactBoundaries）。
+ */
 function _temp4(msg_0) {
+  // 提取消息的 uuid 字段，供 Set 构造函数去重
   return msg_0.uuid;
 }
+/**
+ * _temp3（编译器提升函数）
+ *
+ * 原始源码：msg => isCompactBoundaryMessage(msg)
+ * 角色：useMemo 内 .filter() 的谓词函数，筛选出压缩边界类型的消息，
+ *       结果经 _temp4 映射为 UUID 后构成 currentCompactBoundaries Set。
+ */
 function _temp3(msg) {
+  // 判断消息是否为压缩边界消息（特殊 type 标识）
   return isCompactBoundaryMessage(msg);
 }
+/**
+ * _temp2（编译器提升函数）
+ *
+ * 原始源码：onSelect 回调（useCallback([], [...])）
+ * 角色：用户在调查中选择满意度选项后的事件上报回调，
+ *       同时向 Statsig（logEvent）和 OTel（logOTelEvent）上报 "responded" 事件，
+ *       并携带 session_memory_compaction_enabled 字段区分是否启用了会话记忆压缩。
+ */
 function _temp2(appearanceId_0, selected) {
+  // 查询当前是否启用了会话记忆压缩，作为额外维度上报
   const smCompactionEnabled_0 = shouldUseSessionMemoryCompaction();
+  // 上报至 Statsig，携带完整的调查响应信息
   logEvent("tengu_post_compact_survey_event", {
     event_type: "responded" as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
     appearance_id: appearanceId_0 as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
     response: selected as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
     session_memory_compaction_enabled: smCompactionEnabled_0 as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS
   });
+  // 同步上报至 OTel，统一 survey_type 为 "post_compact"
   logOTelEvent("feedback_survey", {
     event_type: "responded",
     appearance_id: appearanceId_0,
@@ -190,13 +322,24 @@ function _temp2(appearanceId_0, selected) {
     survey_type: "post_compact"
   });
 }
+/**
+ * _temp（编译器提升函数）
+ *
+ * 原始源码：onOpen 回调（useCallback([], [...])）
+ * 角色：调查弹窗首次展示时的事件上报回调，
+ *       同时向 Statsig 和 OTel 上报 "appeared" 事件，
+ *       并携带 session_memory_compaction_enabled 字段。
+ */
 function _temp(appearanceId) {
+  // 查询当前是否启用了会话记忆压缩，作为额外维度上报
   const smCompactionEnabled = shouldUseSessionMemoryCompaction();
+  // 上报至 Statsig，记录调查展示事件
   logEvent("tengu_post_compact_survey_event", {
     event_type: "appeared" as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
     appearance_id: appearanceId as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
     session_memory_compaction_enabled: smCompactionEnabled as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS
   });
+  // 同步上报至 OTel，统一 survey_type 为 "post_compact"
   logOTelEvent("feedback_survey", {
     event_type: "appeared",
     appearance_id: appearanceId,

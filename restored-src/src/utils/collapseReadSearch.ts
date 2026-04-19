@@ -1,3 +1,14 @@
+/**
+ * 读取/搜索操作折叠模块。
+ *
+ * 在 Claude Code 系统中，该模块将连续的 Read/Search/Bash 工具调用折叠为单条摘要展示，
+ * 避免大量工具调用消息刷屏，同时在详细模式（Ctrl+O）下仍可展开查看：
+ * - getToolSearchOrReadInfo()：判断工具调用是否为可折叠的搜索/读取操作
+ * - collapseReadSearchGroups()：将连续的搜索/读取消息折叠为 CollapsedReadSearchGroup
+ * - getSearchReadSummaryText()：生成"已读取 N 个文件、搜索 M 次"等摘要文本
+ * - summarizeRecentActivities()：汇总最近活动列表末尾的搜索/读取操作
+ * - 支持内存文件、团队内存、MCP 工具、bash 命令、git 操作等分类折叠
+ */
 import { feature } from 'bun:bundle'
 import type { UUID } from 'crypto'
 import { findToolByName, type Tools } from '../Tool.js'
@@ -42,7 +53,8 @@ const SNIP_TOOL_NAME = feature('HISTORY_SNIP')
 /* eslint-enable @typescript-eslint/no-require-imports */
 
 /**
- * Result of checking if a tool use is a search or read operation.
+ * 工具调用是否为搜索/读取操作的判断结果类型。
+ * isCollapsible 为 true 时可被折叠进摘要组。
  */
 export type SearchOrReadResult = {
   isCollapsible: boolean
@@ -50,23 +62,22 @@ export type SearchOrReadResult = {
   isRead: boolean
   isList: boolean
   isREPL: boolean
-  /** True if this is a Write/Edit targeting a memory file */
+  /** 为 true 时表示此操作是写入或编辑内存文件 */
   isMemoryWrite: boolean
   /**
-   * True for meta-operations that should be absorbed into a collapse group
-   * without incrementing any count (Snip, ToolSearch). They remain visible
-   * in verbose mode via the groupMessages iteration.
+   * 为 true 时表示这是元操作，应被静默吸收进折叠组，不增加计数（如 Snip、ToolSearch）。
+   * 在详细模式（verbose）下仍可通过 groupMessages 迭代查看。
    */
   isAbsorbedSilently: boolean
-  /** MCP server name when this is an MCP tool */
+  /** MCP 工具时对应的服务器名称 */
   mcpServerName?: string
-  /** Bash command that is NOT a search/read (under fullscreen mode) */
+  /** 非搜索/读取的 bash 命令（仅在全屏模式下启用） */
   isBash?: boolean
 }
 
 /**
- * Extract the primary file/directory path from a tool_use input.
- * Handles both `file_path` (Read/Write/Edit) and `path` (Grep/Glob).
+ * 从工具调用输入中提取主要文件/目录路径。
+ * 同时兼容 file_path（Read/Write/Edit 工具）和 path（Grep/Glob 工具）两种字段名。
  */
 function getFilePathFromToolInput(toolInput: unknown): string | undefined {
   const input = toolInput as
@@ -76,7 +87,9 @@ function getFilePathFromToolInput(toolInput: unknown): string | undefined {
 }
 
 /**
- * Check if a search tool use targets memory files by examining its path, pattern, and glob.
+ * 判断搜索工具调用是否针对内存文件，通过检查 path、pattern 和 glob 字段。
+ * 覆盖 Grep/Glob 工具直接按路径搜索、按 glob 模式匹配内存文件，
+ * 以及 bash grep/rg 等 shell 命令通过 command 字段指向内存路径的场景。
  */
 function isMemorySearch(toolInput: unknown): boolean {
   const input = toolInput as
@@ -85,18 +98,18 @@ function isMemorySearch(toolInput: unknown): boolean {
   if (!input) {
     return false
   }
-  // Check if the search path targets a memory file or directory (Grep/Glob tools)
+  // 检查搜索路径是否指向内存文件或目录（Grep/Glob 工具）
   if (input.path) {
     if (isAutoManagedMemoryFile(input.path) || isMemoryDirectory(input.path)) {
       return true
     }
   }
-  // Check glob patterns that indicate memory file access
+  // 检查 glob 模式是否匹配内存文件访问
   if (input.glob && isAutoManagedMemoryPattern(input.glob)) {
     return true
   }
-  // For shell commands (bash grep/rg, PowerShell Select-String, etc.),
-  // check if the command targets memory paths
+  // 对 shell 命令（bash grep/rg、PowerShell Select-String 等），
+  // 检查命令是否指向内存路径
   if (input.command && isShellCommandTargetingMemory(input.command)) {
     return true
   }
@@ -104,7 +117,8 @@ function isMemorySearch(toolInput: unknown): boolean {
 }
 
 /**
- * Check if a Write or Edit tool use targets a memory file and should be collapsed.
+ * 判断 Write 或 Edit 工具调用是否针对内存文件（应被折叠处理）。
+ * 仅匹配 FILE_WRITE_TOOL_NAME 和 FILE_EDIT_TOOL_NAME，且目标路径为自动管理的内存文件。
  */
 function isMemoryWriteOrEdit(toolName: string, toolInput: unknown): boolean {
   if (toolName !== FILE_WRITE_TOOL_NAME && toolName !== FILE_EDIT_TOOL_NAME) {
@@ -114,13 +128,13 @@ function isMemoryWriteOrEdit(toolName: string, toolInput: unknown): boolean {
   return filePath !== undefined && isAutoManagedMemoryFile(filePath)
 }
 
-// ~5 lines × ~60 cols. Generous static cap — the renderer lets Ink wrap.
+// 约 5 行 × 60 列。宽松的静态上限 — 渲染层会让 Ink 自动换行。
 const MAX_HINT_CHARS = 300
 
 /**
- * Format a bash command for the ⎿ hint. Drops blank lines, collapses runs of
- * inline whitespace, then caps total length. Newlines are preserved so the
- * renderer can indent continuation lines under ⎿.
+ * 将 bash 命令格式化为 ⎿ 提示行。
+ * 去除空行、合并行内连续空白，然后截断至最大长度。
+ * 保留换行符，使渲染层可以在 ⎿ 下对续行缩进展示。
  */
 function commandAsHint(command: string): string {
   const cleaned =
@@ -136,19 +150,19 @@ function commandAsHint(command: string): string {
 }
 
 /**
- * Checks if a tool is a search/read operation using the tool's isSearchOrReadCommand method.
- * Also treats Write/Edit of memory files as collapsible.
- * Returns detailed information about whether it's a search or read operation.
+ * 使用工具自身的 isSearchOrReadCommand 方法判断该工具是否为搜索/读取操作。
+ * 同时将针对内存文件的 Write/Edit 操作视为可折叠对象。
+ * 返回详细的分类信息（是否为搜索、读取、列表、REPL、内存写入等）。
  */
 export function getToolSearchOrReadInfo(
   toolName: string,
   toolInput: unknown,
   tools: Tools,
 ): SearchOrReadResult {
-  // REPL is absorbed silently — its inner tool calls are emitted as virtual
-  // messages (isVirtual: true) via newMessages and flow through this function
-  // as regular Read/Grep/Bash messages. The REPL wrapper itself contributes
-  // no counts and doesn't break the group, so consecutive REPL calls merge.
+  // REPL 被静默吸收 — 其内部工具调用通过 newMessages 以虚拟消息（isVirtual: true）
+  // 的形式发出，并作为普通的 Read/Grep/Bash 消息流经此函数。
+  // REPL 外层包装本身不计入任何计数，也不中断折叠组，
+  // 因此连续的 REPL 调用会合并为同一组。
   if (toolName === REPL_TOOL_NAME) {
     return {
       isCollapsible: true,
@@ -161,7 +175,7 @@ export function getToolSearchOrReadInfo(
     }
   }
 
-  // Memory file writes/edits are collapsible
+  // 内存文件写入/编辑视为可折叠操作
   if (isMemoryWriteOrEdit(toolName, toolInput)) {
     return {
       isCollapsible: true,
@@ -174,9 +188,8 @@ export function getToolSearchOrReadInfo(
     }
   }
 
-  // Meta-operations absorbed silently: Snip (context cleanup) and ToolSearch
-  // (lazy tool schema loading). Neither should break a collapse group or
-  // contribute to its count, but both stay visible in verbose mode.
+  // 静默吸收的元操作：Snip（上下文清理）和 ToolSearch（懒加载工具 schema）。
+  // 二者不应中断折叠组或计入计数，但在 verbose 模式下仍可见。
   if (
     (feature('HISTORY_SNIP') && toolName === SNIP_TOOL_NAME) ||
     (isFullscreenEnvEnabled() && toolName === TOOL_SEARCH_TOOL_NAME)
@@ -192,10 +205,9 @@ export function getToolSearchOrReadInfo(
     }
   }
 
-  // Fallback to REPL primitives: in REPL mode, Bash/Read/Grep/etc. are
-  // stripped from the execution tools list, but REPL emits them as virtual
-  // messages. Without the fallback they'd return isCollapsible: false and
-  // vanish from the summary line.
+  // 回退到 REPL 原语工具列表：REPL 模式下 Bash/Read/Grep 等工具会从执行工具列表中移除，
+  // 但 REPL 会以虚拟消息形式重新发出。若没有此回退，这些工具会返回 isCollapsible: false，
+  // 摘要行将不会计入它们。
   const tool =
     findToolByName(tools, toolName) ??
     findToolByName(getReplPrimitiveTools(), toolName)
@@ -210,16 +222,16 @@ export function getToolSearchOrReadInfo(
       isAbsorbedSilently: false,
     }
   }
-  // The tool's isSearchOrReadCommand method handles its own input validation via safeParse,
-  // so passing the raw input is safe. The type assertion is necessary because Tool[] uses
-  // the default generic which expects { [x: string]: any }, but we receive unknown at runtime.
+  // 工具的 isSearchOrReadCommand 方法内部通过 safeParse 处理自身输入校验，
+  // 因此直接传入原始 input 是安全的。类型断言是必要的，因为 Tool[] 泛型默认
+  // 期望 { [x: string]: any }，而此处运行时接收的是 unknown 类型。
   const result = tool.isSearchOrReadCommand(
     toolInput as { [x: string]: unknown },
   )
   const isList = result.isList ?? false
   const isCollapsible = result.isSearch || result.isRead || isList
-  // Under fullscreen mode, non-search/read Bash commands are also collapsible
-  // as their own category — "Ran N bash commands" instead of breaking the group.
+  // 全屏模式下，非搜索/读取的 bash 命令也可折叠，
+  // 显示为"运行了 N 条 bash 命令"而非中断当前折叠组。
   return {
     isCollapsible:
       isCollapsible ||
@@ -238,8 +250,8 @@ export function getToolSearchOrReadInfo(
 }
 
 /**
- * Check if a tool_use content block is a search/read operation.
- * Returns { isSearch, isRead, isREPL } if it's a collapsible search/read, null otherwise.
+ * 检查 tool_use 内容块是否为搜索/读取操作。
+ * 若为可折叠的搜索/读取操作则返回详细信息对象，否则返回 null。
  */
 export function getSearchOrReadFromContent(
   content: { type: string; name?: string; input?: unknown } | undefined,
@@ -273,7 +285,8 @@ export function getSearchOrReadFromContent(
 }
 
 /**
- * Checks if a tool is a search/read operation (for backwards compatibility).
+ * 判断工具是否为搜索/读取操作（向后兼容的简化版本）。
+ * 内部直接调用 getToolSearchOrReadInfo 并返回 isCollapsible 字段。
  */
 function isToolSearchOrRead(
   toolName: string,
@@ -284,8 +297,9 @@ function isToolSearchOrRead(
 }
 
 /**
- * Get the tool name, input, and search/read info from a message if it's a collapsible tool use.
- * Returns null if the message is not a collapsible tool use.
+ * 从消息中提取工具名称、输入及搜索/读取信息（若为可折叠工具调用）。
+ * 同时处理普通 assistant 消息和 grouped_tool_use 分组消息两种形式。
+ * 若消息不是可折叠工具调用则返回 null。
  */
 function getCollapsibleToolInfo(
   msg: RenderableMessage,
@@ -310,7 +324,7 @@ function getCollapsibleToolInfo(
     }
   }
   if (msg.type === 'grouped_tool_use') {
-    // For grouped tool uses, check the first message's input
+    // 对分组工具调用，取第一条消息的输入进行判断
     const firstContent = msg.messages[0]?.message.content[0]
     const info = getSearchOrReadFromContent(
       firstContent
@@ -326,7 +340,8 @@ function getCollapsibleToolInfo(
 }
 
 /**
- * Check if a message is assistant text that should break a group.
+ * 判断消息是否为应中断折叠组的助手文本内容。
+ * 仅非空的 text 类型内容块才视为"断组文本"。
  */
 function isTextBreaker(msg: RenderableMessage): boolean {
   if (msg.type === 'assistant') {
@@ -339,8 +354,8 @@ function isTextBreaker(msg: RenderableMessage): boolean {
 }
 
 /**
- * Check if a message is a non-collapsible tool use that should break a group.
- * This includes tool uses like Edit, Write, etc.
+ * 判断消息是否为应中断折叠组的不可折叠工具调用。
+ * Edit、Write 等非搜索/读取工具均属此类，会触发 flushGroup。
  */
 function isNonCollapsibleToolUse(
   msg: RenderableMessage,
@@ -367,6 +382,10 @@ function isNonCollapsibleToolUse(
   return false
 }
 
+/**
+ * 判断消息是否为 PreToolUse 钩子摘要（类型谓词）。
+ * PreToolUse 钩子摘要会被吸收进当前折叠组，不会中断组也不会被推迟输出。
+ */
 function isPreToolHookSummary(
   msg: RenderableMessage,
 ): msg is SystemStopHookSummaryMessage {
@@ -378,22 +397,22 @@ function isPreToolHookSummary(
 }
 
 /**
- * Check if a message should be skipped (not break the group, just passed through).
- * This includes thinking blocks, redacted thinking, attachments, etc.
+ * 判断消息是否可跳过（不应中断折叠组，直接透传）。
+ * 包括 thinking 块、redacted_thinking、attachment 附件和 system 系统消息。
  */
 function shouldSkipMessage(msg: RenderableMessage): boolean {
   if (msg.type === 'assistant') {
     const content = msg.message.content[0]
-    // Skip thinking blocks and other non-text, non-tool content
+    // 跳过 thinking 块和其他非文本非工具内容
     if (content?.type === 'thinking' || content?.type === 'redacted_thinking') {
       return true
     }
   }
-  // Skip attachment messages
+  // 跳过 attachment 消息
   if (msg.type === 'attachment') {
     return true
   }
-  // Skip system messages
+  // 跳过 system 消息
   if (msg.type === 'system') {
     return true
   }
@@ -401,7 +420,8 @@ function shouldSkipMessage(msg: RenderableMessage): boolean {
 }
 
 /**
- * Type predicate: Check if a message is a collapsible tool use.
+ * 类型谓词：判断消息是否为可折叠的工具调用（CollapsibleMessage）。
+ * 同时处理普通 assistant 消息和 grouped_tool_use 分组消息。
  */
 function isCollapsibleToolUse(
   msg: RenderableMessage,
@@ -425,8 +445,8 @@ function isCollapsibleToolUse(
 }
 
 /**
- * Type predicate: Check if a message is a tool result for collapsible tools.
- * Returns true if ALL tool results in the message are for tracked collapsible tools.
+ * 类型谓词：判断消息是否为可折叠工具的结果消息。
+ * 仅当消息中所有工具结果均属于已追踪的可折叠工具时才返回 true。
  */
 function isCollapsibleToolResult(
   msg: RenderableMessage,
@@ -437,7 +457,7 @@ function isCollapsibleToolResult(
       (c): c is { type: 'tool_result'; tool_use_id: string } =>
         c.type === 'tool_result',
     )
-    // Only return true if there are tool results AND all of them are for collapsible tools
+    // 仅当存在工具结果且全部属于可折叠工具时才返回 true
     return (
       toolResults.length > 0 &&
       toolResults.every(r => collapsibleToolUseIds.has(r.tool_use_id))
@@ -447,7 +467,7 @@ function isCollapsibleToolResult(
 }
 
 /**
- * Get all tool use IDs from a single message (handles grouped tool uses).
+ * 从单条消息中提取所有工具调用 ID（兼容 grouped_tool_use 分组消息）。
  */
 function getToolUseIdsFromMessage(msg: RenderableMessage): string[] {
   if (msg.type === 'assistant') {
@@ -468,7 +488,7 @@ function getToolUseIdsFromMessage(msg: RenderableMessage): string[] {
 }
 
 /**
- * Get all tool use IDs from a collapsed read/search group.
+ * 从折叠的读取/搜索组中提取所有工具调用 ID。
  */
 export function getToolUseIdsFromCollapsedGroup(
   message: CollapsedReadSearchGroup,
@@ -481,7 +501,8 @@ export function getToolUseIdsFromCollapsedGroup(
 }
 
 /**
- * Check if any tool in a collapsed group is in progress.
+ * 检查折叠组内是否有任意工具调用仍在进行中。
+ * 用于判断折叠组徽章是否应显示为"加载中"状态。
  */
 export function hasAnyToolInProgress(
   message: CollapsedReadSearchGroup,
@@ -493,9 +514,10 @@ export function hasAnyToolInProgress(
 }
 
 /**
- * Get the underlying NormalizedMessage for display (timestamp/model).
- * Handles nested GroupedToolUseMessage within collapsed groups.
- * Returns a NormalizedAssistantMessage or NormalizedUserMessage (never GroupedToolUseMessage).
+ * 获取折叠组的底层显示消息（用于展示时间戳/模型信息）。
+ * 处理折叠组中嵌套 GroupedToolUseMessage 的情况，
+ * 返回值永远是 NormalizedAssistantMessage 或 NormalizedUserMessage，
+ * 不会是 GroupedToolUseMessage。
  */
 export function getDisplayMessageFromCollapsed(
   message: CollapsedReadSearchGroup,
@@ -508,7 +530,8 @@ export function getDisplayMessageFromCollapsed(
 }
 
 /**
- * Count the number of tool uses in a message (handles grouped tool uses).
+ * 统计一条消息中的工具调用数量（兼容 grouped_tool_use 分组消息）。
+ * 分组消息按其内部成员数计算，普通消息计为 1。
  */
 function countToolUses(msg: RenderableMessage): number {
   if (msg.type === 'grouped_tool_use') {
@@ -518,8 +541,8 @@ function countToolUses(msg: RenderableMessage): number {
 }
 
 /**
- * Extract file paths from read tool inputs in a message.
- * Returns an array of file paths (may have duplicates if same file is read multiple times in one grouped message).
+ * 从读取工具的输入中提取文件路径列表。
+ * 同一分组消息中同一文件被多次读取时可能出现重复路径。
  */
 function getFilePathsFromReadMessage(msg: RenderableMessage): string[] {
   const paths: string[] = []
@@ -548,9 +571,9 @@ function getFilePathsFromReadMessage(msg: RenderableMessage): string[] {
 }
 
 /**
- * Scan a bash tool result for commit SHAs and PR URLs and push them into the
- * group accumulator. Called only for results whose tool_use_id was recorded
- * in bashCommands (non-search/read bash).
+ * 扫描 bash 工具结果中的提交 SHA 和 PR URL，并写入折叠组累加器。
+ * 仅对 bashCommands 中已记录的工具调用结果（非搜索/读取的 bash）进行扫描。
+ * git push 会将 ref 更新写入 stderr，因此同时扫描 stdout 和 stderr。
  */
 function scanBashResultForGitOps(
   msg: CollapsibleMessage,
@@ -561,7 +584,7 @@ function scanBashResultForGitOps(
     | { stdout?: string; stderr?: string }
     | undefined
   if (!out?.stdout && !out?.stderr) return
-  // git push writes the ref update to stderr — scan both streams.
+  // git push 将 ref 更新写入 stderr — 同时扫描两个流
   const combined = (out.stdout ?? '') + '\n' + (out.stderr ?? '')
   for (const c of msg.message.content) {
     if (c.type !== 'tool_result') continue
@@ -582,46 +605,48 @@ type GroupAccumulator = {
   messages: CollapsibleMessage[]
   searchCount: number
   readFilePaths: Set<string>
-  // Count of read operations that don't have file paths (e.g., Bash cat commands)
+  // 不含文件路径的读取操作计数（如 Bash cat 命令）
   readOperationCount: number
-  // Count of directory-listing operations (ls, tree, du)
+  // 目录列表操作计数（ls、tree、du 等）
   listCount: number
   toolUseIds: Set<string>
-  // Memory file operation counts (tracked separately from regular counts)
+  // 内存文件操作计数（与常规计数分开追踪）
   memorySearchCount: number
   memoryReadFilePaths: Set<string>
   memoryWriteCount: number
-  // Team memory file operation counts (tracked separately)
+  // 团队内存文件操作计数（与个人内存分开追踪）
   teamMemorySearchCount?: number
   teamMemoryReadFilePaths?: Set<string>
   teamMemoryWriteCount?: number
-  // Non-memory search patterns for display beneath the collapsed summary
+  // 用于折叠摘要下方展示的非内存搜索模式参数
   nonMemSearchArgs: string[]
-  /** Most recently added non-memory operation, pre-formatted for display */
+  /** 最近添加的非内存操作，已预格式化以供显示 */
   latestDisplayHint: string | undefined
-  // MCP tool calls (tracked separately so display says "Queried slack" not "Read N files")
+  // MCP 工具调用（单独追踪，使摘要显示"查询了 slack"而非"读取了 N 个文件"）
   mcpCallCount?: number
   mcpServerNames?: Set<string>
-  // Bash commands that aren't search/read (tracked separately for "Ran N bash commands")
+  // 非搜索/读取的 bash 命令（单独追踪，显示"运行了 N 条 bash 命令"）
   bashCount?: number
-  // Bash tool_use_id → command string, so tool results can be scanned for
-  // commit SHAs / PR URLs (surfaced as "committed abc123, created PR #42")
+  // bash tool_use_id → 命令字符串，用于在工具结果中扫描
+  // 提交 SHA / PR URL（显示为"已提交 abc123、已创建 PR #42"）
   bashCommands?: Map<string, string>
   commits?: { sha: string; kind: CommitKind }[]
   pushes?: { branch: string }[]
   branches?: { ref: string; action: BranchAction }[]
   prs?: { number: number; url?: string; action: PrAction }[]
   gitOpBashCount?: number
-  // PreToolUse hook timing absorbed from hook summary messages
+  // 从 hook 摘要消息中吸收的 PreToolUse 钩子计时数据
   hookTotalMs: number
   hookCount: number
   hookInfos: StopHookInfo[]
-  // relevant_memories attachments absorbed into this group (auto-injected
-  // memories, not explicit Read calls). Paths mirrored into readFilePaths +
-  // memoryReadFilePaths so the inline "recalled N memories" text is accurate.
+  // 被吸收进本折叠组的 relevant_memories 附件（自动注入的内存，非显式 Read 调用）。
+  // 路径会同步写入 readFilePaths + memoryReadFilePaths，确保"已召回 N 条记忆"文本准确。
   relevantMemories?: { path: string; content: string; mtimeMs: number }[]
 }
 
+/**
+ * 创建一个空的折叠组累加器，根据当前运行模式（全屏/TEAMMEM）初始化可选字段。
+ */
 function createEmptyGroup(): GroupAccumulator {
   const group: GroupAccumulator = {
     messages: [],
@@ -662,22 +687,21 @@ function createCollapsedGroup(
   group: GroupAccumulator,
 ): CollapsedReadSearchGroup {
   const firstMsg = group.messages[0]!
-  // When file-path-based reads exist, use unique file count (Set.size) only.
-  // Adding bash operation count on top would double-count — e.g. Read(README.md)
-  // followed by Bash(wc -l README.md) should still show as 1 file, not 2.
-  // Fall back to operation count only when there are no file-path reads (bash-only).
+  // 存在按路径读取时，仅使用唯一文件计数（Set.size），避免双重计算：
+  // 例如 Read(README.md) 后紧跟 Bash(wc -l README.md)，应显示为 1 个文件，而非 2。
+  // 仅在没有文件路径读取（纯 bash）时才回退到操作计数。
   const totalReadCount =
     group.readFilePaths.size > 0
       ? group.readFilePaths.size
       : group.readOperationCount
-  // memoryReadFilePaths ⊆ readFilePaths (both populated from Read tool calls),
-  // so this count is safe to subtract from totalReadCount at readCount below.
-  // Absorbed relevant_memories attachments are NOT in readFilePaths — added
-  // separately after the subtraction so readCount stays correct.
+  // memoryReadFilePaths ⊆ readFilePaths（均来自 Read 工具调用），
+  // 故从 totalReadCount 中减去此计数是安全的。
+  // 吸收的 relevant_memories 附件不在 readFilePaths 中，
+  // 在减法之后单独加入 memoryReadCount，确保 readCount 正确。
   const toolMemoryReadCount = group.memoryReadFilePaths.size
   const memoryReadCount =
     toolMemoryReadCount + (group.relevantMemories?.length ?? 0)
-  // Non-memory read file paths: exclude memory and team memory paths
+  // 非内存读取文件路径：过滤掉内存和团队内存路径
   const teamMemReadPaths = feature('TEAMMEM')
     ? group.teamMemoryReadFilePaths
     : undefined
@@ -696,7 +720,7 @@ function createCollapsedGroup(
     : 0
   const result: CollapsedReadSearchGroup = {
     type: 'collapsed_read_search',
-    // Subtract memory + team memory counts so regular counts only reflect non-memory operations
+    // 减去内存和团队内存计数，使常规计数仅反映非内存操作
     searchCount: Math.max(
       0,
       group.searchCount - group.memorySearchCount - teamMemSearchCount,
@@ -706,9 +730,9 @@ function createCollapsedGroup(
       totalReadCount - toolMemoryReadCount - teamMemReadCount,
     ),
     listCount: group.listCount,
-    // REPL operations are intentionally not collapsed (see isCollapsible: false at line 32),
-    // so replCount in collapsed groups is always 0. The replCount field is kept for
-    // sub-agent progress display in AgentTool/UI.tsx which has a separate code path.
+    // REPL 操作有意不折叠（见上方 isCollapsible: false），
+    // 因此折叠组中 replCount 始终为 0。该字段保留是为了
+    // AgentTool/UI.tsx 中子代理进度展示使用，其有独立的代码路径。
     replCount: 0,
     memorySearchCount: group.memorySearchCount,
     memoryReadCount,
@@ -752,12 +776,12 @@ function createCollapsedGroup(
 }
 
 /**
- * Collapse consecutive Read/Search operations into summary groups.
+ * 将连续的读取/搜索操作折叠为摘要组。
  *
- * Rules:
- * - Groups consecutive search/read tool uses (Grep, Glob, Read, and Bash search/read commands)
- * - Includes their corresponding tool results in the group
- * - Breaks groups when assistant text appears
+ * 折叠规则：
+ * - 将连续的搜索/读取工具调用（Grep、Glob、Read 及 bash 搜索/读取命令）归入同一组
+ * - 对应的工具结果也包含在组内
+ * - 遇到助手文本消息时中断当前组
  */
 export function collapseReadSearchGroups(
   messages: RenderableMessage[],
@@ -781,11 +805,11 @@ export function collapseReadSearchGroups(
 
   for (const msg of messages) {
     if (isCollapsibleToolUse(msg, tools)) {
-      // This is a collapsible tool use - type predicate narrows to CollapsibleMessage
+      // 这是可折叠的工具调用 — 类型谓词将其收窄为 CollapsibleMessage
       const toolInfo = getCollapsibleToolInfo(msg, tools)!
 
       if (toolInfo.isMemoryWrite) {
-        // Memory file write/edit — check if it's team memory
+        // 内存文件写入/编辑 — 检查是否为团队内存
         const count = countToolUses(msg)
         if (
           feature('TEAMMEM') &&
@@ -797,12 +821,12 @@ export function collapseReadSearchGroups(
           currentGroup.memoryWriteCount += count
         }
       } else if (toolInfo.isAbsorbedSilently) {
-        // Snip/ToolSearch absorbed silently — no count, no summary text.
-        // Hidden from the default view but still shown in verbose mode
-        // (Ctrl+O) via the groupMessages iteration in CollapsedReadSearchContent.
+        // Snip/ToolSearch 被静默吸收 — 不计数，不生成摘要文本。
+        // 默认视图下隐藏，但在详细模式（Ctrl+O）下仍可通过
+        // CollapsedReadSearchContent 的 groupMessages 迭代查看。
       } else if (toolInfo.mcpServerName) {
-        // MCP search/read — counted separately so the summary says
-        // "Queried slack N times" instead of "Read N files".
+        // MCP 搜索/读取 — 单独计数，使摘要显示
+        // "查询了 slack N 次"而非"读取了 N 个文件"。
         const count = countToolUses(msg)
         currentGroup.mcpCallCount = (currentGroup.mcpCallCount ?? 0) + count
         currentGroup.mcpServerNames?.add(toolInfo.mcpServerName)
@@ -811,36 +835,35 @@ export function collapseReadSearchGroups(
           currentGroup.latestDisplayHint = `"${input.query}"`
         }
       } else if (isFullscreenEnvEnabled() && toolInfo.isBash) {
-        // Non-search/read Bash command — counted separately so the summary
-        // says "Ran N bash commands" instead of breaking the group.
+        // 非搜索/读取的 bash 命令 — 单独计数，使摘要显示
+        // "运行了 N 条 bash 命令"而非中断折叠组。
         const count = countToolUses(msg)
         currentGroup.bashCount = (currentGroup.bashCount ?? 0) + count
         const input = toolInfo.input as { command?: string } | undefined
         if (input?.command) {
-          // Prefer the stripped `# comment` if present (it's what Claude wrote
-          // for the human — same trigger as the comment-as-label tool-use render).
+          // 优先使用去掉 `# comment` 后的注释内容（这是 Claude 为人类写的注释，
+          // 与工具调用渲染中"注释作为标签"的逻辑触发条件相同）。
           currentGroup.latestDisplayHint =
             extractBashCommentLabel(input.command) ??
             commandAsHint(input.command)
-          // Remember tool_use_id → command so the result (arriving next) can
-          // be scanned for commit SHA / PR URL.
+          // 记录 tool_use_id → 命令字符串，以便在后续结果中扫描提交 SHA / PR URL。
           for (const id of getToolUseIdsFromMessage(msg)) {
             currentGroup.bashCommands?.set(id, input.command)
           }
         }
       } else if (toolInfo.isList) {
-        // Directory-listing bash commands (ls, tree, du) — counted separately
-        // so the summary says "Listed N directories" instead of "Read N files".
+        // 目录列表 bash 命令（ls、tree、du）— 单独计数，
+        // 使摘要显示"列出了 N 个目录"而非"读取了 N 个文件"。
         currentGroup.listCount += countToolUses(msg)
         const input = toolInfo.input as { command?: string } | undefined
         if (input?.command) {
           currentGroup.latestDisplayHint = commandAsHint(input.command)
         }
       } else if (toolInfo.isSearch) {
-        // Use the isSearch flag from the tool to properly categorize bash search commands
+        // 使用工具的 isSearch 标志对 bash 搜索命令正确分类
         const count = countToolUses(msg)
         currentGroup.searchCount += count
-        // Check if the search targets memory files (via path or glob pattern)
+        // 检查搜索目标是否为内存文件（通过路径或 glob 模式判断）
         if (
           feature('TEAMMEM') &&
           teamMemOps?.isTeamMemorySearch(toolInfo.input)
@@ -850,7 +873,7 @@ export function collapseReadSearchGroups(
         } else if (isMemorySearch(toolInfo.input)) {
           currentGroup.memorySearchCount += count
         } else {
-          // Regular (non-memory) search — collect pattern for display
+          // 常规（非内存）搜索 — 收集模式参数以供展示
           const input = toolInfo.input as { pattern?: string } | undefined
           if (input?.pattern) {
             currentGroup.nonMemSearchArgs.push(input.pattern)
@@ -858,7 +881,7 @@ export function collapseReadSearchGroups(
           }
         }
       } else {
-        // For reads, track unique file paths instead of counting operations
+        // 对于读取操作，追踪唯一文件路径而非操作次数
         const filePaths = getFilePathsFromReadMessage(msg)
         for (const filePath of filePaths) {
           currentGroup.readFilePaths.add(filePath)
@@ -867,14 +890,14 @@ export function collapseReadSearchGroups(
           } else if (isAutoManagedMemoryFile(filePath)) {
             currentGroup.memoryReadFilePaths.add(filePath)
           } else {
-            // Non-memory file read — update display hint
+            // 非内存文件读取 — 更新显示提示
             currentGroup.latestDisplayHint = getDisplayPath(filePath)
           }
         }
-        // If no file paths found (e.g., Bash read commands like ls, cat), count the operations
+        // 若未找到文件路径（如 ls、cat 等 bash 读取命令），则统计操作次数
         if (filePaths.length === 0) {
           currentGroup.readOperationCount += countToolUses(msg)
-          // Use the Bash command as the display hint (truncated for readability)
+          // 使用 bash 命令作为显示提示（截断以提高可读性）
           const input = toolInfo.input as { command?: string } | undefined
           if (input?.command) {
             currentGroup.latestDisplayHint = commandAsHint(input.command)
@@ -882,7 +905,7 @@ export function collapseReadSearchGroups(
         }
       }
 
-      // Track tool use IDs for matching results
+      // 追踪工具调用 ID 以便匹配对应结果
       for (const id of getToolUseIdsFromMessage(msg)) {
         currentGroup.toolUseIds.add(id)
       }
@@ -890,12 +913,12 @@ export function collapseReadSearchGroups(
       currentGroup.messages.push(msg)
     } else if (isCollapsibleToolResult(msg, currentGroup.toolUseIds)) {
       currentGroup.messages.push(msg)
-      // Scan bash results for commit SHAs / PR URLs to surface in the summary
+      // 扫描 bash 结果中的提交 SHA / PR URL，以便在摘要中展示
       if (isFullscreenEnvEnabled() && currentGroup.bashCommands?.size) {
         scanBashResultForGitOps(msg, currentGroup)
       }
     } else if (currentGroup.messages.length > 0 && isPreToolHookSummary(msg)) {
-      // Absorb PreToolUse hook summaries into the group instead of deferring
+      // 将 PreToolUse hook 摘要吸收进折叠组，而非推迟输出
       currentGroup.hookCount += msg.hookCount
       currentGroup.hookTotalMs +=
         msg.totalDurationMs ??
@@ -906,22 +929,21 @@ export function collapseReadSearchGroups(
       msg.type === 'attachment' &&
       msg.attachment.type === 'relevant_memories'
     ) {
-      // Absorb auto-injected memory attachments so "recalled N memories"
-      // renders inline with "ran N bash commands" instead of as a separate
-      // ⏺ block. Do NOT add paths to readFilePaths/memoryReadFilePaths —
-      // that would poison the readOperationCount fallback (bash-only reads
-      // have no paths; adding memory paths makes readFilePaths.size > 0 and
-      // suppresses the fallback). createCollapsedGroup adds .length to
-      // memoryReadCount after the readCount subtraction instead.
+      // 吸收自动注入的内存附件，使"已回忆 N 条记忆"与"运行了 N 条 bash 命令"
+      // 在行内一起渲染，而非单独显示为 ⏺ 块。
+      // 不要将路径加入 readFilePaths/memoryReadFilePaths ——
+      // 那样会污染 readOperationCount 的回退逻辑（仅有 bash 的读取没有路径；
+      // 加入内存路径会使 readFilePaths.size > 0，从而抑制回退）。
+      // createCollapsedGroup 在减去 readCount 之后再将 .length 加到 memoryReadCount。
       currentGroup.relevantMemories ??= []
       currentGroup.relevantMemories.push(...msg.attachment.memories)
     } else if (shouldSkipMessage(msg)) {
-      // Don't flush the group for skippable messages (thinking, attachments, system)
-      // If a group is in progress, defer these messages to output after the collapsed group
-      // This preserves the visual ordering where the collapsed badge appears at the position
-      // of the first tool use, not displaced by intervening skippable messages.
-      // Exception: nested_memory attachments are pushed through even during a group so
-      // ⎿ Loaded lines cluster tightly instead of being split by the badge's marginTop.
+      // 不因可跳过消息（thinking、附件、system）而刷新折叠组
+      // 若折叠组正在进行中，将这些消息推迟到折叠徽章之后输出，
+      // 以保证折叠徽章的视觉位置对齐第一条工具调用，
+      // 而非被中间插入的可跳过消息向下推移。
+      // 例外：nested_memory 附件即使在折叠组进行中也直接透传，
+      // 使"⎿ 已加载 N 行"紧密聚合，不被徽章的 marginTop 分隔。
       if (
         currentGroup.messages.length > 0 &&
         !(msg.type === 'attachment' && msg.attachment.type === 'nested_memory')
@@ -931,15 +953,15 @@ export function collapseReadSearchGroups(
         result.push(msg)
       }
     } else if (isTextBreaker(msg)) {
-      // Assistant text breaks the group
+      // 助手文本消息打断当前折叠组
       flushGroup()
       result.push(msg)
     } else if (isNonCollapsibleToolUse(msg, tools)) {
-      // Non-collapsible tool use breaks the group
+      // 不可折叠的工具调用打断当前折叠组
       flushGroup()
       result.push(msg)
     } else {
-      // User messages with non-collapsible tool results break the group
+      // 含不可折叠工具结果的用户消息打断当前折叠组
       flushGroup()
       result.push(msg)
     }
@@ -950,13 +972,13 @@ export function collapseReadSearchGroups(
 }
 
 /**
- * Generate a summary text for search/read/REPL counts.
- * @param searchCount Number of search operations
- * @param readCount Number of read operations
- * @param isActive Whether the group is still in progress (use present tense) or completed (use past tense)
- * @param replCount Number of REPL executions (optional)
- * @param memoryCounts Optional memory file operation counts
- * @returns Summary text like "Searching for 3 patterns, reading 2 files, REPL'd 5 times…"
+ * 生成搜索/读取/REPL 操作计数的摘要文本。
+ * @param searchCount 搜索操作数量
+ * @param readCount 读取操作数量
+ * @param isActive 折叠组是否仍在进行中（true 用现在时，false 用过去时）
+ * @param replCount REPL 执行次数（可选）
+ * @param memoryCounts 内存文件操作计数（可选）
+ * @returns 摘要文本，如"正在搜索 3 个模式，读取 2 个文件，REPL 执行 5 次……"
  */
 export function getSearchReadSummaryText(
   searchCount: number,
@@ -975,7 +997,7 @@ export function getSearchReadSummaryText(
 ): string {
   const parts: string[] = []
 
-  // Memory operations first
+  // 内存操作优先放在摘要最前面
   if (memoryCounts) {
     const { memorySearchCount, memoryReadCount, memoryWriteCount } =
       memoryCounts
@@ -1013,7 +1035,7 @@ export function getSearchReadSummaryText(
         `${verb} ${memoryWriteCount} ${memoryWriteCount === 1 ? 'memory' : 'memories'}`,
       )
     }
-    // Team memory operations
+    // 团队内存操作
     if (feature('TEAMMEM') && teamMemOps) {
       teamMemOps.appendTeamMemorySummaryParts(memoryCounts, isActive, parts)
     }
@@ -1066,10 +1088,9 @@ export function getSearchReadSummaryText(
 }
 
 /**
- * Summarize a list of recent tool activities into a compact description.
- * Rolls up trailing consecutive search/read operations using pre-computed
- * isSearch/isRead classifications from recording time. Falls back to the
- * last activity's description for non-collapsible tool uses.
+ * 将最近工具活动列表汇总为简洁描述。
+ * 将尾部连续的搜索/读取操作合并统计（使用记录时预计算的 isSearch/isRead 分类）。
+ * 对不可折叠的工具调用，回退为最后一条活动的描述文本。
  */
 export function summarizeRecentActivities(
   activities: readonly {
@@ -1081,7 +1102,7 @@ export function summarizeRecentActivities(
   if (activities.length === 0) {
     return undefined
   }
-  // Count trailing search/read activities from the end of the list
+  // 从列表末尾向前统计连续的搜索/读取活动数量
   let searchCount = 0
   let readCount = 0
   for (let i = activities.length - 1; i >= 0; i--) {
@@ -1098,8 +1119,8 @@ export function summarizeRecentActivities(
   if (collapsibleCount >= 2) {
     return getSearchReadSummaryText(searchCount, readCount, true)
   }
-  // Fall back to most recent activity with a description (some tools like
-  // SendMessage don't implement getActivityDescription, so search backward)
+  // 回退：向后查找最近一条有描述文本的活动
+  // （SendMessage 等部分工具未实现 getActivityDescription，需向后搜索）
   for (let i = activities.length - 1; i >= 0; i--) {
     if (activities[i]?.activityDescription) {
       return activities[i]!.activityDescription

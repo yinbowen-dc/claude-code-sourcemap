@@ -1,3 +1,10 @@
+/**
+ * 跨项目会话恢复模块。
+ *
+ * 在 Claude Code 系统中，该模块支持从不同工作目录恢复已存在的对话会话，
+ * 通过会话 ID 查找并加载原始项目的日志文件，
+ * 允许用户在切换目录后仍能继续之前的对话。
+ */
 import { sep } from 'path'
 import { getOriginalCwd } from '../bootstrap/state.js'
 import type { LogOption } from '../types/logs.js'

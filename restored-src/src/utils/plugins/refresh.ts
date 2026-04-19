@@ -1,20 +1,26 @@
 /**
- * Layer-3 refresh primitive: swap active plugin components in the running session.
+ * 插件活跃组件刷新模块 — Claude Code 插件系统的第三层（运行时状态层）
  *
- * Three-layer model (see reconciler.ts for Layer-2):
- * - Layer 1: intent (settings)
- * - Layer 2: materialization (~/.claude/plugins/) — reconcileMarketplaces()
- * - Layer 3: active components (AppState) — this file
+ * Claude Code 插件系统三层模型中的第三层：
+ *   Layer 1：意图层（settings.json 中的声明）
+ *   Layer 2：物化层（~/.claude/plugins/ 目录）← reconciler.ts
+ *   Layer 3：活跃组件层（AppState 中运行时加载的命令/代理/hooks）← 本文件
  *
- * Called from:
- * - /reload-plugins command (interactive, user-initiated)
- * - print.ts refreshPluginState() (headless, auto before first query with SYNC_PLUGIN_INSTALL)
- * - performBackgroundPluginInstallations() (background, auto after new marketplace install)
+ * 调用方：
+ *   - /reload-plugins 命令（交互式，用户主动触发）
+ *   - print.ts 的 refreshPluginState()（无界面模式，在首次查询前自动执行）
+ *   - performBackgroundPluginInstallations()（后台，新市场安装后自动触发）
  *
- * NOT called from:
- * - useManagePlugins needsRefresh effect — interactive mode shows a notification;
- *   user explicitly runs /reload-plugins (PR 5c)
- * - /plugin menu — sets needsRefresh, user runs /reload-plugins (PR 5b)
+ * 不被以下路径调用：
+ *   - useManagePlugins 的 needsRefresh effect（交互模式下显示通知，用户手动运行 /reload-plugins）
+ *
+ * 核心行为：
+ *   - 清空所有插件缓存（与旧的 needsRefresh 路径不同，旧路径只清除 loadAllPlugins 缓存）
+ *   - 串行执行全量加载（先 loadAllPlugins，再 getPluginCommands/getAgentDefinitions）
+ *   - 并发加载 MCP 和 LSP 服务器配置（写入 plugin.mcpServers/lspServers 缓存槽）
+ *   - 更新 AppState（plugins, agentDefinitions, mcp.pluginReconnectKey）
+ *   - 重新初始化 LSP 服务器管理器（无论是否有 LSP 插件）
+ *   - 加载 hooks（独立异常处理，失败不丢失已加载的命令/代理数据）
  */
 
 import { getOriginalCwd } from '../../bootstrap/state.js'
@@ -35,57 +41,63 @@ import { loadPluginMcpServers } from './mcpPluginIntegration.js'
 import { clearPluginCacheExclusions } from './orphanedPluginFilter.js'
 import { loadAllPlugins } from './pluginLoader.js'
 
+// AppState 的 setter 函数类型
 type SetAppState = (updater: (prev: AppState) => AppState) => void
 
+/**
+ * refreshActivePlugins 的返回类型，包含各类插件组件的计数统计。
+ */
 export type RefreshActivePluginsResult = {
-  enabled_count: number
-  disabled_count: number
-  command_count: number
-  agent_count: number
-  hook_count: number
-  mcp_count: number
-  /** LSP servers provided by enabled plugins. reinitializeLspServerManager()
-   * is called unconditionally so the manager picks these up (no-op if
-   * manager was never initialized). */
+  enabled_count: number    // 已启用的插件数量
+  disabled_count: number   // 已禁用的插件数量
+  command_count: number    // 插件提供的命令数量
+  agent_count: number      // 插件提供的代理数量
+  hook_count: number       // 插件提供的 hook 数量
+  mcp_count: number        // 插件提供的 MCP 服务器数量
+  /** 插件提供的 LSP 服务器数量。无论是否有 LSP 插件，reinitializeLspServerManager() 均会调用 */
   lsp_count: number
-  error_count: number
-  /** The refreshed agent definitions, for callers (e.g. print.ts) that also
-   * maintain a local mutable reference outside AppState. */
+  error_count: number      // 加载过程中出现的错误总数
+  /** 刷新后的代理定义，供 print.ts 等在 AppState 之外维护本地引用的调用方使用 */
   agentDefinitions: AgentDefinitionsResult
-  /** The refreshed plugin commands, same rationale as agentDefinitions. */
+  /** 刷新后的插件命令，与 agentDefinitions 同理 */
   pluginCommands: Command[]
 }
 
 /**
- * Refresh all active plugin components: commands, agents, hooks, MCP-reconnect
- * trigger, AppState plugin arrays. Clears ALL plugin caches (unlike the old
- * needsRefresh path which only cleared loadAllPlugins and returned stale data
- * from downstream memoized loaders).
+ * 刷新所有活跃的插件组件（命令、代理、hooks、MCP 重连触发器、AppState 插件数组）。
  *
- * Consumes plugins.needsRefresh (sets to false).
- * Increments mcp.pluginReconnectKey so useManageMCPConnections effects re-run
- * and pick up new plugin MCP servers.
+ * 执行顺序（顺序很重要）：
+ *   1. 清空所有插件缓存（clearAllCaches + clearPluginCacheExclusions）
+ *   2. 串行执行 loadAllPlugins()（先于缓存依赖的消费者，防止竞争条件）
+ *   3. 并发执行 getPluginCommands 和 getAgentDefinitions（依赖步骤 2 的缓存）
+ *   4. 并发为每个已启用插件加载 MCP/LSP 服务器（填充缓存槽）
+ *   5. 通过 setAppState 原子性更新 AppState（plugins, agentDefinitions, mcp.pluginReconnectKey）
+ *   6. 重新初始化 LSP 管理器（读取新的插件 LSP 配置）
+ *   7. 加载 hooks（独立 try/catch，失败不影响已加载的命令/代理）
  *
- * LSP: if plugins now contribute LSP servers, reinitializeLspServerManager()
- * re-reads config. Servers are lazy-started so this is just config parsing.
+ * 副作用：
+ *   - 消费 plugins.needsRefresh（设为 false）
+ *   - 递增 mcp.pluginReconnectKey（触发 useManageMCPConnections 副作用重新运行）
+ *
+ * @param setAppState - AppState 的 setter 函数
+ * @returns 刷新后的统计数据和代理/命令定义
  */
 export async function refreshActivePlugins(
   setAppState: SetAppState,
 ): Promise<RefreshActivePluginsResult> {
   logForDebugging('refreshActivePlugins: clearing all plugin caches')
+  // 清空所有插件相关缓存（memoize 缓存、加载状态等）
   clearAllCaches()
-  // Orphan exclusions are session-frozen by default, but /reload-plugins is
-  // an explicit "disk changed, re-read it" signal — recompute them too.
+  // 清空孤儿排除缓存：/reload-plugins 是"磁盘已变更，重新读取"的信号
   clearPluginCacheExclusions()
 
-  // Sequence the full load before cache-only consumers. Before #23693 all
-  // three shared loadAllPlugins()'s memoize promise so Promise.all was a
-  // no-op race. After #23693 getPluginCommands/getAgentDefinitions call
-  // loadAllPluginsCacheOnly (separate memoize) — racing them means they
-  // read installed_plugins.json before loadAllPlugins() has cloned+cached
-  // the plugin, returning plugin-cache-miss. loadAllPlugins warms the
-  // cache-only memoize on completion, so the awaits below are ~free.
+  // 步骤 2：串行执行 loadAllPlugins（必须先于 getPluginCommands/getAgentDefinitions）
+  // 原因：#23693 后 getPluginCommands/getAgentDefinitions 调用 loadAllPluginsCacheOnly
+  // （独立的 memoize）。若并发执行，缓存可能在 loadAllPlugins 完成前被读取
+  // 导致 plugin-cache-miss。loadAllPlugins 完成后会填充 cache-only memoize，
+  // 后续的 getPluginCommands/getAgentDefinitions 的 await 几乎免费（无需重新加载）
   const pluginResult = await loadAllPlugins()
+  // 步骤 3：并发加载命令和代理（依赖步骤 2 已填充的缓存）
   const [pluginCommands, agentDefinitions] = await Promise.all([
     getPluginCommands(),
     getAgentDefinitionsWithOverrides(getOriginalCwd()),
@@ -93,62 +105,62 @@ export async function refreshActivePlugins(
 
   const { enabled, disabled, errors } = pluginResult
 
-  // Populate mcpServers/lspServers on each enabled plugin. These are lazy
-  // cache slots NOT filled by loadAllPlugins() — they're written later by
-  // extractMcpServersFromPlugins/getPluginLspServers, which races with this.
-  // Loading here gives accurate metrics AND warms the cache slots so the MCP
-  // connection manager (triggered by pluginReconnectKey bump) sees the servers
-  // without re-parsing manifests. Errors are pushed to the shared errors array.
+  // 步骤 4：并发为每个已启用插件加载 MCP 和 LSP 服务器配置
+  // 这些是 loadAllPlugins 不填充的懒加载缓存槽。
+  // 提前加载的好处：
+  //   a) 获得准确的统计数据
+  //   b) 填充缓存槽，使后续的 MCP 连接管理器（由 pluginReconnectKey bump 触发）
+  //      无需重新解析清单文件即可看到服务器
   const [mcpCounts, lspCounts] = await Promise.all([
     Promise.all(
       enabled.map(async p => {
-        if (p.mcpServers) return Object.keys(p.mcpServers).length
+        if (p.mcpServers) return Object.keys(p.mcpServers).length  // 已缓存，直接计数
         const servers = await loadPluginMcpServers(p, errors)
-        if (servers) p.mcpServers = servers
+        if (servers) p.mcpServers = servers  // 写入缓存槽
         return servers ? Object.keys(servers).length : 0
       }),
     ),
     Promise.all(
       enabled.map(async p => {
-        if (p.lspServers) return Object.keys(p.lspServers).length
+        if (p.lspServers) return Object.keys(p.lspServers).length  // 已缓存，直接计数
         const servers = await loadPluginLspServers(p, errors)
-        if (servers) p.lspServers = servers
+        if (servers) p.lspServers = servers  // 写入缓存槽
         return servers ? Object.keys(servers).length : 0
       }),
     ),
   ])
+  // 汇总 MCP 和 LSP 服务器总数
   const mcp_count = mcpCounts.reduce((sum, n) => sum + n, 0)
   const lsp_count = lspCounts.reduce((sum, n) => sum + n, 0)
 
+  // 步骤 5：原子性更新 AppState
   setAppState(prev => ({
     ...prev,
     plugins: {
       ...prev.plugins,
-      enabled,
-      disabled,
+      enabled,            // 更新已启用插件列表
+      disabled,           // 更新已禁用插件列表
       commands: pluginCommands,
-      errors: mergePluginErrors(prev.plugins.errors, errors),
-      needsRefresh: false,
+      errors: mergePluginErrors(prev.plugins.errors, errors),  // 合并错误，保留 lsp-manager 错误
+      needsRefresh: false,  // 消费刷新标志
     },
     agentDefinitions,
     mcp: {
       ...prev.mcp,
+      // 递增重连键，触发 MCP 连接管理器副作用重新运行
       pluginReconnectKey: prev.mcp.pluginReconnectKey + 1,
     },
   }))
 
-  // Re-initialize LSP manager so newly-loaded plugin LSP servers are picked
-  // up. No-op if LSP was never initialized (headless subcommand path).
-  // Unconditional so removing the last LSP plugin also clears stale config.
-  // Fixes issue #15521: LSP manager previously read a stale memoized
-  // loadAllPlugins() result from before marketplaces were reconciled.
+  // 步骤 6：重新初始化 LSP 服务器管理器
+  // 无论是否有 LSP 插件都要调用——移除最后一个 LSP 插件也需要清除旧配置。
+  // 无条件调用还修复了 #15521（LSP 管理器之前读取了市场协调前的旧 memoize 缓存）。
+  // headless 子命令路径下若 LSP 从未初始化，此调用为 no-op。
   reinitializeLspServerManager()
 
-  // clearAllCaches() prunes removed-plugin hooks; this does the FULL swap
-  // (adds hooks from newly-enabled plugins too). Catching here so
-  // hook_load_failed can feed error_count; a failure doesn't lose the
-  // plugin/command/agent data above (hooks go to STATE.registeredHooks, not
-  // AppState).
+  // 步骤 7：加载 hooks（独立 try/catch）
+  // clearAllCaches() 已清除旧插件的 hooks；此步骤执行完整替换（含新启用插件的 hooks）。
+  // hooks 失败不影响已加载的命令/代理数据（hooks 写入 STATE.registeredHooks，非 AppState）
   let hook_load_failed = false
   try {
     await loadPluginHooks()
@@ -160,6 +172,7 @@ export async function refreshActivePlugins(
     )
   }
 
+  // 统计 hook 总数（遍历所有 hooksConfig 的 matchers.hooks 数组）
   const hook_count = enabled.reduce((sum, p) => {
     if (!p.hooksConfig) return sum
     return (
@@ -184,6 +197,7 @@ export async function refreshActivePlugins(
     hook_count,
     mcp_count,
     lsp_count,
+    // hook 加载失败时在错误计数中额外加 1
     error_count: errors.length + (hook_load_failed ? 1 : 0),
     agentDefinitions,
     pluginCommands,
@@ -191,23 +205,40 @@ export async function refreshActivePlugins(
 }
 
 /**
- * Merge fresh plugin-load errors with existing errors, preserving LSP and
- * plugin-component errors that were recorded by other systems and
- * deduplicating. Same logic as refreshPlugins()/updatePluginState(), extracted
- * so refresh.ts doesn't leave those errors stranded.
+ * 合并最新的插件加载错误与 AppState 中已有的错误。
+ *
+ * 合并规则：
+ *   - 保留来自 'lsp-manager' 和 'plugin:*' 来源的已有错误（由其他系统记录）
+ *   - 对保留的错误进行去重（排除与最新错误重叠的部分）
+ *   - 最新错误全量保留
+ *
+ * 目的：防止 refreshActivePlugins 丢失由 LSP 管理器等外部系统记录的错误。
+ *
+ * @param existing - AppState 中当前的错误列表
+ * @param fresh - 本次加载产生的新错误列表
+ * @returns 合并后的错误列表
  */
 function mergePluginErrors(
   existing: PluginError[],
   fresh: PluginError[],
 ): PluginError[] {
+  // 保留来自 lsp-manager 和 plugin: 前缀来源的错误
   const preserved = existing.filter(
     e => e.source === 'lsp-manager' || e.source.startsWith('plugin:'),
   )
+  // 构建最新错误的键集合，用于去重
   const freshKeys = new Set(fresh.map(errorKey))
+  // 从保留列表中排除与最新错误重叠的部分（最新错误优先）
   const deduped = preserved.filter(e => !freshKeys.has(errorKey(e)))
   return [...deduped, ...fresh]
 }
 
+/**
+ * 根据插件错误类型生成唯一键，用于去重比较。
+ *
+ * @param e - 插件错误对象
+ * @returns 唯一标识此错误的字符串键
+ */
 function errorKey(e: PluginError): string {
   return e.type === 'generic-error'
     ? `generic-error:${e.source}:${e.error}`

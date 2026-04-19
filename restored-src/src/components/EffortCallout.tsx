@@ -1,3 +1,37 @@
+/**
+ * EffortCallout.tsx — 努力程度选择对话框组件
+ *
+ * 在 Claude Code 系统流程中的位置：
+ *   提示输入层 → 模型配置引导 → Opus 模型首次使用时的努力程度选择弹窗
+ *
+ * 主要功能：
+ *   1. EffortCallout：主组件，在用户首次使用 Opus 4.6 时弹出努力程度选择对话框，
+ *      展示 medium/high/low 三个选项，30 秒内无操作自动 dismiss。
+ *   2. shouldShowEffortCallout：门控函数，决定是否应该显示该对话框，
+ *      根据订阅类型（Pro/Max/Team）和历史展示记录（v1/v2 dismissed 标志）进行判断：
+ *      - 仅对 opus-4-6 模型生效
+ *      - 品牌新用户（numStartups ≤ 1）直接 dismiss，不展示
+ *      - Pro 用户：若已看过 v1 则 dismiss，否则根据 enabled 判断
+ *      - Max/Team 用户：根据 enabled 判断
+ *      - 其他用户（免费/API Key）：直接 dismiss
+ *   3. markV2Dismissed：将 effortCalloutV2Dismissed 标志写入全局配置（幂等）
+ *   4. EffortIndicatorSymbol：内部组件，渲染带颜色的努力程度符号（从 effortLevelToSymbol 获取）
+ *   5. EffortOptionLabel：内部组件，组合 EffortIndicatorSymbol 和文本标签
+ *   6. _temp（React Compiler 提取）：组件挂载时调用 markV2Dismissed() 的 useEffect 回调
+ *
+ * React Compiler 缓存槽分配（_c(18)）：
+ *   $[0]：defaultEffortConfig（getOpusDefaultEffortConfig() sentinel 缓存）
+ *   $[1]-$[2]：onDone → useEffect（同步 onDoneRef）回调
+ *   $[3]：handleCancel（sentinel 缓存，调用 onDoneRef.current("dismiss")）
+ *   $[4]：useEffect(_temp, []) 的空依赖数组（sentinel 缓存）
+ *   $[5]-$[6]：handleCancel → 30 秒自动 dismiss useEffect 回调 + 依赖数组
+ *   $[7]-$[8]：model → defaultLevel（从模型推断默认努力等级）
+ *   $[9]-$[10]：defaultLevel → handleSelect 回调
+ *   $[11]：静态 options 数组（sentinel 缓存，三个选项）
+ *   $[12]：静态描述文本 Box（sentinel 缓存）
+ *   $[13]-$[15]：三个 EffortIndicatorSymbol 实例（low/medium，加 high 内联）
+ *   $[16]-$[17]：handleSelect → 最终 PermissionDialog JSX
+ */
 import { c as _c } from "react/compiler-runtime";
 import React, { useCallback, useEffect, useRef } from 'react';
 import { Box, Text } from '../ink.js';
@@ -11,12 +45,39 @@ import type { OptionWithDescription } from './CustomSelect/select.js';
 import { Select } from './CustomSelect/select.js';
 import { effortLevelToSymbol } from './EffortIndicator.js';
 import { PermissionDialog } from './permissions/PermissionDialog.js';
+
+// 选择结果类型：努力等级 | undefined（选择了与默认值相同的选项）| 'dismiss'（用户取消）
 type EffortCalloutSelection = EffortLevel | undefined | 'dismiss';
+
+// Props 类型：model 用于推断默认努力等级；onDone 在用户做出选择后回调
 type Props = {
   model: string;
   onDone: (selection: EffortCalloutSelection) => void;
 };
+
+// 自动关闭超时时间：30 秒无操作则自动 dismiss
 const AUTO_DISMISS_MS = 30_000;
+
+/**
+ * EffortCallout 组件
+ *
+ * 整体流程：
+ *   1. $[0] sentinel 缓存：获取 Opus 默认努力配置（dialogTitle, dialogDescription, enabled）
+ *   2. 使用 latest-ref 模式保存 onDone（通过 useEffect 同步到 onDoneRef.current）
+ *   3. $[3] sentinel 缓存 handleCancel：调用 onDoneRef.current("dismiss")
+ *   4. _temp useEffect（空依赖，挂载时执行一次）：调用 markV2Dismissed() 永久标记已展示
+ *   5. $[5]-$[6]：注册 30 秒自动 dismiss 定时器（依赖 handleCancel，返回清理函数）
+ *   6. $[7]-$[8]：根据 model 推断 defaultLevel（fallback 为 "high"）
+ *   7. $[9]-$[10]：handleSelect 回调：若选择值等于默认值则传 undefined（无需保存），
+ *      否则写入 userSettings 并调用 onDoneRef.current(value)
+ *   8. $[11]：静态 options 数组（medium/high/low 三选项，含 EffortOptionLabel）
+ *   9. $[12]-$[15]：静态 UI 元素（描述文本、低/中努力程度指示符）
+ *  10. $[16]-$[17]：依赖 handleSelect 构建最终 PermissionDialog JSX
+ *
+ * 在系统中的角色：
+ *   引导用户为 Opus 模型显式选择思考努力等级，
+ *   通过 updateSettingsForSource 持久化用户偏好设置。
+ */
 export function EffortCallout(t0) {
   const $ = _c(18);
   const {

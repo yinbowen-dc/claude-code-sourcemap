@@ -1,3 +1,17 @@
+/**
+ * CA 证书加载模块。
+ *
+ * 在 Claude Code 系统中，该模块为 TLS 连接提供 CA 证书列表，
+ * 支持系统 CA 证书、捆绑 Mozilla CA 以及自定义额外证书文件：
+ * - getCACertificates()：带 memoize 缓存的 CA 证书加载函数，
+ *   优先使用系统 CA（--use-system-ca/--use-openssl-ca），
+ *   否则使用捆绑 Mozilla 根证书作为基础，并追加 NODE_EXTRA_CA_CERTS 指定文件内容；
+ *   均未设置时返回 undefined，由运行时默认处理
+ * - clearCACertsCache()：清除 getCACertificates 缓存，环境变量变更后调用
+ *
+ * 该模块仅读取 process.env.NODE_EXTRA_CA_CERTS，不导入 config.ts，
+ * 避免传递依赖污染 proxy.ts / mtls.ts 等模块的导入图。
+ */
 import memoize from 'lodash-es/memoize.js'
 import { logForDebugging } from './debug.js'
 import { hasNodeOption } from './envUtils.js'

@@ -1,79 +1,84 @@
 /**
- * Query profiling utility for measuring and reporting time spent in the query
- * pipeline from user input to first token arrival. Enable by setting CLAUDE_CODE_PROFILE_QUERY=1
+ * 查询管道性能分析模块
  *
- * Uses Node.js built-in performance hooks API for standard timing measurement.
- * Tracks each query session with detailed checkpoints for identifying bottlenecks.
+ * 本文件在 Claude Code 系统流程中的位置：
+ * - 用于测量查询管道从用户输入到首个 token 到达（TTFT）各阶段的耗时
+ * - 通过设置环境变量 CLAUDE_CODE_PROFILE_QUERY=1 来启用
+ * - 使用 Node.js 内置 performance hooks API 进行标准计时
+ * - 追踪每个查询会话的详细检查点，帮助定位性能瓶颈
  *
- * Checkpoints tracked (in order):
- * - query_user_input_received: Start of profiling
- * - query_context_loading_start/end: Loading system prompts and contexts
- * - query_query_start: Entry to query call from REPL
- * - query_fn_entry: Entry to query() function
- * - query_microcompact_start/end: Microcompaction of messages
- * - query_autocompact_start/end: Autocompaction check
- * - query_setup_start/end: StreamingToolExecutor and model setup
- * - query_api_loop_start: Start of API retry loop
- * - query_api_streaming_start: Start of streaming API call
- * - query_tool_schema_build_start/end: Building tool schemas
- * - query_message_normalization_start/end: Normalizing messages
- * - query_client_creation_start/end: Creating Anthropic client
- * - query_api_request_sent: HTTP request dispatched (before await, inside retry body)
- * - query_response_headers_received: .withResponse() resolved (headers arrived)
- * - query_first_chunk_received: First streaming chunk received (TTFT)
- * - query_api_streaming_end: Streaming complete
- * - query_tool_execution_start/end: Tool execution
- * - query_recursive_call: Before recursive query call
- * - query_end: End of query
+ * 追踪的检查点（按顺序）：
+ * - query_user_input_received: 分析开始
+ * - query_context_loading_start/end: 加载系统提示词和上下文
+ * - query_query_start: 从 REPL 进入 query 调用
+ * - query_fn_entry: 进入 query() 函数
+ * - query_microcompact_start/end: 消息微压缩
+ * - query_autocompact_start/end: 自动压缩检查
+ * - query_setup_start/end: StreamingToolExecutor 和模型初始化
+ * - query_api_loop_start: API 重试循环开始
+ * - query_api_streaming_start: 流式 API 调用开始
+ * - query_tool_schema_build_start/end: 构建工具 schema
+ * - query_message_normalization_start/end: 消息规范化
+ * - query_client_creation_start/end: 创建 Anthropic 客户端
+ * - query_api_request_sent: HTTP 请求已发送（在重试体内 await 前）
+ * - query_response_headers_received: .withResponse() 已 resolve（响应头到达）
+ * - query_first_chunk_received: 收到首个流式数据块（TTFT）
+ * - query_api_streaming_end: 流式传输完成
+ * - query_tool_execution_start/end: 工具执行
+ * - query_recursive_call: 递归 query 调用前
+ * - query_end: 查询结束
  */
 
 import { logForDebugging } from './debug.js'
 import { isEnvTruthy } from './envUtils.js'
 import { formatMs, formatTimelineLine, getPerformance } from './profilerBase.js'
 
-// Module-level state - initialized once when the module loads
+// 模块级状态，在模块加载时初始化一次
 // eslint-disable-next-line custom-rules/no-process-env-top-level
 const ENABLED = isEnvTruthy(process.env.CLAUDE_CODE_PROFILE_QUERY)
 
-// Track memory snapshots separately (perf_hooks doesn't track memory)
+// 单独跟踪内存快照（perf_hooks 不追踪内存）
 const memorySnapshots = new Map<string, NodeJS.MemoryUsage>()
 
-// Track query count for reporting
+// 记录查询次数，用于报告
 let queryCount = 0
 
-// Track first token received time separately for summary
+// 单独追踪首个 token 到达时间，用于摘要统计
 let firstTokenTime: number | null = null
 
 /**
- * Start profiling a new query session
+ * 启动新一轮查询会话的性能分析。
+ * 清除上一轮的检查点和内存快照，并记录首个检查点。
  */
 export function startQueryProfile(): void {
   if (!ENABLED) return
 
   const perf = getPerformance()
 
-  // Clear previous marks and memory snapshots
+  // 清除上一轮的标记和内存快照
   perf.clearMarks()
   memorySnapshots.clear()
   firstTokenTime = null
 
   queryCount++
 
-  // Record the start checkpoint
+  // 记录起始检查点
   queryCheckpoint('query_user_input_received')
 }
 
 /**
- * Record a checkpoint with the given name
+ * 记录指定名称的检查点，同时保存当前内存使用快照。
+ * 若为 query_first_chunk_received 检查点，额外记录 TTFT 时间。
  */
 export function queryCheckpoint(name: string): void {
   if (!ENABLED) return
 
   const perf = getPerformance()
   perf.mark(name)
+  // 记录当前内存使用快照，便于分析内存增长
   memorySnapshots.set(name, process.memoryUsage())
 
-  // Track first token specially
+  // 特别处理首个 token 到达时间
   if (name === 'query_first_chunk_received' && firstTokenTime === null) {
     const marks = perf.getEntriesByType('mark')
     if (marks.length > 0) {
@@ -84,7 +89,7 @@ export function queryCheckpoint(name: string): void {
 }
 
 /**
- * End the current query profiling session
+ * 结束当前查询会话的性能分析，记录结束检查点。
  */
 export function endQueryProfile(): void {
   if (!ENABLED) return
@@ -93,11 +98,11 @@ export function endQueryProfile(): void {
 }
 
 /**
- * Identify slow operations (> 100ms delta)
+ * 根据检查点间的时间差识别慢操作（>100ms），返回对应的警告字符串。
+ * 首个检查点不标记为慢操作（其时间从进程启动算起，非实际处理耗时）。
  */
 function getSlowWarning(deltaMs: number, name: string): string {
-  // Don't flag the first checkpoint as slow - it measures time from process start,
-  // not actual processing overhead
+  // 首个检查点从进程启动算起，不代表实际处理开销，跳过慢检测
   if (name === 'query_user_input_received') {
     return ''
   }
@@ -109,7 +114,7 @@ function getSlowWarning(deltaMs: number, name: string): string {
     return ` ⚠️  SLOW`
   }
 
-  // Specific warnings for known bottlenecks
+  // 针对已知性能瓶颈的特定警告
   if (name.includes('git_status') && deltaMs > 50) {
     return ' ⚠️  git status'
   }
@@ -124,7 +129,8 @@ function getSlowWarning(deltaMs: number, name: string): string {
 }
 
 /**
- * Get a formatted report of all checkpoints for the current/last query
+ * 生成当前/上一次查询的所有检查点格式化报告字符串。
+ * 包含时间线明细、TTFT 摘要统计和各阶段耗时分解。
  */
 function getQueryProfileReport(): string {
   if (!ENABLED) {

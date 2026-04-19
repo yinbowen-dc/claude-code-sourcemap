@@ -1,3 +1,18 @@
+/**
+ * 会话费用追踪模块 - 管理和持久化每次对话的 API 调用费用与 token 使用量
+ *
+ * 在整个系统流程中的位置：
+ * - 位于 bootstrap/state.ts（底层存储）和上层 UI 组件（/cost 命令、状态栏）之间
+ * - query.ts 在每次 API 响应后调用 addToTotalSessionCost() 累积费用
+ * - saveCurrentSessionCosts() 在会话切换前将费用写入项目配置文件（project config）
+ * - 恢复会话（/resume）时通过 restoreCostStateForSession() 从配置恢复历史费用
+ *
+ * 关键设计点：
+ * - 费用状态存储在 bootstrap/state.ts 的全局变量中，本文件是读写它的门面层
+ * - 支持按模型（short canonical name）聚合 token 使用量
+ * - 通过 OTel counter（getCostCounter/getTokenCounter）上报可观测性指标
+ * - advisor 模型的费用会递归累加（advisor tool 使用辅助模型）
+ */
 import type { BetaUsage as Usage } from '@anthropic-ai/sdk/resources/beta/messages/messages.mjs'
 import chalk from 'chalk'
 import {
@@ -80,9 +95,9 @@ type StoredCostState = {
 }
 
 /**
- * Gets stored cost state from project config for a specific session.
- * Returns the cost data if the session ID matches, or undefined otherwise.
- * Use this to read costs BEFORE overwriting the config with saveCurrentSessionCosts().
+ * 从项目配置文件中读取上次保存的费用状态
+ * 仅当 sessionId 与上次保存的 session 匹配时才返回数据（防止跨 session 数据污染）
+ * 注意：需要在 saveCurrentSessionCosts() 覆盖配置前调用
  */
 export function getStoredSessionCosts(
   sessionId: string,
@@ -123,9 +138,9 @@ export function getStoredSessionCosts(
 }
 
 /**
- * Restores cost state from project config when resuming a session.
- * Only restores if the session ID matches the last saved session.
- * @returns true if cost state was restored, false otherwise
+ * 恢复指定 session 的历史费用状态（用于 /resume 恢复会话）
+ * 通过 setCostStateForRestore 将读取的费用数据写回全局状态
+ * @returns true 表示成功恢复，false 表示无匹配 session 数据
  */
 export function restoreCostStateForSession(sessionId: string): boolean {
   const data = getStoredSessionCosts(sessionId)
@@ -137,8 +152,9 @@ export function restoreCostStateForSession(sessionId: string): boolean {
 }
 
 /**
- * Saves the current session's costs to project config.
- * Call this before switching sessions to avoid losing accumulated costs.
+ * 将当前会话的费用数据持久化到项目配置文件
+ * 在会话切换前调用，确保费用数据不丢失
+ * 同时记录 FPS 指标（如有）用于性能分析
  */
 export function saveCurrentSessionCosts(fpsMetrics?: FpsMetrics): void {
   saveCurrentProjectConfig(current => ({
@@ -174,10 +190,24 @@ export function saveCurrentSessionCosts(fpsMetrics?: FpsMetrics): void {
   }))
 }
 
+/**
+ * 格式化费用数字为美元字符串
+ * 超过 $0.50 时保留 2 位小数，否则保留 maxDecimalPlaces 位（默认 4 位）
+ * 避免高额费用显示成 "$0.5000" 或低额费用显示成 "$0.00"
+ */
+/**
+ * 格式化费用数字为美元字符串
+ * 超过 $0.50 时保留 2 位小数，否则保留 maxDecimalPlaces 位（默认 4 位）
+ * 避免高额费用显示成 "$0.5000" 或低额费用显示成 "$0.00"
+ */
 function formatCost(cost: number, maxDecimalPlaces: number = 4): string {
   return `$${cost > 0.5 ? round(cost, 100).toFixed(2) : cost.toFixed(maxDecimalPlaces)}`
 }
 
+/**
+ * 按模型分组格式化 token 使用量
+ * 将同一 canonical name 的多个模型版本合并，输出每个模型的详细用量和费用
+ */
 function formatModelUsage(): string {
   const modelUsageMap = getModelUsage()
   if (Object.keys(modelUsageMap).length === 0) {
@@ -225,6 +255,10 @@ function formatModelUsage(): string {
   return result
 }
 
+/**
+ * 生成完整的费用摘要字符串（用于 /cost 命令和会话结束时的输出）
+ * 包含：总费用、API 耗时、实际耗时、代码行数变化、各模型 token 用量
+ */
 export function formatTotalCost(): string {
   const costDisplay =
     formatCost(getTotalCostUSD()) +
@@ -243,10 +277,15 @@ ${modelUsageDisplay}`,
   )
 }
 
+/** 四舍五入到指定精度（precision 为乘数，如 100 表示保留 2 位小数） */
 function round(number: number, precision: number): number {
   return Math.round(number * precision) / precision
 }
 
+/**
+ * 将本次 API 响应的 token 用量累加到指定模型的统计数据中
+ * 同时更新 contextWindow 和 maxOutputTokens（从模型配置动态获取）
+ */
 function addToTotalModelUsage(
   cost: number,
   usage: Usage,
@@ -275,6 +314,17 @@ function addToTotalModelUsage(
   return modelUsage
 }
 
+/**
+ * 将本次 API 调用的费用和 token 用量累加到会话总计
+ *
+ * 流程：
+ * 1. 调用 addToTotalModelUsage 更新模型级用量
+ * 2. 调用 addToTotalCostState 写入全局状态
+ * 3. 通过 OTel counter 上报成本和 token 指标
+ * 4. 递归处理 advisor 模型的附带费用（如有）
+ *
+ * @returns 本次调用（含 advisor）的总费用（USD）
+ */
 export function addToTotalSessionCost(
   cost: number,
   usage: Usage,

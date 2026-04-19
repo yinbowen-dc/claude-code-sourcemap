@@ -1,6 +1,20 @@
 /**
- * Converts ANSI-escaped terminal text to SVG format
- * Supports basic ANSI color codes (foreground colors)
+ * ANSI 转义文本转 SVG 模块。
+ *
+ * 在 Claude Code 系统中，该模块负责将含 ANSI 颜色转义的终端文本解析并
+ * 渲染为 SVG 格式，供截图、预览等场景使用（如 /stats 输出可视化）。
+ *
+ * 主要功能：
+ * 1. parseAnsi()：将 ANSI 转义字符串解析为逐行 TextSpan 列表，
+ *    支持基础颜色（30-37/90-97）、256 色（38;5;n）、真彩色（38;2;r;g;b）
+ * 2. get256Color()：将 256 色调色板索引映射为 RGB 颜色
+ * 3. ansiToSvg()：将解析结果渲染为 SVG，每行使用单个 <text> 元素
+ *    加多个 <tspan> 子元素，由渲染器原生处理字符间距
+ *
+ * 注意：ansiToPng.ts 模块依赖本模块的 parseAnsi() 和类型定义。
+ *
+ * Converts ANSI-escaped terminal text to SVG format.
+ * Supports basic ANSI color codes (foreground colors).
  */
 
 import { escapeXml } from './xml.js'
@@ -44,11 +58,13 @@ export type TextSpan = {
 export type ParsedLine = TextSpan[]
 
 /**
- * Parse ANSI escape sequences from text
- * Supports:
- * - Basic colors (30-37, 90-97)
- * - 256-color mode (38;5;n)
- * - 24-bit true color (38;2;r;g;b)
+ * 解析 ANSI 转义序列，将文本转为逐行 TextSpan 列表。
+ * 支持：
+ * - 基础颜色（30-37、90-97）
+ * - 256 色模式（38;5;n）
+ * - 24-bit 真彩色（38;2;r;g;b）
+ *
+ * Parse ANSI escape sequences from text.
  */
 export function parseAnsi(text: string): ParsedLine[] {
   const lines: ParsedLine[] = []
@@ -145,7 +161,12 @@ export function parseAnsi(text: string): ParsedLine[] {
 }
 
 /**
- * Get color from 256-color palette
+ * 根据 256 色调色板索引返回对应 RGB 颜色。
+ * - 0-15：标准 16 色
+ * - 16-231：6×6×6 颜色立方体
+ * - 232-255：24 级灰阶
+ *
+ * Get color from 256-color palette.
  */
 function get256Color(index: number): AnsiColor {
   // Standard colors (0-15)
@@ -200,9 +221,13 @@ export type AnsiToSvgOptions = {
 }
 
 /**
- * Convert ANSI text to SVG
+ * 将 ANSI 文本转换为 SVG 字符串。
+ * 每行生成一个 <text> 元素，每个颜色段生成一个 <tspan>，
+ * 由 SVG 渲染器原生处理字符间距（无需手动计算字符宽度）。
+ *
+ * Convert ANSI text to SVG.
  * Uses <tspan> elements within a single <text> per line so the renderer
- * handles character spacing natively (no manual charWidth calculation)
+ * handles character spacing natively (no manual charWidth calculation).
  */
 export function ansiToSvg(
   ansiText: string,

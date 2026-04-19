@@ -1,3 +1,11 @@
+/**
+ * 系统二进制文件存在性检测模块。
+ *
+ * 在 Claude Code 系统中，该模块用于检测指定命令（如 gopls、rust-analyzer 等语言服务器）
+ * 是否已安装并可在系统 PATH 中找到：
+ * - isBinaryInstalled()：使用 which 工具检测命令是否可用，结果缓存于会话级 Map
+ * - clearBinaryCache()：清除检测缓存（用于测试重置）
+ */
 import { logForDebugging } from './debug.js'
 import { which } from './which.js'
 
@@ -5,11 +13,12 @@ import { which } from './which.js'
 const binaryCache = new Map<string, boolean>()
 
 /**
- * Check if a binary/command is installed and available on the system.
- * Uses 'which' on Unix systems (macOS, Linux, WSL) and 'where' on Windows.
+ * 检测指定二进制命令是否已安装并可在系统 PATH 中找到。
+ * 结果缓存于会话级 Map，避免重复调用 which 命令。
+ * Unix（macOS/Linux/WSL）使用 which，Windows 使用 where。
  *
- * @param command - The command name to check (e.g., 'gopls', 'rust-analyzer')
- * @returns Promise<boolean> - true if the command exists, false otherwise
+ * @param command - 待检测的命令名称（如 'gopls'、'rust-analyzer'）
+ * @returns 若命令存在则返回 true，否则返回 false
  */
 export async function isBinaryInstalled(command: string): Promise<boolean> {
   // Edge case: empty or whitespace-only command
@@ -45,9 +54,7 @@ export async function isBinaryInstalled(command: string): Promise<boolean> {
   return exists
 }
 
-/**
- * Clear the binary check cache (useful for testing)
- */
+/** 清除二进制检测缓存（用于测试重置）。 */
 export function clearBinaryCache(): void {
   binaryCache.clear()
 }

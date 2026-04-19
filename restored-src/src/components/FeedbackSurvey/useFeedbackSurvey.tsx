@@ -1,3 +1,30 @@
+/**
+ * useFeedbackSurvey.tsx — 反馈调查触发逻辑 Hook
+ *
+ * 在 Claude Code 系统流程中的位置：
+ *   主会话界面 → useFeedbackSurvey → 决策是否展示调查 → useSurveyState（状态机）
+ *   → FeedbackSurvey 组件渲染 → 用户选择 → onSelect / onTranscriptSelect
+ *
+ * 主要功能：
+ *   useFeedbackSurvey：自定义 Hook，实现反馈调查的"何时出现"决策逻辑，包括：
+ *   - 多维度限流（会话内冷却时间、全局跨会话冷却时间、用户回合数）
+ *   - 概率门控（防止 useMemo 每次重新求值都重新掷骰子）
+ *   - 组织策略检查（ZDR / allow_product_feedback）
+ *   - 模型白名单（onForModels 配置）
+ *   - 转录共享提示决策（shouldShowTranscriptPrompt）
+ *   - 所有调查事件的 OTel / analytics 上报
+ *
+ * 配置来源：
+ *   - GrowthBook 动态配置（tengu_feedback_survey_config）
+ *   - GrowthBook 动态配置（tengu_bad/good_survey_transcript_ask_config）
+ *   - 用户设置（feedbackSurveyRate）
+ *
+ * 触发限流逻辑（DEFAULT_FEEDBACK_SURVEY_CONFIG 默认值）：
+ *   - 首次出现：会话开始后至少 10 分钟，且用户发送至少 5 条消息
+ *   - 再次出现：上次出现后至少 1 小时，且用户又发送至少 10 条消息
+ *   - 全局冷却：跨会话至少 ~27.7 小时（100,000,000 ms）
+ *   - 概率：默认 0.5%（probability: 0.005）
+ */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useDynamicConfig } from 'src/hooks/useDynamicConfig.js';
 import { isFeedbackSurveyDisabled } from 'src/services/analytics/config.js';
@@ -14,19 +41,24 @@ import { submitTranscriptShare, type TranscriptShareTrigger } from './submitTran
 import type { TranscriptShareResponse } from './TranscriptSharePrompt.js';
 import { useSurveyState } from './useSurveyState.js';
 import type { FeedbackSurveyResponse, FeedbackSurveyType } from './utils.js';
+// 调查触发限流配置类型：定义调查展示时机的所有可调参数
 type FeedbackSurveyConfig = {
-  minTimeBeforeFeedbackMs: number;
-  minTimeBetweenFeedbackMs: number;
-  minTimeBetweenGlobalFeedbackMs: number;
-  minUserTurnsBeforeFeedback: number;
-  minUserTurnsBetweenFeedback: number;
-  hideThanksAfterMs: number;
-  onForModels: string[];
-  probability: number;
+  minTimeBeforeFeedbackMs: number;    // 会话开始后首次展示所需的最短等待时间（毫秒）
+  minTimeBetweenFeedbackMs: number;   // 同一会话内两次展示之间的最短间隔（毫秒）
+  minTimeBetweenGlobalFeedbackMs: number; // 跨会话的全局冷却时间（毫秒），防止频繁打扰
+  minUserTurnsBeforeFeedback: number; // 首次展示前用户需发送的最少消息数
+  minUserTurnsBetweenFeedback: number; // 再次展示前用户需额外发送的消息数
+  hideThanksAfterMs: number;          // 感谢页面自动隐藏的延迟时间（毫秒）
+  onForModels: string[];              // 允许展示调查的模型列表（'*' 表示所有模型）
+  probability: number;                // 满足所有条件后实际触发调查的概率（0~1）
 };
+
+// 转录共享询问配置类型：仅包含概率参数，控制在反馈后是否询问共享转录
 type TranscriptAskConfig = {
-  probability: number;
+  probability: number; // 用户提交反馈后询问是否共享转录的概率（0 = 不询问）
 };
+
+// 默认调查配置：约 10 分钟热身 + 5 条消息 → 首次展示；1 小时 + 10 条消息 → 再次展示；~27.7 小时全局冷却；0.5% 概率
 const DEFAULT_FEEDBACK_SURVEY_CONFIG: FeedbackSurveyConfig = {
   minTimeBeforeFeedbackMs: 600000,
   minTimeBetweenFeedbackMs: 3600000,
@@ -37,17 +69,41 @@ const DEFAULT_FEEDBACK_SURVEY_CONFIG: FeedbackSurveyConfig = {
   onForModels: ['*'],
   probability: 0.005
 };
+
+// 默认转录询问配置：概率为 0，即默认不展示转录共享提示（由 GrowthBook 远程开启）
 const DEFAULT_TRANSCRIPT_ASK_CONFIG: TranscriptAskConfig = {
   probability: 0
 };
+/**
+ * useFeedbackSurvey
+ *
+ * 整体流程：
+ *   1. 通过多个 useRef 保存会话级不变量（会话开始时间、会话开始时的提交计数）
+ *      和最新值快照（submitCountRef、messagesRef、lastAssistantMessageIdRef）
+ *   2. 从 GrowthBook 拉取动态配置（tengu_feedback_survey_config 及两个转录询问配置）
+ *   3. useSurveyState 管理调查的状态机（closed → open → thanks/transcript_prompt）
+ *   4. isModelAllowed useMemo：检查当前模型是否在白名单中（支持 '*' 通配符）
+ *   5. shouldOpen useMemo：串联所有门控条件（加载状态、活跃提示、环境变量、
+ *      组织策略、模型白名单、会话内限流、用户回合数、概率门、全局跨会话冷却）
+ *   6. useEffect：当 shouldOpen 变为 true 时调用 open()，触发调查展示
+ *   7. 各事件回调（onOpen / onSelect / onTranscriptSelect 等）负责更新限流状态
+ *      并向 analytics + OTel 双渠道上报事件
+ *
+ * 在系统中的角色：
+ *   是反馈调查系统的顶层决策层，向上层 UI 提供
+ *   { state, lastResponse, handleSelect, handleTranscriptSelect } 四个接口，
+ *   屏蔽了所有限流、概率、策略、转录共享等复杂决策细节。
+ */
 export function useFeedbackSurvey(messages: Message[], isLoading: boolean, submitCount: number, surveyType: FeedbackSurveyType = 'session', hasActivePrompt: boolean = false): {
   state: 'closed' | 'open' | 'thanks' | 'transcript_prompt' | 'submitting' | 'submitted';
   lastResponse: FeedbackSurveyResponse | null;
   handleSelect: (selected: FeedbackSurveyResponse) => boolean;
   handleTranscriptSelect: (selected: TranscriptShareResponse) => void;
 } {
+  // Latest-ref 模式：实时追踪最新的最后一条 AI 消息 ID，用于事件上报，避免闭包捕获旧值
   const lastAssistantMessageIdRef = useRef('unknown');
   lastAssistantMessageIdRef.current = getLastAssistantMessage(messages)?.message?.id || 'unknown';
+  // 会话内限流状态：记录本次会话中调查最后展示的时间及对应提交计数，用于会话内冷却判断
   const [feedbackSurvey, setFeedbackSurvey] = useState<{
     timeLastShown: number | null;
     submitCountAtLastAppearance: number | null;
@@ -55,44 +111,77 @@ export function useFeedbackSurvey(messages: Message[], isLoading: boolean, submi
     timeLastShown: null,
     submitCountAtLastAppearance: null
   }));
+  // 从 GrowthBook 动态拉取调查主配置（限流参数、模型白名单、概率等）
   const config = useDynamicConfig<FeedbackSurveyConfig>('tengu_feedback_survey_config', DEFAULT_FEEDBACK_SURVEY_CONFIG);
+  // 从 GrowthBook 分别拉取差评/好评后转录共享询问的概率配置
   const badTranscriptAskConfig = useDynamicConfig<TranscriptAskConfig>('tengu_bad_survey_transcript_ask_config', DEFAULT_TRANSCRIPT_ASK_CONFIG);
   const goodTranscriptAskConfig = useDynamicConfig<TranscriptAskConfig>('tengu_good_survey_transcript_ask_config', DEFAULT_TRANSCRIPT_ASK_CONFIG);
+  // 读取用户本地设置中的调查显示频率覆盖值（可覆盖 GrowthBook 概率）
   const settingsRate = getInitialSettings().feedbackSurveyRate;
+  // 会话开始时间：仅在 Hook 首次挂载时记录，用于计算首次展示的热身时间
   const sessionStartTime = useRef(Date.now());
+  // 会话开始时的提交计数：用于计算首次展示前用户需发送的最少消息数
   const submitCountAtSessionStart = useRef(submitCount);
+  // Latest-ref：每次渲染同步更新，使 useMemo/useCallback 闭包中始终能读到最新 submitCount
   const submitCountRef = useRef(submitCount);
   submitCountRef.current = submitCount;
+  // Latest-ref：每次渲染同步更新，使 onTranscriptSelect 闭包中始终能读到最新消息列表
   const messagesRef = useRef(messages);
   messagesRef.current = messages;
-  // Probability gate: roll once when eligibility conditions are met, not on every
-  // useMemo re-evaluation. Without this, each dependency change (submitCount,
-  // isLoading toggle, etc.) re-rolls Math.random(), making the survey almost
-  // certain to appear after enough renders.
+  // 概率门控：滚动一次后用 ref 缓存结果，避免每次 useMemo 重新求值都重新掷骰子
+  // 若不缓存，随着 submitCount/isLoading 等依赖项频繁变化，调查几乎必然被触发
   const probabilityPassedRef = useRef(false);
+  // 记录上次进行概率掷骰时的 submitCount，用于判断是否需要重新掷骰（每次满足资格条件后掷一次）
   const lastEligibleSubmitCountRef = useRef<number | null>(null);
+  /**
+   * updateLastShownTime
+   *
+   * 整体流程：
+   *   1. 通过 setFeedbackSurvey 更新会话内限流状态（timeLastShown + submitCountAtLastAppearance）
+   *      - 使用函数式更新并做幂等判断，避免相同值触发不必要的重渲染
+   *   2. 同步将 lastShownTime 持久化到全局配置文件，
+   *      确保跨会话的全局冷却时间在下次启动时仍然有效
+   *      - 同样做幂等判断：若全局配置中值已相同则跳过写入
+   *
+   * 在系统中的角色：
+   *   是所有调查展示/响应事件的"限流打点"入口，
+   *   onOpen 和 onSelect 都会调用它以重置冷却计时器。
+   */
   const updateLastShownTime = useCallback((timestamp: number, submitCountValue: number) => {
+    // 函数式更新：读取上一次状态并比较，相同则返回原对象，避免触发不必要的重渲染
     setFeedbackSurvey(prev => {
       if (prev.timeLastShown === timestamp && prev.submitCountAtLastAppearance === submitCountValue) {
-        return prev;
+        return prev; // 值未变化，跳过更新
       }
       return {
-        timeLastShown: timestamp,
-        submitCountAtLastAppearance: submitCountValue
+        timeLastShown: timestamp,            // 记录本次展示时间，用于会话内冷却计算
+        submitCountAtLastAppearance: submitCountValue // 记录本次展示时的提交计数，用于用户回合数判断
       };
     });
-    // Persist cross-session pacing state (previously done by onChangeAppState observer)
+    // 持久化跨会话限流状态到全局配置（之前由 onChangeAppState 观察者完成，现已内联）
+    // 幂等判断：若全局配置中值已相同则跳过文件写入，避免重复 I/O
     if (getGlobalConfig().feedbackSurveyState?.lastShownTime !== timestamp) {
       saveGlobalConfig(current => ({
         ...current,
         feedbackSurveyState: {
-          lastShownTime: timestamp
+          lastShownTime: timestamp // 写入全局配置，供下次会话读取以执行全局冷却判断
         }
       }));
     }
   }, []);
+  /**
+   * onOpen
+   *
+   * 整体流程：
+   *   1. 调用 updateLastShownTime 打点当前时间和提交计数，重置会话内及全局冷却计时器
+   *   2. 通过 logEvent 向 analytics 上报 'appeared' 事件（含 appearance_id、消息 ID、调查类型）
+   *   3. 通过 logOTelEvent 向 OpenTelemetry 上报相同事件（异步，void 忽略 Promise）
+   *
+   * 在系统中的角色：
+   *   由 useSurveyState 在调查从 closed → open 时回调，是调查"首次曝光"的唯一上报入口。
+   */
   const onOpen = useCallback((appearanceId: string) => {
-    updateLastShownTime(Date.now(), submitCountRef.current);
+    updateLastShownTime(Date.now(), submitCountRef.current); // 重置限流计时器
     logEvent('tengu_feedback_survey_event', {
       event_type: 'appeared' as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
       appearance_id: appearanceId as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
@@ -105,8 +194,19 @@ export function useFeedbackSurvey(messages: Message[], isLoading: boolean, submi
       survey_type: surveyType
     });
   }, [updateLastShownTime, surveyType]);
+  /**
+   * onSelect
+   *
+   * 整体流程：
+   *   1. 调用 updateLastShownTime 再次打点（用户响应时刷新冷却计时器，防止响应后立刻再次出现）
+   *   2. 通过 logEvent 向 analytics 上报 'responded' 事件（含用户评分 response）
+   *   3. 通过 logOTelEvent 向 OpenTelemetry 上报相同事件（异步）
+   *
+   * 在系统中的角色：
+   *   由 useSurveyState 在用户选择评分后回调，是用户评分选择的唯一上报入口。
+   */
   const onSelect = useCallback((appearanceId_0: string, selected: FeedbackSurveyResponse) => {
-    updateLastShownTime(Date.now(), submitCountRef.current);
+    updateLastShownTime(Date.now(), submitCountRef.current); // 刷新冷却计时器
     logEvent('tengu_feedback_survey_event', {
       event_type: 'responded' as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
       appearance_id: appearanceId_0 as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
@@ -121,27 +221,52 @@ export function useFeedbackSurvey(messages: Message[], isLoading: boolean, submi
       survey_type: surveyType
     });
   }, [updateLastShownTime, surveyType]);
+  /**
+   * shouldShowTranscriptPrompt
+   *
+   * 整体流程：
+   *   1. 仅 'bad' 和 'good' 评分才可能触发转录共享询问
+   *   2. 若用户曾选择"不再询问"（transcriptShareDismissed），直接返回 false
+   *   3. 若组织策略禁止产品反馈（ZDR / allow_product_feedback），直接返回 false
+   *   4. 根据评分类型读取对应 GrowthBook 配置中的概率，通过 Math.random() 决策
+   *
+   * 在系统中的角色：
+   *   由 useSurveyState 在用户选择评分后同步调用，决定是否切换到 transcript_prompt 状态。
+   *   是转录共享询问是否展示的唯一决策点。
+   */
   const shouldShowTranscriptPrompt = useCallback((selected_0: FeedbackSurveyResponse) => {
-    // Only bad and good ratings trigger the transcript ask
+    // 仅 bad 和 good 评分才触发转录共享询问，其他评分（如 neutral）直接跳过
     if (selected_0 !== 'bad' && selected_0 !== 'good') {
       return false;
     }
 
-    // Don't show if user previously chose "Don't ask again"
+    // 用户曾选择"不再询问"，永久跳过转录共享提示
     if (getGlobalConfig().transcriptShareDismissed) {
       return false;
     }
 
-    // Don't show if product feedback is blocked by org policy (ZDR)
+    // 组织策略检查：ZDR 环境下禁止向 Anthropic 发送任何反馈内容
     if (!isPolicyAllowed('allow_product_feedback')) {
       return false;
     }
 
-    // Probability gate from GrowthBook config (separate per rating)
+    // 根据评分类型从 GrowthBook 配置读取对应概率，掷骰决定是否展示转录共享提示
     const probability = selected_0 === 'bad' ? badTranscriptAskConfig.probability : goodTranscriptAskConfig.probability;
     return Math.random() <= probability;
   }, [badTranscriptAskConfig.probability, goodTranscriptAskConfig.probability]);
+  /**
+   * onTranscriptPromptShown
+   *
+   * 整体流程：
+   *   1. 根据调查响应类型确定 TranscriptShareTrigger（good/bad_feedback_survey）
+   *   2. 通过 logEvent 向 analytics 上报 'transcript_prompt_appeared' 事件
+   *   3. 通过 logOTelEvent 向 OpenTelemetry 上报相同事件（异步）
+   *
+   * 在系统中的角色：
+   *   由 useSurveyState 在转录共享提示展示时回调，记录"用户看到了转录共享询问"的曝光事件。
+   */
   const onTranscriptPromptShown = useCallback((appearanceId_1: string, surveyResponse: FeedbackSurveyResponse) => {
+    // 根据调查响应类型映射到对应的转录共享触发类型
     const trigger: TranscriptShareTrigger = surveyResponse === 'good' ? 'good_feedback_survey' : 'bad_feedback_survey';
     logEvent('tengu_feedback_survey_event', {
       event_type: 'transcript_prompt_appeared' as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
@@ -156,8 +281,24 @@ export function useFeedbackSurvey(messages: Message[], isLoading: boolean, submi
       survey_type: surveyType
     });
   }, [surveyType]);
+  /**
+   * onTranscriptSelect
+   *
+   * 整体流程：
+   *   1. 确定 TranscriptShareTrigger（good/bad_feedback_survey）
+   *   2. 通过 logEvent 上报 `transcript_share_${selected}` 事件（yes/no/dont_ask_again）
+   *   3. 若用户选择 'dont_ask_again'，写入全局配置 transcriptShareDismissed=true，永久不再询问
+   *   4. 若用户选择 'yes'，调用 submitTranscriptShare 执行实际的转录上传，
+   *      并根据结果再次上报 'transcript_share_submitted' 或 'transcript_share_failed' 事件
+   *   5. 选择 'no' 或 'dont_ask_again' 时返回 false；选择 'yes' 时返回提交是否成功
+   *
+   * 在系统中的角色：
+   *   是转录共享的最终执行入口，串联了用户意愿上报、持久化偏好和实际数据上传三个步骤。
+   */
   const onTranscriptSelect = useCallback(async (appearanceId_2: string, selected_1: TranscriptShareResponse, surveyResponse_0: FeedbackSurveyResponse | null): Promise<boolean> => {
+    // 根据调查响应类型映射触发类型（null 视为 bad）
     const trigger_0: TranscriptShareTrigger = surveyResponse_0 === 'good' ? 'good_feedback_survey' : 'bad_feedback_survey';
+    // 上报用户对转录共享提示的选择（yes / no / dont_ask_again）
     logEvent('tengu_feedback_survey_event', {
       event_type: `transcript_share_${selected_1}` as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
       appearance_id: appearanceId_2 as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
@@ -165,12 +306,14 @@ export function useFeedbackSurvey(messages: Message[], isLoading: boolean, submi
       survey_type: surveyType as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
       trigger: trigger_0 as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS
     });
+    // 用户选择"不再询问"时，持久化到全局配置，后续调查不再展示转录共享提示
     if (selected_1 === 'dont_ask_again') {
       saveGlobalConfig(current_0 => ({
         ...current_0,
         transcriptShareDismissed: true
       }));
     }
+    // 用户同意共享：调用 submitTranscriptShare 执行转录上传，并上报成功/失败结果
     if (selected_1 === 'yes') {
       const result = await submitTranscriptShare(messagesRef.current, trigger_0, appearanceId_2);
       logEvent('tengu_feedback_survey_event', {
@@ -178,9 +321,9 @@ export function useFeedbackSurvey(messages: Message[], isLoading: boolean, submi
         appearance_id: appearanceId_2 as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
         trigger: trigger_0 as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS
       });
-      return result.success;
+      return result.success; // 返回上传结果，供 useSurveyState 决定后续状态
     }
-    return false;
+    return false; // no / dont_ask_again 均不触发转录上传，返回 false
   }, [surveyType]);
   const {
     state,
@@ -196,94 +339,127 @@ export function useFeedbackSurvey(messages: Message[], isLoading: boolean, submi
     onTranscriptPromptShown,
     onTranscriptSelect
   });
+  // 获取当前主循环使用的模型名称，用于与 onForModels 白名单比对
   const currentModel = getMainLoopModel();
+  /**
+   * isModelAllowed useMemo
+   *
+   * 整体流程：
+   *   - onForModels 为空数组时，任何模型都不允许（配置错误保护）
+   *   - onForModels 包含 '*' 时，所有模型均允许（默认配置）
+   *   - 其他情况下，检查当前模型名是否在白名单中
+   *
+   * 在系统中的角色：
+   *   是模型白名单门控，允许远程通过 GrowthBook 将调查限制在特定模型的用户中。
+   */
   const isModelAllowed = useMemo(() => {
     if (config.onForModels.length === 0) {
-      return false;
+      return false; // 白名单为空：任何模型都不允许
     }
     if (config.onForModels.includes('*')) {
-      return true;
+      return true; // 通配符：所有模型均允许
     }
-    return config.onForModels.includes(currentModel);
+    return config.onForModels.includes(currentModel); // 精确匹配当前模型
   }, [config.onForModels, currentModel]);
+  /**
+   * shouldOpen useMemo
+   *
+   * 整体流程（按优先级从高到低依次检查，任一为 false 则直接返回 false）：
+   *   1. 调查已打开（state !== 'closed'）→ 不重复打开
+   *   2. 正在加载 → 不在加载时打扰用户
+   *   3. 有活跃提示（权限/询问弹窗）→ 不叠加展示
+   *   4. CLAUDE_FORCE_DISPLAY_SURVEY 环境变量（测试模式）→ 强制展示（跳过后续检查）
+   *   5. 模型白名单检查
+   *   6. CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY 环境变量 → 完全禁用
+   *   7. isFeedbackSurveyDisabled()（analytics 配置检查）
+   *   8. 组织策略检查（ZDR / allow_product_feedback）
+   *   9. 会话内限流：已展示过 → 检查时间间隔和用户回合数；首次展示 → 检查热身时间和消息数
+   *  10. 概率门：每次满足所有资格条件时掷骰一次（通过 lastEligibleSubmitCountRef 记录掷骰时的 submitCount）
+   *  11. 全局跨会话冷却（最后检查，因为需要读取文件系统，代价最高）
+   *
+   * 在系统中的角色：
+   *   是 shouldOpen 的最终计算结果，驱动下方 useEffect 决定是否调用 open()。
+   */
   const shouldOpen = useMemo(() => {
     if (state !== 'closed') {
-      return false;
+      return false; // 调查已处于非关闭状态，无需重复触发
     }
     if (isLoading) {
-      return false;
+      return false; // 模型正在生成响应，不在此时展示调查
     }
 
-    // Don't show survey when permission or ask question prompts are visible
+    // 有活跃的权限询问或其他提示弹窗时，避免与调查同时展示
     if (hasActivePrompt) {
       return false;
     }
 
-    // Force display for testing
+    // 测试模式：强制展示调查（仅在尚未展示过时生效）
     if (process.env.CLAUDE_FORCE_DISPLAY_SURVEY && !feedbackSurvey.timeLastShown) {
       return true;
     }
     if (!isModelAllowed) {
-      return false;
+      return false; // 当前模型不在白名单中
     }
     if (isEnvTruthy(process.env.CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY)) {
-      return false;
+      return false; // 环境变量完全禁用调查
     }
     if (isFeedbackSurveyDisabled()) {
-      return false;
+      return false; // analytics 配置禁用调查（如 telemetry 关闭）
     }
 
-    // Check if product feedback is allowed by org policy
+    // 组织策略检查：ZDR 模式下禁止产品反馈
     if (!isPolicyAllowed('allow_product_feedback')) {
       return false;
     }
 
-    // Check session-local pacing
+    // 会话内限流：已展示过 → 检查时间间隔和用户回合数
     if (feedbackSurvey.timeLastShown) {
-      // Check time elapsed since last appearance in this session
+      // 检查距上次展示是否已过最短间隔时间
       const timeSinceLastShown = Date.now() - feedbackSurvey.timeLastShown;
       if (timeSinceLastShown < config.minTimeBetweenFeedbackMs) {
         return false;
       }
-      // Check user turn requirement for subsequent appearances
+      // 检查用户是否在上次展示后又发送了足够多的消息
       if (feedbackSurvey.submitCountAtLastAppearance !== null && submitCount < feedbackSurvey.submitCountAtLastAppearance + config.minUserTurnsBetweenFeedback) {
         return false;
       }
     } else {
-      // First appearance in this session
+      // 首次展示：检查会话热身时间是否足够
       const timeSinceSessionStart = Date.now() - sessionStartTime.current;
       if (timeSinceSessionStart < config.minTimeBeforeFeedbackMs) {
         return false;
       }
+      // 首次展示：检查用户是否发送了足够多的消息
       if (submitCount < submitCountAtSessionStart.current + config.minUserTurnsBeforeFeedback) {
         return false;
       }
     }
 
-    // Probability check: roll once per eligibility window to avoid re-rolling
-    // on every useMemo re-evaluation (which would make triggering near-certain).
+    // 概率门：当 submitCount 变化（新一轮资格窗口）时重新掷骰，否则复用上次结果
+    // 避免 useMemo 每次重新求值都重新掷骰，防止调查因频繁渲染而近乎必然触发
     if (lastEligibleSubmitCountRef.current !== submitCount) {
-      lastEligibleSubmitCountRef.current = submitCount;
+      lastEligibleSubmitCountRef.current = submitCount; // 记录本次掷骰时的 submitCount
       probabilityPassedRef.current = Math.random() <= (settingsRate ?? config.probability);
     }
     if (!probabilityPassedRef.current) {
-      return false;
+      return false; // 本轮概率未通过
     }
 
-    // Check global pacing (across all sessions)
-    // Leave this till last because it reads from the filesystem which is expensive.
+    // 全局跨会话冷却检查（放在最后，因为需要读取文件系统，代价较高）
     const globalFeedbackState = getGlobalConfig().feedbackSurveyState;
     if (globalFeedbackState?.lastShownTime) {
       const timeSinceGlobalLastShown = Date.now() - globalFeedbackState.lastShownTime;
       if (timeSinceGlobalLastShown < config.minTimeBetweenGlobalFeedbackMs) {
-        return false;
+        return false; // 全局冷却时间未到，跳过本次展示
       }
     }
-    return true;
+    return true; // 所有检查通过，可以展示调查
   }, [state, isLoading, hasActivePrompt, isModelAllowed, feedbackSurvey.timeLastShown, feedbackSurvey.submitCountAtLastAppearance, submitCount, config.minTimeBetweenFeedbackMs, config.minTimeBetweenGlobalFeedbackMs, config.minUserTurnsBetweenFeedback, config.minTimeBeforeFeedbackMs, config.minUserTurnsBeforeFeedback, config.probability, settingsRate]);
+  // 当 shouldOpen 变为 true 时触发调查展示：
+  // useEffect 确保 open() 仅在 shouldOpen 值发生变化时调用，而非每次渲染都调用
   useEffect(() => {
     if (shouldOpen) {
-      open();
+      open(); // 触发 useSurveyState 状态机从 closed → open
     }
   }, [shouldOpen, open]);
   return {

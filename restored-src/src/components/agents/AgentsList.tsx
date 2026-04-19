@@ -1,3 +1,20 @@
+/**
+ * AgentsList.tsx — Agent 列表展示与导航组件
+ *
+ * 【在 Claude Code 系统流程中的位置】
+ * 本文件位于 src/components/agents/ 目录下，是 Agent 管理界面的核心列表视图。
+ * 由 AgentsMenu 在 `list-agents` 模式下渲染，负责展示所有可用的 Agent，
+ * 并提供键盘导航（↑↓）、选择（Enter）和新建（Create new agent）入口。
+ *
+ * 【主要功能】
+ * 1. 展示按来源（source）筛选的 Agent 列表，支持 all/userSettings/projectSettings 等视图
+ * 2. renderAgent — 渲染单个 Agent 行，含选中状态、覆盖警告、模型/记忆信息
+ * 3. renderCreateNewOption — 渲染"Create new agent"入口行
+ * 4. renderBuiltInAgentsSection — 渲染内置 Agent 分组区块
+ * 5. renderAgentGroup — 渲染按来源分组的 Agent 列表（含文件夹路径）
+ * 6. handleKeyDown — 处理 ↑↓/Enter 键盘导航，支持循环选择
+ * 7. 使用 React Compiler（96 个缓存槽）实现细粒度 memoization
+ */
 import { c as _c } from "react/compiler-runtime";
 import figures from 'figures';
 import * as React from 'react';
@@ -11,6 +28,7 @@ import { count } from '../../utils/array.js';
 import { Dialog } from '../design-system/Dialog.js';
 import { Divider } from '../design-system/Divider.js';
 import { getAgentSourceDisplayName } from './utils.js';
+// Props 类型定义：source 控制显示哪个来源的 Agent，changes 用于显示最近操作记录
 type Props = {
   source: SettingSource | 'all' | 'built-in' | 'plugin';
   agents: ResolvedAgent[];
@@ -19,8 +37,22 @@ type Props = {
   onCreateNew?: () => void;
   changes?: string[];
 };
+
+/**
+ * AgentsList 组件
+ *
+ * 渲染 Agent 列表界面，包含：
+ * - 顶部"Create new agent"选项（当 onCreateNew 存在时）
+ * - 按来源分组或按名称排序的 Agent 列表
+ * - 底部展示最近变更记录（changes 最后一条）
+ * - 内置 Agent 分区（built-in，置于列表末尾，不可选中）
+ *
+ * 使用 React Compiler 分配 96 个缓存槽，对各闭包和 JSX 节点进行细粒度 memoization。
+ */
 export function AgentsList(t0) {
+  // React Compiler 分配 96 个缓存槽，用于对各依赖项的细粒度缓存
   const $ = _c(96);
+  // 解构 props：source 决定显示哪些 Agent，changes 展示最新操作提示
   const {
     source,
     agents,
@@ -29,20 +61,27 @@ export function AgentsList(t0) {
     onCreateNew,
     changes
   } = t0;
+  // selectedAgent：当前键盘光标停在哪个 Agent 上（null 表示光标在"Create new"上）
   const [selectedAgent, setSelectedAgent] = React.useState(null);
+  // isCreateNewSelected：初始为 true，表示光标默认停在"Create new agent"选项
   const [isCreateNewSelected, setIsCreateNewSelected] = React.useState(true);
   let t1;
   if ($[0] !== agents) {
+    // agents 变化时重新排序（按名称字母顺序）
     t1 = [...agents].sort(compareAgentsByName);
     $[0] = agents;
     $[1] = t1;
   } else {
     t1 = $[1];
   }
+  // sortedAgents：按名称排序后的 Agent 数组，用于稳定的列表渲染顺序
   const sortedAgents = t1;
+  // getOverrideInfo：从外部辅助函数获取 Agent 的覆盖状态（是否被其他来源的同名 Agent 覆盖）
   const getOverrideInfo = _temp;
   let t2;
   if ($[2] !== isCreateNewSelected) {
+    // isCreateNewSelected 变化时重建"Create new agent"行的渲染函数
+    // 选中时显示指针符号（figures.pointer）并着色为 suggestion 色
     t2 = () => <Box><Text color={isCreateNewSelected ? "suggestion" : undefined}>{isCreateNewSelected ? `${figures.pointer} ` : "  "}</Text><Text color={isCreateNewSelected ? "suggestion" : undefined}>Create new agent</Text></Box>;
     $[2] = isCreateNewSelected;
     $[3] = t2;
@@ -52,16 +91,23 @@ export function AgentsList(t0) {
   const renderCreateNewOption = t2;
   let t3;
   if ($[4] !== isCreateNewSelected || $[5] !== selectedAgent?.agentType || $[6] !== selectedAgent?.source) {
+    // isCreateNewSelected 或 selectedAgent 变化时重建 renderAgent 渲染函数
     t3 = agent_0 => {
+      // 内置 Agent 不可选中（光标跳过），仅展示（灰色）
       const isBuiltIn = agent_0.source === "built-in";
+      // 当前 Agent 是否被键盘光标选中
       const isSelected = !isBuiltIn && !isCreateNewSelected && selectedAgent?.agentType === agent_0.agentType && selectedAgent?.source === agent_0.source;
       const {
         isOverridden,
         overriddenBy
       } = getOverrideInfo(agent_0);
+      // 内置或被覆盖的 Agent 显示为灰色（dimmed）
       const dimmed = isBuiltIn || isOverridden;
+      // 选中时文字着 suggestion 色，未选中时不特殊着色
       const textColor = !isBuiltIn && isSelected ? "suggestion" : undefined;
+      // 获取 Agent 使用的实际模型名（经过覆盖解析）
       const resolvedModel = resolveAgentModelDisplay(agent_0);
+      // 渲染 Agent 行：指针/空格 + 名称 + 可选的模型/记忆标签 + 可选的覆盖警告
       return <Box key={`${agent_0.agentType}-${agent_0.source}`}><Text dimColor={dimmed && !isSelected} color={textColor}>{isBuiltIn ? "" : isSelected ? `${figures.pointer} ` : "  "}</Text><Text dimColor={dimmed && !isSelected} color={textColor}>{agent_0.agentType}</Text>{resolvedModel && <Text dimColor={true} color={textColor}>{" \xB7 "}{resolvedModel}</Text>}{agent_0.memory && <Text dimColor={true} color={textColor}>{" \xB7 "}{agent_0.memory} memory</Text>}{overriddenBy && <Text dimColor={!isSelected} color={isSelected ? "warning" : undefined}>{" "}{figures.warning} shadowed by {getOverrideSourceLabel(overriddenBy)}</Text>}</Box>;
     };
     $[4] = isCreateNewSelected;
@@ -71,12 +117,15 @@ export function AgentsList(t0) {
   } else {
     t3 = $[7];
   }
+  // renderAgent：渲染单个 Agent 行的闭包函数，依赖选中状态
   const renderAgent = t3;
   let t4;
   if ($[8] !== sortedAgents || $[9] !== source) {
     bb0: {
+      // 过滤掉内置 Agent，得到可选中的列表
       const nonBuiltIn = sortedAgents.filter(_temp2);
       if (source === "all") {
+        // source=all 时：按 AGENT_SOURCE_GROUPS 定义的来源顺序展示各组非内置 Agent
         t4 = AGENT_SOURCE_GROUPS.filter(_temp3).flatMap(t5 => {
           const {
             source: groupSource
@@ -85,6 +134,7 @@ export function AgentsList(t0) {
         });
         break bb0;
       }
+      // 其他 source 时：直接使用过滤后的非内置 Agent 列表
       t4 = nonBuiltIn;
     }
     $[8] = sortedAgents;
@@ -93,19 +143,24 @@ export function AgentsList(t0) {
   } else {
     t4 = $[10];
   }
+  // selectableAgentsInOrder：当前视图中可通过键盘选中的 Agent 有序列表（不含内置）
   const selectableAgentsInOrder = t4;
   let t5;
   let t6;
   if ($[11] !== isCreateNewSelected || $[12] !== onCreateNew || $[13] !== selectableAgentsInOrder || $[14] !== selectedAgent) {
+    // useEffect：当选中状态为空（无光标）且列表非空时，自动将光标移到首项（"Create new"或第一个 Agent）
     t5 = () => {
       if (!selectedAgent && !isCreateNewSelected && selectableAgentsInOrder.length > 0) {
         if (onCreateNew) {
+          // 有"Create new"选项时优先选中它
           setIsCreateNewSelected(true);
         } else {
+          // 否则选中第一个 Agent
           setSelectedAgent(selectableAgentsInOrder[0] || null);
         }
       }
     };
+    // useEffect 依赖数组：列表内容或选中状态变化时重新评估自动选中逻辑
     t6 = [selectableAgentsInOrder, selectedAgent, isCreateNewSelected, onCreateNew];
     $[11] = isCreateNewSelected;
     $[12] = onCreateNew;
@@ -120,9 +175,11 @@ export function AgentsList(t0) {
   React.useEffect(t5, t6);
   let t7;
   if ($[17] !== isCreateNewSelected || $[18] !== onCreateNew || $[19] !== onSelect || $[20] !== selectableAgentsInOrder || $[21] !== selectedAgent) {
+    // 任何选中状态或列表内容变化时重建 handleKeyDown 闭包
     t7 = e => {
       if (e.key === "return") {
         e.preventDefault();
+        // Enter 键：若光标在"Create new"上则触发创建；否则触发选中当前 Agent
         if (isCreateNewSelected && onCreateNew) {
           onCreateNew();
         } else {
@@ -132,27 +189,35 @@ export function AgentsList(t0) {
         }
         return;
       }
+      // 非上下键时忽略
       if (e.key !== "up" && e.key !== "down") {
         return;
       }
       e.preventDefault();
+      // hasCreateOption：是否存在"Create new"选项（位置 0）
       const hasCreateOption = !!onCreateNew;
+      // totalItems：所有可选条目总数（"Create new" + Agent 列表）
       const totalItems = selectableAgentsInOrder.length + (hasCreateOption ? 1 : 0);
       if (totalItems === 0) {
         return;
       }
+      // currentPosition：当前光标在全局条目列表中的位置（0 = "Create new"）
       let currentPosition = 0;
       if (!isCreateNewSelected && selectedAgent) {
         const agentIndex = selectableAgentsInOrder.findIndex(a_1 => a_1.agentType === selectedAgent.agentType && a_1.source === selectedAgent.source);
         if (agentIndex >= 0) {
+          // 有"Create new"选项时，Agent 位置从 1 开始
           currentPosition = hasCreateOption ? agentIndex + 1 : agentIndex;
         }
       }
+      // 计算新位置：支持循环（到达两端时从另一端继续）
       const newPosition = e.key === "up" ? currentPosition === 0 ? totalItems - 1 : currentPosition - 1 : currentPosition === totalItems - 1 ? 0 : currentPosition + 1;
       if (hasCreateOption && newPosition === 0) {
+        // 移动到"Create new"选项
         setIsCreateNewSelected(true);
         setSelectedAgent(null);
       } else {
+        // 移动到具体的 Agent（考虑"Create new"偏移量）
         const agentIndex_0 = hasCreateOption ? newPosition - 1 : newPosition;
         const newAgent = selectableAgentsInOrder[agentIndex_0];
         if (newAgent) {
@@ -170,12 +235,17 @@ export function AgentsList(t0) {
   } else {
     t7 = $[22];
   }
+  // handleKeyDown：处理键盘事件的闭包（↑↓导航 + Enter选择）
   const handleKeyDown = t7;
   let t8;
   if ($[23] !== renderAgent || $[24] !== sortedAgents) {
+    // renderAgent 或 sortedAgents 变化时重建内置 Agent 区块渲染函数
     t8 = t9 => {
+      // title 默认显示"Built-in (always available):"，可由调用方自定义
       const title = t9 === undefined ? "Built-in (always available):" : t9;
+      // 过滤出所有内置 Agent（source === "built-in"）
       const builtInAgents = sortedAgents.filter(_temp4);
+      // 渲染带标题的内置 Agent 列表块（左缩进 2，加粗灰色标题）
       return <Box flexDirection="column" marginBottom={1} paddingLeft={2}><Text bold={true} dimColor={true}>{title}</Text>{builtInAgents.map(renderAgent)}</Box>;
     };
     $[23] = renderAgent;
@@ -184,14 +254,19 @@ export function AgentsList(t0) {
   } else {
     t8 = $[25];
   }
+  // renderBuiltInAgentsSection：渲染内置 Agent 分组区块
   const renderBuiltInAgentsSection = t8;
   let t9;
   if ($[26] !== renderAgent) {
+    // renderAgent 变化时重建分组渲染函数
     t9 = (title_0, groupAgents) => {
+      // 若该来源无 Agent，不渲染任何内容
       if (!groupAgents.length) {
         return null;
       }
+      // 显示分组文件夹路径（若存在）帮助用户定位文件来源
       const folderPath = groupAgents[0]?.baseDir;
+      // 渲染分组：加粗标题 + 可选路径 + Agent 列表
       return <Box flexDirection="column" marginBottom={1}><Box paddingLeft={2}><Text bold={true} dimColor={true}>{title_0}</Text>{folderPath && <Text dimColor={true}> ({folderPath})</Text>}</Box>{groupAgents.map(agent_1 => renderAgent(agent_1))}</Box>;
     };
     $[26] = renderAgent;
@@ -199,15 +274,18 @@ export function AgentsList(t0) {
   } else {
     t9 = $[27];
   }
+  // renderAgentGroup：渲染单个来源分组（标题 + 路径 + Agent 列表）
   const renderAgentGroup = t9;
   let t10;
   if ($[28] !== source) {
+    // source 变化时重新获取来源的显示名称（如"User settings"、"Project settings"等）
     t10 = getAgentSourceDisplayName(source);
     $[28] = source;
     $[29] = t10;
   } else {
     t10 = $[29];
   }
+  // sourceTitle：当前视图的标题，用于 Dialog 组件的 title prop
   const sourceTitle = t10;
   let T0;
   let T1;
@@ -224,13 +302,18 @@ export function AgentsList(t0) {
   let t21;
   let t22;
   if ($[30] !== changes || $[31] !== handleKeyDown || $[32] !== onBack || $[33] !== onCreateNew || $[34] !== renderAgent || $[35] !== renderAgentGroup || $[36] !== renderBuiltInAgentsSection || $[37] !== renderCreateNewOption || $[38] !== sortedAgents || $[39] !== source || $[40] !== sourceTitle) {
+    // 任一依赖变化时重新计算主渲染逻辑
+    // 使用 early_return_sentinel 标记是否提前返回（无 Agent 的空状态）
     t22 = Symbol.for("react.early_return_sentinel");
     bb1: {
+      // 过滤出所有内置 Agent（在"全部"视图的底部展示）
       const builtInAgents_0 = sortedAgents.filter(_temp5);
+      // hasNoAgents：列表为空，或（非 built-in 视图下）无非内置 Agent
       const hasNoAgents = !sortedAgents.length || source !== "built-in" && !sortedAgents.some(_temp6);
       if (hasNoAgents) {
         let t23;
         if ($[55] !== onCreateNew || $[56] !== renderCreateNewOption) {
+          // 空状态下仍渲染"Create new agent"入口
           t23 = onCreateNew && <Box>{renderCreateNewOption()}</Box>;
           $[55] = onCreateNew;
           $[56] = renderCreateNewOption;
@@ -242,6 +325,7 @@ export function AgentsList(t0) {
         let t25;
         let t26;
         if ($[58] === Symbol.for("react.memo_cache_sentinel")) {
+          // 首次渲染时创建空状态说明文本（永久缓存，内容不变）
           t24 = <Text dimColor={true}>No agents found. Create specialized subagents that Claude can delegate to.</Text>;
           t25 = <Text dimColor={true}>Each subagent has its own context window, custom system prompt, and specific tools.</Text>;
           t26 = <Text dimColor={true}>Try creating: Code Reviewer, Code Simplifier, Security Reviewer, Tech Lead, or UX Reviewer.</Text>;
@@ -275,6 +359,7 @@ export function AgentsList(t0) {
         }
         let t29;
         if ($[69] !== onBack || $[70] !== sourceTitle || $[71] !== t28) {
+          // 渲染空状态的 Dialog：标题=来源名称，副标题="No agents found"
           t29 = <Dialog title={sourceTitle} subtitle="No agents found" onCancel={onBack} hideInputGuide={true}>{t28}</Dialog>;
           $[69] = onBack;
           $[70] = sourceTitle;
@@ -286,32 +371,41 @@ export function AgentsList(t0) {
         t22 = t29;
         break bb1;
       }
+      // 正常状态（有 Agent）：设置 Dialog 的类型和属性
       T1 = Dialog;
+      // Dialog 标题使用当前来源的显示名称
       t17 = sourceTitle;
       let t23;
       if ($[73] !== sortedAgents) {
+        // 统计非内置 Agent 数量用于副标题显示（"N agents"）
         t23 = count(sortedAgents, _temp8);
         $[73] = sortedAgents;
         $[74] = t23;
       } else {
         t23 = $[74];
       }
+      // Dialog 副标题：显示非内置 Agent 总数
       t18 = `${t23} agents`;
       t19 = onBack;
+      // hideInputGuide=true 隐藏默认的输入提示（由 AgentNavigationFooter 替代）
       t20 = true;
       if ($[75] !== changes) {
+        // 若有变更记录，在列表顶部展示最后一条（如"Deleted agent: xxx"）
         t21 = changes && changes.length > 0 && <Box marginTop={1}><Text dimColor={true}>{changes[changes.length - 1]}</Text></Box>;
         $[75] = changes;
         $[76] = t21;
       } else {
         t21 = $[76];
       }
+      // 容器组件类型（始终为 Box）
       T0 = Box;
       t11 = "column";
+      // tabIndex=0 使容器可获得焦点，autoFocus=true 自动聚焦
       t12 = 0;
       t13 = true;
       t14 = handleKeyDown;
       if ($[77] !== onCreateNew || $[78] !== renderCreateNewOption) {
+        // "Create new agent"选项：有 onCreateNew 时渲染，加底部间距
         t15 = onCreateNew && <Box marginBottom={1}>{renderCreateNewOption()}</Box>;
         $[77] = onCreateNew;
         $[78] = renderCreateNewOption;
@@ -319,6 +413,10 @@ export function AgentsList(t0) {
       } else {
         t15 = $[79];
       }
+      // t16：主内容区，根据 source 类型选择不同的渲染策略：
+      // - "all"：按 AGENT_SOURCE_GROUPS 分组渲染，末尾附加内置 Agent 区块
+      // - "built-in"：展示只读说明文本 + 内置 Agent 列表
+      // - 其他来源：先显示非内置 Agent，再附加 Divider + 内置 Agent 区块
       t16 = source === "all" ? <>{AGENT_SOURCE_GROUPS.filter(_temp9).map(t24 => {
           const {
             label,
@@ -368,11 +466,14 @@ export function AgentsList(t0) {
     t21 = $[53];
     t22 = $[54];
   }
+  // t22 为 early_return_sentinel 说明走了正常渲染路径（有 Agent），继续构建 JSX
   if (t22 !== Symbol.for("react.early_return_sentinel")) {
+    // 若 t22 被设置为某个 JSX 节点（空状态路径），直接提前返回
     return t22;
   }
   let t23;
   if ($[80] !== T0 || $[81] !== t11 || $[82] !== t12 || $[83] !== t13 || $[84] !== t14 || $[85] !== t15 || $[86] !== t16) {
+    // 构建内容容器：Box（column 方向，自动聚焦，绑定键盘事件）
     t23 = <T0 flexDirection={t11} tabIndex={t12} autoFocus={t13} onKeyDown={t14}>{t15}{t16}</T0>;
     $[80] = T0;
     $[81] = t11;
@@ -387,6 +488,7 @@ export function AgentsList(t0) {
   }
   let t24;
   if ($[88] !== T1 || $[89] !== t17 || $[90] !== t18 || $[91] !== t19 || $[92] !== t20 || $[93] !== t21 || $[94] !== t23) {
+    // 将内容容器包裹在 Dialog 中，Dialog 提供标题栏和 Esc/取消回调
     t24 = <T1 title={t17} subtitle={t18} onCancel={t19} hideInputGuide={t20}>{t21}{t23}</T1>;
     $[88] = T1;
     $[89] = t17;
@@ -401,21 +503,29 @@ export function AgentsList(t0) {
   }
   return t24;
 }
+// --- 提升到模块顶层的辅助过滤函数（由 React Compiler 从内联箭头函数提取）---
+
+// _temp1：过滤内置 Agent（source === "built-in"），用于判断是否显示内置 Agent 分区
 function _temp1(a_9) {
   return a_9.source === "built-in";
 }
+// _temp0：过滤非内置 Agent（source !== "built-in"），用于非 built-in 视图的列表渲染
 function _temp0(a_8) {
   return a_8.source !== "built-in";
 }
+// _temp9：过滤非内置来源的来源分组，用于 source=all 时跳过 built-in 分组
 function _temp9(g_0) {
   return g_0.source !== "built-in";
 }
+// _temp8：过滤未被覆盖的 Agent（overriddenBy 为 falsy），用于统计实际可用的 Agent 数量
 function _temp8(a_6) {
   return !a_6.overriddenBy;
 }
+// _temp7：过滤内置 Agent，用于空状态下判断是否需要展示内置 Agent 说明区块
 function _temp7(a_5) {
   return a_5.source === "built-in";
 }
+// _temp6：过滤非内置 Agent，用于判断空状态（所有 Agent 都是内置时视为空）
 function _temp6(a_4) {
   return a_4.source !== "built-in";
 }

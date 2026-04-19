@@ -1,14 +1,13 @@
 /**
- * Protocol Handler
+ * Deep Link 协议处理器模块。
  *
- * Entry point for `claude --handle-uri <url>`. When the OS invokes claude
- * with a `claude-cli://` URL, this module:
- *   1. Parses the URI into a structured action
- *   2. Detects the user's terminal emulator
- *   3. Opens a new terminal window running claude with the appropriate args
+ * 在 Claude Code 系统中，该模块是 `claude --handle-uri <url>` 的入口点。
+ * 当 OS 通过 `claude-cli://` URL 调用 claude 时，该模块：
+ * 1. 将 URI 解析为结构化动作
+ * 2. 检测用户的终端模拟器
+ * 3. 打开新终端窗口并以适当参数运行 claude
  *
- * This runs in a headless context (no TTY) because the OS launches the binary
- * directly — there is no terminal attached.
+ * 在无头上下文（无 TTY）中运行，因为 OS 直接启动二进制文件而无终端连接。
  */
 
 import { homedir } from 'os'

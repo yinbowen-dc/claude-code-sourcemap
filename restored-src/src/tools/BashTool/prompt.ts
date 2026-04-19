@@ -1,3 +1,23 @@
+/**
+ * BashTool/prompt.ts
+ *
+ * 【在 Claude Code 系统中的位置】
+ * 本文件属于 BashTool 工具模块，负责生成 BashTool 的系统提示词（system prompt）。
+ * 提示词在每次请求时注入到模型上下文中，指导模型如何正确、安全地使用 BashTool。
+ *
+ * 【主要功能】
+ * - getDefaultTimeoutMs / getMaxTimeoutMs：暴露超时配置给外部使用（如 schema 说明）。
+ * - getBackgroundUsageNote：生成后台任务运行说明（可由环境变量禁用）。
+ * - getCommitAndPRInstructions：生成 git 提交和 PR 创建的完整操作指南，
+ *     ant 用户使用精简版（指向 /commit skill），外部用户使用内联详细版。
+ * - dedup：去重工具函数，用于沙箱路径列表去重（减少 prompt token 消耗）。
+ * - getSimpleSandboxSection：若沙箱已启用，生成沙箱限制说明和使用指南。
+ * - getSimplePrompt：主入口，组装完整的 BashTool 系统提示词字符串。
+ *
+ * 【设计原则】
+ * 提示词内容会随运行时配置（沙箱状态、用户类型、git 设置、嵌入式工具等）动态变化，
+ * 以确保模型的行为与当前环境匹配。
+ */
 import { feature } from 'bun:bundle'
 import { prependBullets } from '../../constants/prompts.js'
 import { getAttributionTexts } from '../../utils/attribution.js'
@@ -24,14 +44,38 @@ import { GREP_TOOL_NAME } from '../GrepTool/prompt.js'
 import { TodoWriteTool } from '../TodoWriteTool/TodoWriteTool.js'
 import { BASH_TOOL_NAME } from './toolName.js'
 
+/**
+ * getDefaultTimeoutMs
+ *
+ * 【函数作用】
+ * 返回 BashTool 命令的默认执行超时时间（毫秒）。
+ * 实际值由 getDefaultBashTimeoutMs() 从配置层读取，此处仅作转发。
+ * 用于 schema 说明和 prompt 文本中展示默认超时值。
+ */
 export function getDefaultTimeoutMs(): number {
   return getDefaultBashTimeoutMs()
 }
 
+/**
+ * getMaxTimeoutMs
+ *
+ * 【函数作用】
+ * 返回 BashTool 命令允许的最大执行超时时间（毫秒）。
+ * 实际值由 getMaxBashTimeoutMs() 从配置层读取，此处仅作转发。
+ * 用于 schema 参数说明中告知模型可设置的超时上限。
+ */
 export function getMaxTimeoutMs(): number {
   return getMaxBashTimeoutMs()
 }
 
+/**
+ * getBackgroundUsageNote
+ *
+ * 【函数作用】
+ * 生成关于 `run_in_background` 参数使用说明的字符串。
+ * 若环境变量 CLAUDE_CODE_DISABLE_BACKGROUND_TASKS 为真值，则返回 null（不在提示词中展示该说明）。
+ * 否则返回一段说明文本，引导模型在不需要立即获取结果时使用后台任务模式。
+ */
 function getBackgroundUsageNote(): string | null {
   if (isEnvTruthy(process.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS)) {
     return null
@@ -39,6 +83,24 @@ function getBackgroundUsageNote(): string | null {
   return "You can use the `run_in_background` parameter to run the command in the background. Only use this if you don't need the result immediately and are OK being notified when the command completes later. You do not need to check the output right away - you'll be notified when it finishes. You do not need to use '&' at the end of the command when using this parameter."
 }
 
+/**
+ * getCommitAndPRInstructions
+ *
+ * 【函数作用】
+ * 生成 git 提交和 PR 创建的操作指南字符串，注入到 BashTool 提示词中。
+ *
+ * 【差异化处理】
+ *   - ant 用户（USER_TYPE=ant）：返回精简版，引导使用 /commit、/commit-push-pr skills；
+ *     若同时是 undercover 模式，在最前面加入 undercover 保密指令，
+ *     防止模型在提交信息中泄露内部代号。
+ *   - 外部用户：返回完整的内联操作指南，包含 git 安全协议、提交步骤、PR 创建步骤等。
+ *   - 若 shouldIncludeGitInstructions() 为 false，仅返回 undercoverSection（若有）。
+ *
+ * 【安全说明】
+ * undercover 指令是"最后防线"（defense-in-depth）：
+ * 即使用户禁用了 git 指令，attribution 剥除和模型 ID 隐藏在机械层面仍然生效，
+ * 但显式的"不要暴露代号"指令需要额外保留。
+ */
 function getCommitAndPRInstructions(): string {
   // Defense-in-depth: undercover instructions must survive even if the user
   // has disabled git instructions entirely. Attribution stripping and model-ID
@@ -164,11 +226,32 @@ Important:
 // CLI flags) without deduping, so paths like ~/.cache appear 3× in allowOnly.
 // Dedup here before inlining into the prompt — affects only what the model sees,
 // not sandbox enforcement. Saves ~150-200 tokens/request when sandbox is enabled.
+// 去重函数：仅用于沙箱路径列表展示，不影响实际沙箱策略执行，减少 ~150-200 tokens/请求
 function dedup<T>(arr: T[] | undefined): T[] | undefined {
   if (!arr || arr.length === 0) return arr
   return [...new Set(arr)]
 }
 
+/**
+ * getSimpleSandboxSection
+ *
+ * 【函数作用】
+ * 若沙箱功能已启用，生成沙箱限制说明和使用指南的提示词片段。
+ * 若沙箱未启用，返回空字符串。
+ *
+ * 【内容组成】
+ *   1. 沙箱文件系统限制（读/写 allowOnly/denyOnly 规则）
+ *   2. 网络限制（allowedHosts / deniedHosts / allowUnixSockets）
+ *   3. 忽略违规配置（若有）
+ *   4. 沙箱覆盖使用说明：
+ *      - 允许非沙箱命令：引导模型仅在有沙箱失败证据时才使用 dangerouslyDisableSandbox
+ *      - 禁用非沙箱命令：所有命令必须在沙箱中运行
+ *   5. 临时文件指南：始终使用 $TMPDIR 而非 /tmp
+ *
+ * 【token 优化】
+ * 使用 dedup 去重路径列表，使用 normalizeAllowOnly 将 per-UID 临时目录路径
+ * 替换为 $TMPDIR，确保跨用户的提示词内容一致（有利于全局提示词缓存命中）。
+ */
 function getSimpleSandboxSection(): string {
   if (!SandboxManager.isSandboxingEnabled()) {
     return ''
@@ -272,6 +355,25 @@ function getSimpleSandboxSection(): string {
   ].join('\n')
 }
 
+/**
+ * getSimplePrompt
+ *
+ * 【函数作用】
+ * BashTool 系统提示词的主入口，组装并返回完整的提示词字符串。
+ *
+ * 【提示词结构】
+ *   1. 工具功能说明（工作目录持久化、shell 状态不持久化）
+ *   2. 工具使用偏好指南（优先使用专用工具而非 bash 命令）
+ *   3. 操作指南（路径引号、cwd 维护、超时设置、后台任务、多命令策略、git 规范、sleep 规范）
+ *   4. 沙箱说明（若已启用）
+ *   5. git 提交和 PR 创建指南（若已配置）
+ *
+ * 【动态调整】
+ *   - embedded（ant 原生构建）：find/grep 已被 bfs/ugrep 替代，
+ *     工具偏好列表中移除 Glob/Grep 工具推荐；
+ *     增加 `find -regex` 左长替代规则说明（Oniguruma 最左优先 vs POSIX 最长优先差异）。
+ *   - feature('MONITOR_TOOL')：sleep 指南中加入 Monitor 工具相关说明。
+ */
 export function getSimplePrompt(): string {
   // Ant-native builds alias find/grep to embedded bfs/ugrep in Claude's shell,
   // so we don't steer away from them (and Glob/Grep tools are removed).

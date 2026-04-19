@@ -1,3 +1,30 @@
+/**
+ * BashTool/pathValidation.ts
+ *
+ * 【在 Claude Code 系统中的位置】
+ * 本文件属于 BashTool 工具模块，负责对 bash 命令中涉及文件系统路径的操作进行权限校验。
+ * 在 BashTool 主权限流程中，checkPathConstraints 作为路径约束检查入口被调用，
+ * 确保命令只能访问允许的工作目录集合中的路径。
+ *
+ * 【主要功能】
+ * - PathCommand 类型：支持路径校验的命令枚举（cd、ls、find、rm、cat、grep 等40+命令）。
+ * - PATH_EXTRACTORS：命令 → 路径提取函数映射，负责从各命令的 args 中提取出路径字符串。
+ * - COMMAND_OPERATION_TYPE：命令 → 操作类型（read/write/create）映射，用于权限判断。
+ * - filterOutFlags：提取非 flag 位置参数，正确处理 `--` 结束符（防止 `-/../etc` 路径绕过）。
+ * - parsePatternCommand：解析 grep/rg 风格的命令（模式 + 路径）。
+ * - checkDangerousRemovalPaths（内部）：对 rm/rmdir 命令检测危险路径（如 /），
+ *   即使存在允许规则也强制要求用户批准。
+ * - validateCommandPaths（内部）：单命令路径验证核心，包括命令特定 validator、
+ *   cd 复合命令写操作拦截、逐路径 validatePath 调用。
+ * - createPathChecker：创建命令特定的路径检查器闭包，集成危险路径检测和权限建议。
+ * - validateSinglePathCommand（内部）：解析单条子命令字符串，提取路径，运行路径检查。
+ * - validateSinglePathCommandArgv（内部）：AST argv 直接路径检查版本（避免 shell-quote 漏洞）。
+ * - validateOutputRedirections（内部）：验证输出重定向目标路径的安全性。
+ * - astRedirectsToOutputRedirections（内部）：将 AST Redirect[] 转换为重定向校验格式。
+ * - checkPathConstraints（导出）：主入口，整合进程替换检测、重定向校验、命令路径校验。
+ * - stripWrappersFromArgv（导出）：从 AST argv 中剥除安全包装命令（timeout/nice/stdbuf/env/nohup/time）。
+ * - 辅助函数：skipTimeoutFlags、skipStdbufFlags、skipEnvFlags（用于 stripWrappersFromArgv）。
+ */
 import { homedir } from 'os'
 import { isAbsolute, resolve } from 'path'
 import type { z } from 'zod/v4'
@@ -24,6 +51,14 @@ import type { BashTool } from './BashTool.js'
 import { stripSafeWrappers } from './bashPermissions.js'
 import { sedCommandIsAllowedByAllowlist } from './sedValidation.js'
 
+/**
+ * PathCommand
+ *
+ * 【类型说明】
+ * 支持路径约束校验的 bash 命令枚举类型。
+ * 只有列于此处的命令才会触发 PATH_EXTRACTORS 中对应的路径提取和 validatePath 校验；
+ * 未列出的命令在路径校验层不做路径级别的 allow/deny 判断。
+ */
 export type PathCommand =
   | 'cd'
   | 'ls'
@@ -63,9 +98,18 @@ export type PathCommand =
   | 'md5sum'
 
 /**
+ * checkDangerousRemovalPaths
+ *
+ * 【函数作用】
+ * 对 rm/rmdir 命令检测是否操作了危险路径（如 `/`、`/home`、`/usr` 等系统关键目录）。
+ * 即使存在用户配置的允许规则，危险路径仍强制要求用户手动批准（不可被规则自动通过），
+ * 防止因允许规则误配置导致灾难性数据丢失（如 `rm -rf /`）。
+ *
+ * 注意：路径在验证时不解析符号链接（/tmp 在 macOS 上是 /private/tmp 的符号链接，
+ * 但 /tmp 本身也应被视为危险路径，不解析链接可以正确拦截此类情况）。
+ *
  * Checks if an rm/rmdir command targets dangerous paths that should always
  * require explicit user approval, even if allowlist rules exist.
- * This prevents catastrophic data loss from commands like `rm -rf /`.
  */
 function checkDangerousRemovalPaths(
   command: 'rm' | 'rmdir',
@@ -108,20 +152,19 @@ function checkDangerousRemovalPaths(
 }
 
 /**
+ * filterOutFlags
+ *
+ * 【函数作用】
+ * 从命令 args 中提取非 flag 的位置参数（路径），正确处理 POSIX `--` 结束符。
+ *
+ * 【安全说明】
+ * 大多数命令（rm、cat、touch 等）在遇到 `--` 后将所有后续参数视为位置参数，
+ * 即使它们以 `-` 开头。朴素的 `!arg.startsWith('-')` 过滤会丢弃 `--` 后的路径参数，
+ * 导致 `rm -- -/../.claude/settings.local.json` 这类攻击路径被静默跳过（验证器看到零个路径）。
+ * 正确处理 `--` 后，此类路径会被提取并校验（由 isClaudeConfigFilePath / pathInAllowedWorkingPath 拦截）。
+ *
  * SECURITY: Extract positional (non-flag) arguments, correctly handling the
  * POSIX `--` end-of-options delimiter.
- *
- * Most commands (rm, cat, touch, etc.) stop parsing options at `--` and treat
- * ALL subsequent arguments as positional, even if they start with `-`. Naive
- * `!arg.startsWith('-')` filtering drops these, causing path validation to be
- * silently skipped for attack payloads like:
- *
- *   rm -- -/../.claude/settings.local.json
- *
- * Here `-/../.claude/settings.local.json` starts with `-` so the naive filter
- * drops it, validation sees zero paths, returns passthrough, and the file is
- * deleted without a prompt. With `--` handling, the path IS extracted and
- * validated (blocked by isClaudeConfigFilePath / pathInAllowedWorkingPath).
  */
 function filterOutFlags(args: string[]): string[] {
   const result: string[] = []
@@ -138,6 +181,21 @@ function filterOutFlags(args: string[]): string[] {
   return result
 }
 
+/**
+ * parsePatternCommand
+ *
+ * 【函数作用】
+ * 解析 grep/rg 风格的命令参数（格式：[flags] pattern [files...]），
+ * 提取其中的文件路径参数。
+ * 正确处理：
+ *   - `-e`/`--regexp`/`-f`/`--file` 等带模式的 flag（标记模式已找到）
+ *   - 需要参数的 flag（flagsWithArgs，跳过其参数）
+ *   - `--` 结束符（其后所有参数均为路径）
+ *
+ * @param args - 命令参数列表（不含命令名）
+ * @param flagsWithArgs - 需要跳过后续参数的 flag 集合
+ * @param defaults - 无路径时的默认值（如 rg 默认为 ['.']）
+ */
 // Helper: Parse grep/rg style commands (pattern then paths)
 function parsePatternCommand(
   args: string[],
@@ -184,6 +242,24 @@ function parsePatternCommand(
 }
 
 /**
+ * PATH_EXTRACTORS
+ *
+ * 【说明】
+ * 命令 → 路径提取函数的映射表。
+ * 对每种 PathCommand，定义如何从其 args 中提取需要进行路径校验的字符串列表。
+ *
+ * 各命令的特殊处理说明：
+ * - cd：无参数时返回 home 目录，否则将所有参数拼接为单一路径（含空格路径）。
+ * - ls：过滤 flag 后若无路径则默认为 `.`。
+ * - find：收集全局选项（-H/-L/-P）之前的非 flag 参数作为搜索起点，同时提取 -newer/-samefile 等的路径参数；
+ *         支持 `--` 后将所有参数视为路径（防止 `find -- -/../../etc` 绕过）。
+ * - rm/rmdir/mv/cp/cat/… 简单命令：直接过滤 flag（filterOutFlags）。
+ * - tr：跳过字符集参数（-d 时跳过 1 个，否则跳过 2 个）。
+ * - grep/rg：parsePatternCommand 解析模式+路径。
+ * - sed：跳过 -e/-f 表达式/脚本 flag，剩余为文件路径；-f 的脚本文件本身也加入路径验证。
+ * - jq：跳过过滤器，后续为文件路径；无文件则读 stdin（返回空数组）。
+ * - git：仅 `git diff --no-index` 需要路径校验（其他 git 子命令受 git 自身安全模型约束）。
+ *
  * Extracts paths from command arguments for different path commands.
  * Each command has specific logic for how it handles paths and flags.
  */
@@ -508,8 +584,26 @@ export const PATH_EXTRACTORS: Record<
   },
 }
 
+/**
+ * SUPPORTED_PATH_COMMANDS
+ *
+ * 【说明】
+ * 所有需要进行路径校验的命令名称列表，直接从 PATH_EXTRACTORS 键集动态生成，
+ * 保证两者始终同步，避免手动维护遗漏。
+ * 在 validateSinglePathCommand / validateSinglePathCommandArgv 中作为白名单判断
+ * 命令是否需要进入路径校验逻辑。
+ */
 const SUPPORTED_PATH_COMMANDS = Object.keys(PATH_EXTRACTORS) as PathCommand[]
 
+/**
+ * ACTION_VERBS
+ *
+ * 【说明】
+ * 为每种 PathCommand 提供人类可读的操作描述动词短语，
+ * 用于在路径被拒绝时构造面向用户的错误消息。
+ * 格式："`command` in '`path`' was blocked. Claude Code may only `ACTION_VERBS[command]` the allowed directories."
+ * 例如：mkdir → "create directories in"，rm → "remove files from"。
+ */
 const ACTION_VERBS: Record<PathCommand, string> = {
   cd: 'change directories to',
   ls: 'list files in',
@@ -549,6 +643,17 @@ const ACTION_VERBS: Record<PathCommand, string> = {
   md5sum: 'compute MD5 checksums for files in',
 }
 
+/**
+ * COMMAND_OPERATION_TYPE
+ *
+ * 【说明】
+ * 将每种 PathCommand 映射到其对应的文件操作类型（read / write / create）。
+ * 该映射决定在路径校验中如何判断权限：
+ *   - read：仅需读取权限（cat、ls、grep 等）
+ *   - write：需要写入权限（rm、rmdir、mv、cp、sed 等）
+ *   - create：需要创建权限（mkdir、touch 等，以及输出重定向）
+ * 同时影响 createPathChecker 中权限建议的内容（读操作建议 ReadRule，写/创建操作建议 addDirectories）。
+ */
 export const COMMAND_OPERATION_TYPE: Record<PathCommand, FileOperationType> = {
   cd: 'read',
   ls: 'read',
@@ -589,6 +694,16 @@ export const COMMAND_OPERATION_TYPE: Record<PathCommand, FileOperationType> = {
 }
 
 /**
+ * COMMAND_VALIDATOR
+ *
+ * 【说明】
+ * 命令级前置校验器映射表（可选）。
+ * 仅部分命令需要前置校验，目前只有 mv 和 cp：
+ *   - 当 mv/cp 带有任何以 `-` 开头的 flag 时返回 false（拒绝），
+ *     因为某些 flag（如 --target-directory=PATH）会改变路径提取语义，
+ *     可能导致路径校验被绕过。
+ *   - 保守策略：所有带 flag 的 mv/cp 统一要求人工批准，避免路径注入风险。
+ *
  * Command-specific validators that run before path validation.
  * Returns true if the command is valid, false if it should be rejected.
  * Used to block commands with flags that could bypass path validation.
@@ -600,6 +715,30 @@ const COMMAND_VALIDATOR: Partial<
   cp: (args: string[]) => !args.some(arg => arg?.startsWith('-')),
 }
 
+/**
+ * validateCommandPaths
+ *
+ * 【函数作用】
+ * 对单条路径命令执行完整的路径权限校验，是路径校验的核心执行函数。
+ *
+ * 【执行流程】
+ *   1. 通过 PATH_EXTRACTORS 提取命令参数中的路径列表。
+ *   2. 若命令有前置校验器（COMMAND_VALIDATOR），先执行前置校验；
+ *      mv/cp 带 flag 时直接返回 ask（避免 --target-directory 等绕过路径提取）。
+ *   3. 若复合命令含 cd 且当前命令为写/创建操作，返回 ask 要求人工批准，
+ *      防止 `cd .claude/ && mv test.txt settings.json` 类路径解析绕过攻击。
+ *   4. 对每条提取的路径调用 validatePath，任一路径不在允许范围内则：
+ *      - deny 规则命中 → 返回 deny
+ *      - 其他 → 返回 ask，附带 blockedPath
+ *   5. 全部通过 → 返回 passthrough。
+ *
+ * @param command - 要检查的路径命令名称
+ * @param args - 命令参数列表（不含命令名本身）
+ * @param cwd - 当前工作目录
+ * @param toolPermissionContext - 包含允许路径集合的权限上下文
+ * @param compoundCommandHasCd - 复合命令中是否存在 cd 子命令
+ * @param operationTypeOverride - 可选，覆盖默认的 COMMAND_OPERATION_TYPE 映射
+ */
 function validateCommandPaths(
   command: PathCommand,
   args: string[],
@@ -700,6 +839,24 @@ function validateCommandPaths(
   }
 }
 
+/**
+ * createPathChecker
+ *
+ * 【函数作用】
+ * 工厂函数：为指定命令创建一个路径校验闭包（checker）。
+ * 返回的 checker 签名与 validateCommandPaths 类似，但额外执行：
+ *   1. 先调用 validateCommandPaths（含 deny 规则检查）。
+ *   2. 若结果为 deny，直接返回，不被后续逻辑覆盖。
+ *   3. 对 rm/rmdir 还需额外调用 checkDangerousRemovalPaths，
+ *      阻止 `rm -rf /`、`rm -rf ~` 等危险路径（优先于通用拒绝消息）。
+ *   4. 对 ask 结果，附加 suggestions（建议操作）：
+ *      - 读操作 → 建议添加 ReadRule（只读白名单规则）
+ *      - 写/创建操作 → 建议添加目录 + 切换 acceptEdits 模式
+ *
+ * @param command - 目标路径命令
+ * @param operationTypeOverride - 可选，覆盖 COMMAND_OPERATION_TYPE[command]
+ * @returns 可复用的路径校验函数（(args, cwd, context, compoundCommandHasCd) => PermissionResult）
+ */
 export function createPathChecker(
   command: PathCommand,
   operationTypeOverride?: FileOperationType,
@@ -784,6 +941,21 @@ export function createPathChecker(
 }
 
 /**
+ * parseCommandArguments
+ *
+ * 【函数作用】
+ * 使用 shell-quote 将命令字符串解析为参数数组，将 glob 对象转换为字符串。
+ *
+ * 【说明】
+ * shell-quote 会将 *.txt 等 glob 模式解析为 `{ op: 'glob', pattern: '...' }` 对象，
+ * 而路径校验需要字符串形式，因此需要在此统一转换。
+ * 若解析失败（malformed shell 语法），返回空数组，让调用方安全跳过。
+ *
+ * 【已知限制】
+ * shell-quote 存在单引号反斜杠 bug（参见 validateSinglePathCommandArgv 注释），
+ * 在含有 `'\''` 等结构时可能静默返回 []，导致路径校验被跳过。
+ * AST 路径（validateSinglePathCommandArgv）通过直接使用 tree-sitter argv 绕过该问题。
+ *
  * Parses command arguments using shell-quote, converting glob objects to strings.
  * This is necessary because shell-quote parses patterns like *.txt as glob objects,
  * but we need them as strings for path validation.
@@ -817,6 +989,21 @@ function parseCommandArguments(cmd: string): string[] {
 }
 
 /**
+ * validateSinglePathCommand
+ *
+ * 【函数作用】
+ * 基于 shell-quote 的单条命令路径校验（传统路径）。
+ * 是 checkPathConstraints 在无 AST 时调用的校验函数。
+ *
+ * 【执行流程】
+ *   1. 调用 stripSafeWrappers 剥除 timeout/nohup/nice 等包装命令，
+ *      防止 `timeout 10 rm -rf /` 被误判为 timeout 命令而跳过路径检查。
+ *   2. 调用 parseCommandArguments 解析参数（shell-quote 路径）。
+ *   3. 若基础命令不在 SUPPORTED_PATH_COMMANDS 中，返回 passthrough。
+ *   4. 对 sed 命令额外判断是否为只读模式（sedCommandIsAllowedByAllowlist），
+ *      只读 sed 的文件参数视为读操作而非写操作。
+ *   5. 调用 createPathChecker 生成校验器并执行路径校验。
+ *
  * Validates a single command for path constraints and shell safety.
  *
  * This function:
@@ -880,6 +1067,18 @@ function validateSinglePathCommand(
 }
 
 /**
+ * validateSinglePathCommandArgv
+ *
+ * 【函数作用】
+ * 基于 AST 派生 argv 的单条命令路径校验（AST 路径）。
+ * 与 validateSinglePathCommand 功能相同，但直接使用 tree-sitter 解析出的 argv，
+ * 规避 shell-quote 单引号反斜杠 bug 导致 parseCommandArguments 静默返回 [] 而跳过路径校验的问题。
+ *
+ * 【与 validateSinglePathCommand 的区别】
+ *   - 输入为 SimpleCommand（AST 节点），而非原始命令字符串。
+ *   - 调用 stripWrappersFromArgv（argv 级别包装命令剥除），而非 stripSafeWrappers（文本级别）。
+ *   - 对 sed 的只读检查仍需基于文本（cmd.text）进行，并先剥除包装命令。
+ *
  * Like validateSinglePathCommand but operates on AST-derived argv directly
  * instead of re-parsing the command string with shell-quote. Avoids the
  * shell-quote single-quote backslash bug that causes parseCommandArguments
@@ -921,6 +1120,26 @@ function validateSinglePathCommandArgv(
   return pathChecker(args, cwd, toolPermissionContext, compoundCommandHasCd)
 }
 
+/**
+ * validateOutputRedirections
+ *
+ * 【函数作用】
+ * 校验输出重定向目标路径（`>` 和 `>>`）是否在允许范围内。
+ *
+ * 【安全说明】
+ *   - 若复合命令含 cd 且存在重定向，返回 ask，防止以下攻击：
+ *     `cd .claude/ && echo "malicious" > settings.json`
+ *     此时路径相对原始 cwd 校验，但写入实际发生在 cd 后的目录中。
+ *   - `/dev/null` 始终被允许（丢弃输出，无安全风险）。
+ *   - 非 /dev/null 的重定向目标：调用 validatePath 校验；
+ *     deny 规则命中 → 返回 deny；
+ *     其他不允许 → 返回 ask，附 suggestions（addDirectories）。
+ *
+ * @param redirections - 待校验的输出重定向列表（target + operator）
+ * @param cwd - 当前工作目录
+ * @param toolPermissionContext - 权限上下文
+ * @param compoundCommandHasCd - 复合命令中是否含 cd
+ */
 function validateOutputRedirections(
   redirections: Array<{ target: string; operator: '>' | '>>' }>,
   cwd: string,
@@ -1003,8 +1222,26 @@ function validateOutputRedirections(
 }
 
 /**
- * Checks path constraints for commands that access the filesystem (cd, ls, find).
- * Also validates output redirections to ensure they're within allowed directories.
+ * checkPathConstraints
+ *
+ * 【函数作用】
+ * 路径约束检查的主入口，是 BashTool 权限校验流程中路径安全检查的核心函数。
+ *
+ * 【执行流程】
+ *   1. 进程替换检测（非 AST 路径）：命令中含 `>(...)`/`<(...)` 时要求人工批准，
+ *      防止通过进程替换将写入目标隐藏在重定向检测之外。
+ *   2. 输出重定向提取：AST 路径使用 astRedirectsToOutputRedirections，
+ *      传统路径使用 extractOutputRedirections（shell-quote）。
+ *   3. 若检测到变量展开语法（$VAR / %VAR%）的危险重定向，返回 ask。
+ *   4. 调用 validateOutputRedirections 校验所有输出重定向目标。
+ *   5. 遍历子命令：
+ *      - AST 路径：使用 validateSinglePathCommandArgv（避免 shell-quote 单引号 bug）。
+ *      - 传统路径：使用 validateSinglePathCommand（shell-quote 解析）。
+ *   6. 全部通过 → 返回 passthrough。
+ *
+ * 【设计原则】
+ * 始终返回 passthrough，让其他权限检查模块继续运行，
+ * 只在发现路径约束违规时才返回 ask/deny 短路后续检查。
  *
  * @returns
  * - 'ask' if any path command or redirection tries to access outside allowed directories
@@ -1109,6 +1346,22 @@ export function checkPathConstraints(
 }
 
 /**
+ * astRedirectsToOutputRedirections
+ *
+ * 【函数作用】
+ * 将 AST 解析出的 Redirect[] 转换为 validateOutputRedirections 所需的格式。
+ *
+ * 【转换规则】
+ *   - `>`、`>|`、`&>` → operator: '>'（普通覆盖写入）
+ *   - `>>`、`&>>` → operator: '>>'（追加写入）
+ *   - `>&` + 仅数字目标（如 2>&1、>&10）→ 跳过（fd 复制，非文件写入）
+ *   - `>&` + 非数字目标 → operator: '>'（deprecated 文件重定向形式）
+ *   - `<`、`<<`、`<&`、`<<<` → 输入重定向，跳过
+ *
+ * 【安全说明】
+ * AST 目标路径已由 tree-sitter 正确解析，checkSemantics 也已验证，
+ * 不存在 shell 变量展开风险，因此 hasDangerousRedirection 始终为 false。
+ *
  * Convert AST-derived Redirect[] to the format expected by
  * validateOutputRedirections. Filters to output-only redirects (excluding
  * fd duplications like 2>&1) and maps operators to '>' | '>>'.
@@ -1174,9 +1427,22 @@ function astRedirectsToOutputRedirections(redirects: Redirect[]): {
 // SECURITY: allowlist for timeout flag VALUES (signals are TERM/KILL/9,
 // durations are 5/5s/10.5). Rejects $ ( ) ` | ; & and newlines that
 // previously matched via [^ \t]+ — `timeout -k$(id) 10 ls` must NOT strip.
+// 安全白名单：timeout flag 值必须为合法字母数字+少量符号，阻止 $(...) 等注入
 const TIMEOUT_FLAG_VALUE_RE = /^[A-Za-z0-9_.+-]+$/
 
 /**
+ * skipTimeoutFlags
+ *
+ * 【函数作用】
+ * 解析 timeout 命令的 GNU 风格 flag（长/短格式、融合/空格分隔），
+ * 返回 DURATION 参数在 argv 数组中的下标；
+ * 若 flag 无法识别（可能存在注入风险）则返回 -1（保守拒绝）。
+ *
+ * 【安全说明】
+ * flag 值通过 TIMEOUT_FLAG_VALUE_RE 白名单校验，
+ * 防止 `timeout -k$(id) 10 ls` 中的命令注入绕过包装命令剥除。
+ * 未知 flag 统一返回 -1，让调用方保留原始 argv（不剥除包装）。
+ *
  * Parse timeout's GNU flags (long + short, fused + space-separated) and
  * return the argv index of the DURATION token, or -1 if flags are unparseable.
  */
@@ -1218,6 +1484,17 @@ function skipTimeoutFlags(a: readonly string[]): number {
 }
 
 /**
+ * skipStdbufFlags
+ *
+ * 【函数作用】
+ * 解析 stdbuf 命令的 flag（-i/-o/-e，融合/空格分隔/长等号格式），
+ * 返回被包装命令在 argv 中的下标；
+ * 未识别 flag 或无 flag（stdbuf 无参数时无效）返回 -1。
+ *
+ * 【安全说明】
+ * 与 checkSemantics（ast.ts）中的 stdbuf 处理保持同步。
+ * 未知 flag → 返回 -1（fail closed），保留原始 argv，防止路径校验被跳过。
+ *
  * Parse stdbuf's flags (-i/-o/-e in fused/space-separated/long-= forms).
  * Returns argv index of wrapped COMMAND, or -1 if unparseable or no flags
  * consumed (stdbuf without flags is inert). Mirrors checkSemantics (ast.ts).
@@ -1237,6 +1514,18 @@ function skipStdbufFlags(a: readonly string[]): number {
 }
 
 /**
+ * skipEnvFlags
+ *
+ * 【函数作用】
+ * 解析 `env` 命令的 VAR=val 赋值参数和安全 flag（-i/-0/-v/-u NAME），
+ * 返回被包装命令在 argv 中的下标；
+ * 遇到不安全 flag（-S/-C/-P 或未知 flag）时返回 -1（fail closed）。
+ *
+ * 【安全说明】
+ * -S（argv 拆分器）、-C（改变工作目录）、-P（修改 PATH）等 flag 具有安全风险，
+ * 统一拒绝（返回 -1），不剥除 env 包装，保留原始 argv。
+ * 与 checkSemantics（ast.ts）中的 env 处理保持同步。
+ *
  * Parse env's VAR=val and safe flags (-i/-0/-v/-u NAME). Returns argv index
  * of wrapped COMMAND, or -1 if unparseable/no wrapped cmd. Rejects -S (argv
  * splitter), -C/-P (altwd/altpath). Mirrors checkSemantics (ast.ts).
@@ -1256,6 +1545,29 @@ function skipEnvFlags(a: readonly string[]): number {
 }
 
 /**
+ * stripWrappersFromArgv
+ *
+ * 【函数作用】
+ * argv 级别的包装命令剥除函数（正规版本）。
+ * 迭代剥除 time、nohup、timeout、nice、stdbuf、env 等安全包装命令，
+ * 直到 argv 首元素不再是已知包装命令为止（不动点迭代）。
+ *
+ * 【支持的包装命令及处理方式】
+ *   - time / nohup：直接跳过（处理 `-- ` 分隔符）
+ *   - timeout：调用 skipTimeoutFlags 解析 flag，再跳过 DURATION 参数；
+ *              DURATION 必须匹配 `^\d+(?:\.\d+)?[smhd]?$`，否则返回原始 argv。
+ *   - nice：处理三种形式：`nice -n N cmd`、`nice -N cmd`（legacy）、`nice cmd`。
+ *   - stdbuf：调用 skipStdbufFlags；flag 未识别时 fail closed。
+ *   - env：调用 skipEnvFlags；不安全 flag 时 fail closed。
+ *
+ * 【规范说明】
+ * 这是路径校验模块中 stripWrappersFromArgv 的唯一生产消费者（正规版本）。
+ * bashPermissions.ts 中存在旧的窄版本（仅处理 timeout/nice -n N），
+ * 由于 Bun DCE 问题无法删除（见注释 bun-feature-dce-cliff.md），但不被生产使用。
+ * 需与以下代码保持同步：
+ *   - bashPermissions.ts 中的 SAFE_WRAPPER_PATTERNS（文本级 stripSafeWrappers）
+ *   - ast.ts checkSemantics 中的包装命令剥除循环（约第 1860 行）
+ *
  * Argv-level counterpart to stripSafeWrappers (bashPermissions.ts). Strips
  * wrapper commands from AST-derived argv. Env vars are already separated
  * into SimpleCommand.envVars so no env-var stripping here.

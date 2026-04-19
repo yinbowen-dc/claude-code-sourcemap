@@ -1,3 +1,39 @@
+/**
+ * 🏗️ Claude Code 桥接系统主入口模块 - bridgeMain.ts
+ * 
+ * 这是Claude Code远程控制功能的核心实现，负责管理本地环境与云端服务之间的通信桥接。
+ * 该模块实现了完整的会话生命周期管理、工作项轮询、会话生成和状态同步等功能。
+ * 
+ * 📍 架构定位：
+ * - 位置：src/bridge/bridgeMain.ts
+ * - 层级：桥接层核心模块
+ * - 依赖：与bootstrap、assistant、utils等模块紧密协作
+ * - 功能：远程会话管理、多会话并发、工作项处理、状态同步
+ * 
+ * 🎯 核心功能：
+ * 1. 环境注册与认证管理
+ * 2. 工作项轮询与分发
+ * 3. 会话生成与生命周期管理
+ * 4. 心跳检测与连接恢复
+ * 5. 多会话并发控制
+ * 6. 错误处理与重试机制
+ * 
+ * 🔄 工作流程：
+ * 1. 初始化环境配置和认证
+ * 2. 注册桥接环境到云端服务
+ * 3. 启动轮询循环获取工作项
+ * 4. 根据工作项类型生成对应会话
+ * 5. 管理会话状态和资源分配
+ * 6. 处理异常和连接中断恢复
+ * 
+ * ⚠️ 重要特性：
+ * - 支持单会话和多会话模式
+ * - 具备工作树隔离机制
+ * - 实现完整的错误恢复策略
+ * - 集成OpenTelemetry监控
+ * - 支持多种认证方式
+ */
+
 import { feature } from 'bun:bundle'
 import { randomUUID } from 'crypto'
 import { hostname, tmpdir } from 'os'
@@ -56,6 +92,22 @@ import {
   sameSessionId,
 } from './workSecret.js'
 
+/**
+ * 🕒 退避策略配置类型定义
+ * 
+ * 定义桥接系统在遇到网络错误或服务不可用时的重试策略。
+ * 采用指数退避算法，避免对服务器造成过载，同时保证连接恢复的及时性。
+ * 
+ * 📊 配置参数说明：
+ * - connInitialMs: 连接错误初始退避时间（毫秒）
+ * - connCapMs: 连接错误最大退避时间上限
+ * - connGiveUpMs: 连接错误放弃时间阈值，超过此时间则停止重试
+ * - generalInitialMs: 一般错误初始退避时间
+ * - generalCapMs: 一般错误最大退避时间上限
+ * - generalGiveUpMs: 一般错误放弃时间阈值
+ * - shutdownGraceMs: 优雅关闭的SIGTERM→SIGKILL等待时间
+ * - stopWorkBaseDelayMs: stopWork重试的基础延迟时间
+ */
 export type BackoffConfig = {
   connInitialMs: number
   connCapMs: number
@@ -63,58 +115,132 @@ export type BackoffConfig = {
   generalInitialMs: number
   generalCapMs: number
   generalGiveUpMs: number
-  /** SIGTERM→SIGKILL grace period on shutdown. Default 30s. */
+  /** SIGTERM→SIGKILL优雅关闭等待时间，默认30秒 */
   shutdownGraceMs?: number
-  /** stopWorkWithRetry base delay (1s/2s/4s backoff). Default 1000ms. */
+  /** stopWork重试基础延迟（1s/2s/4s退避），默认1000ms */
   stopWorkBaseDelayMs?: number
 }
 
+/**
+ * 🎯 默认退避策略配置
+ * 
+ * 为桥接系统提供合理的默认重试策略：
+ * - 连接错误：初始2秒，最大2分钟，10分钟后放弃
+ * - 一般错误：初始500ms，最大30秒，10分钟后放弃
+ * 
+ * 这种配置平衡了快速恢复和避免服务器过载的需求。
+ */
 const DEFAULT_BACKOFF: BackoffConfig = {
   connInitialMs: 2_000,
-  connCapMs: 120_000, // 2 minutes
-  connGiveUpMs: 600_000, // 10 minutes
+  connCapMs: 120_000, // 2分钟
+  connGiveUpMs: 600_000, // 10分钟
   generalInitialMs: 500,
   generalCapMs: 30_000,
-  generalGiveUpMs: 600_000, // 10 minutes
+  generalGiveUpMs: 600_000, // 10分钟
 }
 
-/** Status update interval for the live display (ms). */
+/**
+ * 🔄 状态更新间隔常量
+ * 
+ * 控制实时状态显示的刷新频率，确保用户界面保持响应性。
+ */
 const STATUS_UPDATE_INTERVAL_MS = 1_000
+
+/**
+ * 👥 默认会话生成数量
+ * 
+ * 在多会话模式下，系统默认支持的最大并发会话数量。
+ * 这个值可以根据服务器负载和用户配置进行调整。
+ */
 const SPAWN_SESSIONS_DEFAULT = 32
 
 /**
- * GrowthBook gate for multi-session spawn modes (--spawn / --capacity / --create-session-in-dir).
- * Sibling of tengu_ccr_bridge_multi_environment (multiple envs per host:dir) —
- * this one enables multiple sessions per environment.
- * Rollout staged via targeting rules: ants first, then gradual external.
- *
- * Uses the blocking gate check so a stale disk-cache miss doesn't unfairly
- * deny access. The fast path (cache has true) is still instant; only the
- * cold-start path awaits the server fetch, and that fetch also seeds the
- * disk cache for next time.
+ * 🔐 多会话生成功能开关检查
+ * 
+ * 检查GrowthBook功能开关，确定是否启用多会话生成模式。
+ * 这个功能开关控制着--spawn、--capacity、--create-session-in-dir等
+ * 多会话相关参数是否可用。
+ * 
+ * 🎯 功能特点：
+ * - 与tengu_ccr_bridge_multi_environment功能互为补充
+ * - 支持分阶段灰度发布：内部用户优先，逐步向外部用户开放
+ * - 采用阻塞式检查策略，避免磁盘缓存过期导致的误判
+ * 
+ * 📊 检查策略：
+ * - 快速路径：缓存命中时立即返回结果
+ * - 冷启动路径：等待服务器获取最新配置并缓存
+ * 
+ * @returns 如果启用多会话模式则返回true，否则返回false
  */
 async function isMultiSessionSpawnEnabled(): Promise<boolean> {
   return checkGate_CACHED_OR_BLOCKING('tengu_ccr_bridge_multi_session')
 }
 
 /**
- * Returns the threshold for detecting system sleep/wake in the poll loop.
- * Must exceed the max backoff cap — otherwise normal backoff delays trigger
- * false sleep detection (resetting the error budget indefinitely). Using
- * 2× the connection backoff cap, matching the pattern in WebSocketTransport
- * and replBridge.
+ * ⏰ 系统休眠检测阈值计算
+ * 
+ * 计算用于检测系统休眠/唤醒的轮询间隔阈值。
+ * 这个阈值必须超过最大退避上限，否则正常的退避延迟会被误判为系统休眠，
+ * 导致错误预算被无限重置。
+ * 
+ * 🔧 设计原理：
+ * - 使用连接退避上限的2倍作为阈值
+ * - 与WebSocketTransport和replBridge中的模式保持一致
+ * - 确保只有真正的系统休眠才会触发检测
+ * 
+ * @param backoff 退避配置对象
+ * @returns 休眠检测阈值（毫秒）
+ */
+/**
+ * ⏰ 轮询休眠检测阈值计算器
+ * 
+ * 计算用于检测系统休眠/唤醒的轮询间隔阈值。
+ * 这个阈值必须超过最大退避上限，否则正常的退避延迟会被误判为系统休眠，
+ * 导致错误预算被无限重置。
+ * 
+ * 🔧 设计原理：
+ * - 使用连接退避上限的2倍作为阈值
+ * - 与WebSocketTransport和replBridge中的模式保持一致
+ * - 确保只有真正的系统休眠才会触发检测
+ * - 避免正常退避延迟误触发休眠检测
+ * 
+ * 📊 计算逻辑：
+ * - 连接退避上限（connCapMs）：最大连接重试间隔
+ * - 阈值 = connCapMs × 2，提供足够的缓冲空间
+ * - 例如：如果最大退避为2分钟，则阈值为4分钟
+ * 
+ * @param backoff 退避策略配置对象
+ * @returns 休眠检测阈值（毫秒）
  */
 function pollSleepDetectionThresholdMs(backoff: BackoffConfig): number {
   return backoff.connCapMs * 2
 }
 
 /**
- * Returns the args that must precede CLI flags when spawning a child claude
- * process. In compiled binaries, process.execPath is the claude binary itself
- * and args go directly to it. In npm installs (node running cli.js),
- * process.execPath is the node runtime — the child spawn must pass the script
- * path as the first arg, otherwise node interprets --sdk-url as a node option
- * and exits with "bad option: --sdk-url". See anthropics/claude-code#28334.
+ * 🔧 子进程脚本参数生成器
+ * 
+ * 确定在生成子Claude进程时必须在CLI标志之前传递的参数。
+ * 这个函数解决了不同运行环境下的参数传递兼容性问题。
+ * 
+ * 🏗️ 运行环境差异处理：
+ * - 编译二进制环境：process.execPath是Claude二进制文件本身，参数直接传递
+ * - npm安装环境：process.execPath是Node运行时，必须传递脚本路径作为第一个参数
+ * 
+ * ⚠️ 兼容性问题：
+ * 在npm安装环境中，如果不传递脚本路径，Node会将--sdk-url等参数解释为Node选项，
+ * 导致"bad option: --sdk-url"错误并退出（参见anthropics/claude-code#28334）
+ * 
+ * 🔄 处理逻辑：
+ * - 捆绑模式：返回空数组（参数直接传递给二进制文件）
+ * - npm模式：返回[process.argv[1]]（脚本路径作为第一个参数）
+ * - 安全检查：确保process.argv[1]存在
+ * 
+ * 📋 使用场景：
+ * - 会话生成器（SessionSpawner）调用
+ * - 多会话模式下的子进程创建
+ * - 工作树隔离环境中的进程生成
+ * 
+ * @returns 需要前置的脚本参数数组
  */
 function spawnScriptArgs(): string[] {
   if (isInBundledMode() || !process.argv[1]) {
@@ -123,7 +249,37 @@ function spawnScriptArgs(): string[] {
   return [process.argv[1]]
 }
 
-/** Attempt to spawn a session; returns error string if spawn throws. */
+/**
+ * 🔒 安全会话生成器 - 异常安全包装器
+ * 
+ * 尝试生成会话的安全包装函数，捕获生成过程中的异常并返回错误信息。
+ * 这个函数确保会话生成失败不会导致整个桥接系统崩溃，而是优雅地处理错误。
+ * 
+ * 🎯 设计目标：
+ * - 提供异常安全的会话生成接口
+ * - 防止会话生成失败导致桥接循环中断
+ * - 提供详细的错误日志和错误信息返回
+ * - 支持错误恢复和重试机制
+ * 
+ * 🔄 执行流程：
+ * 1. 尝试调用会话生成器的spawn方法
+ * 2. 如果成功：返回会话句柄对象
+ * 3. 如果失败：捕获异常，记录错误日志，返回错误信息字符串
+ * 
+ * 📊 返回值类型：
+ * - SessionHandle：会话生成成功，返回会话控制句柄
+ * - string：会话生成失败，返回错误描述信息
+ * 
+ * ⚠️ 错误处理：
+ * - 记录详细的错误日志，包含错误消息和堆栈信息
+ * - 返回可读的错误描述，便于上层逻辑处理
+ * - 不会抛出异常，确保调用方代码的稳定性
+ * 
+ * @param spawner 会话生成器实例
+ * @param opts 会话生成选项配置
+ * @param dir 工作目录路径
+ * @returns 会话句柄或错误信息字符串
+ */
 function safeSpawn(
   spawner: SessionSpawner,
   opts: SessionSpawnOpts,
@@ -138,6 +294,48 @@ function safeSpawn(
   }
 }
 
+/**
+ * 🔄 桥接系统主循环 - 远程会话生命周期管理
+ * 
+ * 这是Claude Code桥接系统的核心执行循环，负责管理远程会话的完整生命周期。
+ * 该函数实现了工作项轮询、会话生成、心跳检测、错误恢复等关键功能。
+ * 
+ * 🎯 核心职责：
+ * - 轮询云端服务获取工作项
+ * - 根据工作项类型生成对应会话
+ * - 管理会话状态和资源分配
+ * - 实现心跳检测和连接恢复
+ * - 处理多会话并发控制
+ * - 实现优雅关闭和错误处理
+ * 
+ * 📊 输入参数：
+ * @param config 桥接配置对象，包含会话模式、最大会话数等设置
+ * @param environmentId 环境标识符，用于区分不同的桥接环境
+ * @param environmentSecret 环境密钥，用于认证和加密
+ * @param api 桥接API客户端，用于与云端服务通信
+ * @param spawner 会话生成器，负责创建和管理子进程会话
+ * @param logger 日志记录器，用于状态显示和错误记录
+ * @param signal 中止信号，用于优雅关闭控制
+ * @param backoffConfig 退避策略配置，控制重试间隔
+ * @param initialSessionId 初始会话ID，用于会话恢复场景
+ * @param getAccessToken 访问令牌获取函数，用于认证刷新
+ * 
+ * 🔄 工作流程：
+ * 1. 初始化本地中止控制器和信号处理
+ * 2. 设置会话状态跟踪数据结构
+ * 3. 启动状态显示更新定时器
+ * 4. 进入主轮询循环，持续获取工作项
+ * 5. 根据工作项类型执行相应处理逻辑
+ * 6. 处理会话完成、错误和超时事件
+ * 7. 实现优雅关闭和资源清理
+ * 
+ * ⚠️ 重要特性：
+ * - 支持单会话和多会话并发模式
+ * - 具备完整的错误恢复和重试机制
+ * - 集成心跳检测保持连接活跃
+ * - 实现工作树隔离确保会话安全
+ * - 支持会话恢复和状态持久化
+ */
 export async function runBridgeLoop(
   config: BridgeConfig,
   environmentId: string,
@@ -150,8 +348,8 @@ export async function runBridgeLoop(
   initialSessionId?: string,
   getAccessToken?: () => string | undefined | Promise<string | undefined>,
 ): Promise<void> {
-  // Local abort controller so that onSessionDone can stop the poll loop.
-  // Linked to the incoming signal so external aborts also work.
+  // 创建本地中止控制器，使得onSessionDone可以停止轮询循环
+  // 与传入信号链接，确保外部中止也能正常工作
   const controller = new AbortController()
   if (signal.aborted) {
     controller.abort()
@@ -160,19 +358,81 @@ export async function runBridgeLoop(
   }
   const loopSignal = controller.signal
 
+  // ==================== 会话状态跟踪数据结构 ====================
+  
+  /**
+   * 📊 活跃会话映射表
+   * 
+   * 按会话ID索引的活跃会话句柄映射，用于跟踪所有正在运行的会话进程。
+   * 键：会话ID（唯一标识符）
+   * 值：会话句柄对象，包含进程控制、状态监控等功能
+   */
   const activeSessions = new Map<string, SessionHandle>()
+  
+  /**
+   * ⏰ 会话启动时间映射表
+   * 
+   * 记录每个会话的启动时间戳，用于计算会话运行时长和超时检测。
+   * 键：会话ID
+   * 值：启动时间戳（毫秒）
+   */
   const sessionStartTimes = new Map<string, number>()
+  
+  /**
+   * 🔗 会话-工作项关联映射表
+   * 
+   * 维护会话ID与对应工作项ID的关联关系，用于工作项状态跟踪。
+   * 键：会话ID
+   * 值：工作项ID（云端分配的唯一标识符）
+   */
   const sessionWorkIds = new Map<string, string>()
-  // Compat-surface ID (session_*) computed once at spawn and cached so
-  // cleanup and status-update ticks use the same key regardless of whether
-  // the tengu_bridge_repl_v2_cse_shim_enabled gate flips mid-session.
+  
+  /**
+   * 🔄 会话兼容ID映射表
+   * 
+   * 存储会话的兼容表面ID（session_*格式），在会话生成时计算并缓存。
+   * 确保清理和状态更新使用相同的键，避免tengu_bridge_repl_v2_cse_shim_enabled
+   * 功能开关在会话中途切换时导致键不一致问题。
+   * 键：会话ID
+   * 值：兼容表面ID
+   */
   const sessionCompatIds = new Map<string, string>()
-  // Session ingress JWTs for heartbeat auth, keyed by sessionId.
-  // Stored separately from handle.accessToken because the token refresh
-  // scheduler overwrites that field with the OAuth token (~3h55m in).
+  
+  /**
+   * 🔐 会话入口令牌映射表
+   * 
+   * 存储用于心跳认证的会话入口JWT令牌，按会话ID索引。
+   * 与handle.accessToken分开存储，因为令牌刷新调度器会覆盖该字段
+   * 为OAuth令牌（约3小时55分钟刷新一次）。
+   * 键：会话ID
+   * 值：JWT令牌字符串
+   */
   const sessionIngressTokens = new Map<string, string>()
+  
+  /**
+   * ⏱️ 会话定时器映射表
+   * 
+   * 跟踪每个会话的超时定时器，用于会话超时检测和自动清理。
+   * 键：会话ID
+   * 值：setTimeout返回的定时器句柄
+   */
   const sessionTimers = new Map<string, ReturnType<typeof setTimeout>>()
+  
+  /**
+   * ✅ 已完成工作项集合
+   * 
+   * 记录已成功完成的工作项ID，避免重复处理相同工作项。
+   * 使用Set数据结构确保唯一性，支持快速查找。
+   */
   const completedWorkIds = new Set<string>()
+  
+  /**
+   * 🌳 会话工作树映射表
+   * 
+   * 管理每个会话的Git工作树信息，支持工作树隔离和分支管理。
+   * 键：会话ID
+   * 值：工作树配置对象，包含路径、分支、Git根目录等信息
+   */
   const sessionWorktrees = new Map<
     string,
     {
@@ -182,15 +442,30 @@ export async function runBridgeLoop(
       hookBased?: boolean
     }
   >()
-  // Track sessions killed by the timeout watchdog so onSessionDone can
-  // distinguish them from server-initiated or shutdown interrupts.
+  
+  /**
+   * ⏰ 超时会话集合
+   * 
+   * 跟踪被超时看门狗终止的会话，使onSessionDone能够区分超时终止
+   * 与服务器发起或关闭中断的区别。
+   */
   const timedOutSessions = new Set<string>()
-  // Sessions that already have a title (server-set or bridge-derived) so
-  // onFirstUserMessage doesn't clobber a user-assigned --name / web rename.
-  // Keyed by compatSessionId to match logger.setSessionTitle's key.
+  
+  /**
+   * 📝 已命名会话集合
+   * 
+   * 记录已有标题的会话（服务器设置或桥接派生），防止onFirstUserMessage
+   * 覆盖用户分配的--name或Web重命名。
+   * 使用兼容会话ID作为键，与logger.setSessionTitle的键匹配。
+   */
   const titledSessions = new Set<string>()
-  // Signal to wake the at-capacity sleep early when a session completes,
-  // so the bridge can immediately accept new work.
+  
+  /**
+   * 🔔 容量唤醒信号
+   * 
+   * 当会话完成时提前唤醒容量饱和状态下的休眠，使桥接能够立即接受新工作。
+   * 实现会话完成时的即时响应机制。
+   */
   const capacityWake = createCapacityWake(loopSignal)
 
   /**
@@ -199,25 +474,59 @@ export async function runBridgeLoop(
    * got a 401/403 (JWT expired — re-queued via reconnectSession so the next
    * poll delivers fresh work), or 'failed' if all failed for other reasons.
    */
+  /**
+   * ❤️ 心跳检测 - 活跃工作项状态维护
+   * 
+   * 对所有活跃工作项执行心跳检测，保持与云端服务的连接活跃状态。
+   * 心跳检测是桥接系统可靠性的关键机制，确保会话不会因网络中断而丢失。
+   * 
+   * 🎯 功能目标：
+   * - 检测会话连接状态
+   * - 处理JWT令牌过期问题
+   * - 触发服务器端重新调度
+   * - 区分不同类型的错误状态
+   * 
+   * 📊 返回值说明：
+   * - 'ok'：至少一个心跳成功，系统正常运行
+   * - 'auth_failed'：检测到401/403错误（JWT过期）
+   * - 'fatal'：检测到404/410错误（环境过期或删除）
+   * - 'failed'：所有心跳都因其他原因失败
+   * 
+   * 🔄 错误处理流程：
+   * 1. JWT过期（401/403）：触发服务器重新调度，避免工作项卡在Redis PEL中
+   * 2. 环境过期（404/410）：标记为致命错误，无需重试
+   * 3. 其他错误：记录日志并继续监控
+   * 
+   * @returns 心跳检测结果状态码
+   */
   async function heartbeatActiveWorkItems(): Promise<
     'ok' | 'auth_failed' | 'fatal' | 'failed'
   > {
     let anySuccess = false
     let anyFatal = false
     const authFailedSessions: string[] = []
+    
+    // 遍历所有活跃会话执行心跳检测
     for (const [sessionId] of activeSessions) {
       const workId = sessionWorkIds.get(sessionId)
       const ingressToken = sessionIngressTokens.get(sessionId)
+      
+      // 跳过缺少工作ID或入口令牌的会话
       if (!workId || !ingressToken) {
         continue
       }
+      
       try {
+        // 执行心跳检测API调用
         await api.heartbeatWork(environmentId, workId, ingressToken)
         anySuccess = true
       } catch (err) {
+        // 记录心跳失败日志
         logForDebugging(
           `[bridge:heartbeat] Failed for sessionId=${sessionId} workId=${workId}: ${errorMessage(err)}`,
         )
+        
+        // 处理桥接致命错误
         if (err instanceof BridgeFatalError) {
           logEvent('tengu_bridge_heartbeat_error', {
             status:
@@ -226,21 +535,23 @@ export async function runBridgeLoop(
               ? 'auth_failed'
               : 'fatal') as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
           })
+          
           if (err.status === 401 || err.status === 403) {
+            // JWT过期错误 - 需要重新认证
             authFailedSessions.push(sessionId)
           } else {
-            // 404/410 = environment expired or deleted — no point retrying
+            // 404/410错误 - 环境过期或删除，无需重试
             anyFatal = true
           }
         }
       }
     }
-    // JWT expired → trigger server-side re-dispatch. Without this, work stays
-    // ACK'd out of the Redis PEL and poll returns empty forever (CC-1263).
-    // The existingHandle path below delivers the fresh token to the child.
-    // sessionId is already in the format /bridge/reconnect expects: it comes
-    // from work.data.id, which matches the server's EnvironmentInstance store
-    // (cse_* under the compat gate, session_* otherwise).
+    
+    // JWT过期处理：触发服务器端重新调度
+    // 如果不这样做，工作项会卡在Redis PEL中，导致轮询永远返回空结果（CC-1263）
+    // existingHandle路径会将新令牌传递给子进程
+    // sessionId已经是/bridge/reconnect期望的格式：来自work.data.id，与服务器的EnvironmentInstance存储匹配
+    // （在兼容功能开关下为cse_*，否则为session_*）
     for (const sessionId of authFailedSessions) {
       logger.logVerbose(
         `Session ${sessionId} token expired — re-queuing via bridge/reconnect`,
@@ -260,6 +571,8 @@ export async function runBridgeLoop(
         )
       }
     }
+    
+    // 根据错误类型返回相应状态码
     if (anyFatal) {
       return 'fatal'
     }
@@ -439,86 +752,156 @@ export async function runBridgeLoop(
     }
   }
 
+  /**
+   * 🔄 会话完成处理函数 - 会话生命周期终结器
+   * 
+   * 处理会话完成事件的高阶函数，返回一个实际的完成处理函数。
+   * 这个函数负责清理会话资源、更新状态、通知服务器，并决定桥接系统的后续行为。
+   * 
+   * 🎯 核心职责：
+   * - 清理会话相关的所有状态和资源
+   * - 更新会话完成状态和统计信息
+   * - 通知服务器工作项完成状态
+   * - 清理工作树和临时文件
+   * - 决定桥接系统的后续行为（继续运行或关闭）
+   * 
+   * 🔧 设计模式：
+   * - 高阶函数设计：返回实际的处理函数，便于异步注册
+   * - 闭包捕获：捕获会话ID、启动时间、句柄等上下文信息
+   * - 状态安全：确保会话状态清理的原子性和一致性
+   * 
+   * @param sessionId 会话唯一标识符
+   * @param startTime 会话启动时间戳（毫秒）
+   * @param handle 会话控制句柄对象
+   * @returns 会话完成状态处理函数
+   */
   function onSessionDone(
     sessionId: string,
     startTime: number,
     handle: SessionHandle,
   ): (status: SessionDoneStatus) => void {
     return (rawStatus: SessionDoneStatus): void => {
+      // ==================== 会话状态清理阶段 ====================
+      
+      // 获取工作项ID用于后续通知服务器
       const workId = sessionWorkIds.get(sessionId)
+      
+      // 清理所有会话状态映射表
       activeSessions.delete(sessionId)
       sessionStartTimes.delete(sessionId)
       sessionWorkIds.delete(sessionId)
       sessionIngressTokens.delete(sessionId)
+      
+      // 获取兼容会话ID并清理相关状态
       const compatId = sessionCompatIds.get(sessionId) ?? sessionId
       sessionCompatIds.delete(sessionId)
       logger.removeSession(compatId)
       titledSessions.delete(compatId)
       v2Sessions.delete(sessionId)
-      // Clear per-session timeout timer
+      
+      // 清理会话超时定时器
       const timer = sessionTimers.get(sessionId)
       if (timer) {
         clearTimeout(timer)
         sessionTimers.delete(sessionId)
       }
-      // Clear token refresh timer
+      
+      // 清理令牌刷新定时器
       tokenRefresh?.cancel(sessionId)
-      // Wake the at-capacity sleep so the bridge can accept new work immediately
+      
+      // 唤醒容量饱和状态下的休眠，使桥接能够立即接受新工作
       capacityWake.wake()
 
-      // If the session was killed by the timeout watchdog, treat it as a
-      // failed session (not a server/shutdown interrupt) so we still call
-      // stopWork and archiveSession below.
+      // ==================== 会话状态处理阶段 ====================
+      
+      /**
+       * 🔄 状态转换逻辑：处理超时会话的特殊情况
+       * 
+       * 如果会话被超时看门狗终止，将其视为失败会话而非中断会话，
+       * 这样仍然会调用stopWork和archiveSession进行清理。
+       * 避免将超时终止误判为服务器/关闭中断，确保资源正确释放。
+       */
       const wasTimedOut = timedOutSessions.delete(sessionId)
       const status: SessionDoneStatus =
         wasTimedOut && rawStatus === 'interrupted' ? 'failed' : rawStatus
+      
+      // 计算会话运行时长
       const durationMs = Date.now() - startTime
 
+      // ==================== 日志记录和监控阶段 ====================
+      
+      // 记录调试日志：会话退出详细信息
       logForDebugging(
         `[bridge:session] sessionId=${sessionId} workId=${workId ?? 'unknown'} exited status=${status} duration=${formatDuration(durationMs)}`,
       )
+      
+      // 记录分析事件：用于性能监控和统计
       logEvent('tengu_bridge_session_done', {
         status:
           status as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
         duration_ms: durationMs,
       })
+      
+      // 记录诊断信息：不含个人身份信息的诊断日志
       logForDiagnosticsNoPII('info', 'bridge_session_done', {
         status,
         duration_ms: durationMs,
       })
 
-      // Clear the status display before printing final log
+      // ==================== 状态显示清理阶段 ====================
+      
+      // 清理状态显示，为最终日志打印准备干净的界面
       logger.clearStatus()
       stopStatusUpdates()
 
-      // Build error message from stderr if available
+      // ==================== 错误信息构建阶段 ====================
+      
+      /**
+       * 📝 错误信息构建：从stderr输出中提取错误信息
+       * 
+       * 如果会话有标准错误输出，将其汇总为错误消息。
+       * 这有助于诊断会话失败的具体原因。
+       */
       const stderrSummary =
-        handle.lastStderr.length > 0 ? handle.lastStderr.join('\n') : undefined
+        handle.lastStderr.length > 0 ? handle.lastStderr.join('\\n') : undefined
       let failureMessage: string | undefined
 
+      // ==================== 会话状态处理阶段 ====================
+      
       switch (status) {
         case 'completed':
+          // ✅ 会话成功完成：记录完成日志
           logger.logSessionComplete(sessionId, durationMs)
           break
+          
         case 'failed':
-          // Skip failure log during shutdown — the child exits non-zero when
-          // killed, which is expected and not a real failure.
-          // Also skip for timeout-killed sessions — the timeout watchdog
-          // already logged a clear timeout message.
+          /**
+           * ❌ 会话失败处理：记录失败日志，但需要特殊处理两种情况：
+           * 1. 关闭期间失败：子进程被杀死时非零退出是预期的，不是真正的失败
+           * 2. 超时杀死：超时看门狗已经记录了清晰的超时消息
+           */
           if (!wasTimedOut && !loopSignal.aborted) {
             failureMessage = stderrSummary ?? 'Process exited with error'
             logger.logSessionFailed(sessionId, failureMessage)
             logError(new Error(`Bridge session failed: ${failureMessage}`))
           }
           break
+          
         case 'interrupted':
+          // ⏹️ 会话中断：记录详细日志
           logger.logVerbose(`Session ${sessionId} interrupted`)
           break
       }
 
-      // Notify the server that this work item is done. Skip for interrupted
-      // sessions — interrupts are either server-initiated (the server already
-      // knows) or caused by bridge shutdown (which calls stopWork() separately).
+      // ==================== 服务器通知阶段 ====================
+      
+      /**
+       * 📡 通知服务器工作项完成状态
+       * 
+       * 对于中断会话跳过通知，因为中断可能是：
+       * - 服务器发起的（服务器已经知道）
+       * - 桥接关闭引起的（会单独调用stopWork()）
+       */
       if (status !== 'interrupted' && workId) {
         trackCleanup(
           stopWorkWithRetry(
@@ -532,7 +915,16 @@ export async function runBridgeLoop(
         completedWorkIds.add(workId)
       }
 
-      // Clean up worktree if one was created for this session
+      // ==================== 工作树清理阶段 ====================
+      
+      /**
+       * 🌳 清理会话工作树
+       * 
+       * 如果为该会话创建了工作树，需要清理相关资源：
+       * - 删除工作树目录
+       * - 清理Git分支引用
+       * - 移除钩子配置
+       */
       const wt = sessionWorktrees.get(sessionId)
       if (wt) {
         sessionWorktrees.delete(sessionId)
@@ -549,19 +941,32 @@ export async function runBridgeLoop(
           ),
         )
       }
-
-      // Lifecycle decision: in multi-session mode, keep the bridge running
-      // after a session completes. In single-session mode, abort the poll
-      // loop so the bridge exits cleanly.
+      // ==================== 生命周期决策阶段 ====================
+      
+      /**
+       * 🔄 桥接系统生命周期决策
+       * 
+       * 根据会话模式和状态决定桥接系统的后续行为：
+       * - 多会话模式：继续运行，等待新工作项
+       * - 单会话模式：关闭桥接，清理环境
+       */
       if (status !== 'interrupted' && !loopSignal.aborted) {
         if (config.spawnMode !== 'single-session') {
-          // Multi-session: archive the completed session so it doesn't linger
-          // as stale in the web UI. archiveSession is idempotent (409 if already
-          // archived), so double-archiving at shutdown is safe.
-          // sessionId arrived as cse_* from the work poll (infrastructure-layer
-          // tag). archiveSession hits /v1/sessions/{id}/archive which is the
-          // compat surface and validates TagSession (session_*). Re-tag — same
-          // UUID underneath.
+          // ==================== 多会话模式处理 ====================
+          
+          /**
+           * 🔄 多会话模式：归档已完成会话
+           * 
+           * 在多会话模式下，桥接继续运行，需要归档已完成会话，
+           * 避免在Web UI中显示为陈旧会话。
+           * 
+           * 📋 设计要点：
+           * - archiveSession是幂等的（如果已归档返回409）
+           * - 关闭时的双重归档是安全的
+           * - sessionId来自工作轮询的cse_*格式（基础设施层标签）
+           * - archiveSession调用/v1/sessions/{id}/archive（兼容表面）
+           * - 重新标记为session_*格式，底层UUID相同
+           */
           trackCleanup(
             api
               .archiveSession(compatId)
@@ -571,11 +976,19 @@ export async function runBridgeLoop(
                 ),
               ),
           )
+          
           logForDebugging(
             `[bridge:session] Session ${status}, returning to idle (multi-session mode)`,
           )
         } else {
-          // Single-session: coupled lifecycle — tear down environment
+          // ==================== 单会话模式处理 ====================
+          
+          /**
+           * 🔚 单会话模式：耦合生命周期 - 关闭环境
+           * 
+           * 在单会话模式下，会话完成意味着桥接任务完成，
+           * 需要中止轮询循环以优雅关闭环境。
+           */
           logForDebugging(
             `[bridge:session] Session ${status}, aborting poll loop to tear down environment`,
           )
@@ -584,6 +997,14 @@ export async function runBridgeLoop(
         }
       }
 
+      // ==================== 状态恢复阶段 ====================
+      
+      /**
+       * 🔄 恢复状态更新显示
+       * 
+       * 如果桥接系统没有中止，重新启动状态更新显示，
+       * 为下一个工作项或会话准备显示界面。
+       */
       if (!loopSignal.aborted) {
         startStatusUpdates()
       }
@@ -1734,7 +2155,43 @@ function parseCapacityValue(raw: string | undefined): number | string {
   return n
 }
 
+/**
+ * 🔧 命令行参数解析器 - 远程控制模式
+ * 
+ * 解析Claude远程控制功能的命令行参数，支持多种运行模式和配置选项。
+ * 这个函数是桥接系统的入口点，负责将用户输入转换为可执行的配置对象。
+ * 
+ * 📋 支持的参数列表：
+ * - `--help`, `-h` → 显示帮助信息
+ * - `--verbose`, `-v` → 启用详细日志输出
+ * - `--sandbox` / `--no-sandbox` → 启用/禁用沙箱模式
+ * - `--debug-file PATH` → 指定调试文件路径
+ * - `--session-timeout SECONDS` → 设置会话超时时间
+ * - `--permission-mode MODE` → 设置权限模式
+ * - `--name NAME` → 设置会话名称
+ * - `--session-id ID` → 使用特定会话ID（KAIROS功能）
+ * - `--continue`, `-c` → 继续上次会话（KAIROS功能）
+ * - `--spawn MODE` → 设置会话生成模式
+ * - `--capacity N` → 设置会话容量
+ * - `--create-session-in-dir` → 在目录中创建会话
+ * 
+ * 🛡️ 错误处理：
+ * - 参数值缺失时抛出明确错误
+ * - 数值参数进行范围验证
+ * - 参数组合进行逻辑验证
+ * - 未知参数立即报错
+ * 
+ * 🔄 参数验证流程：
+ * 1. 遍历所有命令行参数
+ * 2. 验证参数格式和值范围
+ * 3. 检查参数之间的逻辑冲突
+ * 4. 返回解析结果或错误信息
+ * 
+ * @param args 命令行参数数组
+ * @returns 解析后的参数配置对象，包含错误信息（如果有）
+ */
 export function parseArgs(args: string[]): ParsedArgs {
+  // 初始化所有参数变量为默认值
   let verbose = false
   let sandbox = false
   let debugFile: string | undefined
@@ -1748,34 +2205,51 @@ export function parseArgs(args: string[]): ParsedArgs {
   let sessionId: string | undefined
   let continueSession = false
 
+  // 遍历所有命令行参数进行解析
   for (let i = 0; i < args.length; i++) {
     const arg = args[i]!
+    
+    // 处理帮助参数
     if (arg === '--help' || arg === '-h') {
       help = true
-    } else if (arg === '--verbose' || arg === '-v') {
+    } 
+    // 处理详细日志参数
+    else if (arg === '--verbose' || arg === '-v') {
       verbose = true
-    } else if (arg === '--sandbox') {
+    } 
+    // 处理沙箱模式参数
+    else if (arg === '--sandbox') {
       sandbox = true
     } else if (arg === '--no-sandbox') {
       sandbox = false
-    } else if (arg === '--debug-file' && i + 1 < args.length) {
+    } 
+    // 处理调试文件参数
+    else if (arg === '--debug-file' && i + 1 < args.length) {
       debugFile = resolve(args[++i]!)
     } else if (arg.startsWith('--debug-file=')) {
       debugFile = resolve(arg.slice('--debug-file='.length))
-    } else if (arg === '--session-timeout' && i + 1 < args.length) {
+    } 
+    // 处理会话超时参数
+    else if (arg === '--session-timeout' && i + 1 < args.length) {
       sessionTimeoutMs = parseInt(args[++i]!, 10) * 1000
     } else if (arg.startsWith('--session-timeout=')) {
       sessionTimeoutMs =
         parseInt(arg.slice('--session-timeout='.length), 10) * 1000
-    } else if (arg === '--permission-mode' && i + 1 < args.length) {
+    } 
+    // 处理权限模式参数
+    else if (arg === '--permission-mode' && i + 1 < args.length) {
       permissionMode = args[++i]!
     } else if (arg.startsWith('--permission-mode=')) {
       permissionMode = arg.slice('--permission-mode='.length)
-    } else if (arg === '--name' && i + 1 < args.length) {
+    } 
+    // 处理会话名称参数
+    else if (arg === '--name' && i + 1 < args.length) {
       name = args[++i]!
     } else if (arg.startsWith('--name=')) {
       name = arg.slice('--name='.length)
-    } else if (
+    } 
+    // 处理会话ID参数（KAIROS功能）
+    else if (
       feature('KAIROS') &&
       arg === '--session-id' &&
       i + 1 < args.length
@@ -1789,9 +2263,13 @@ export function parseArgs(args: string[]): ParsedArgs {
       if (!sessionId) {
         return makeError('--session-id requires a value')
       }
-    } else if (feature('KAIROS') && (arg === '--continue' || arg === '-c')) {
+    } 
+    // 处理继续会话参数（KAIROS功能）
+    else if (feature('KAIROS') && (arg === '--continue' || arg === '-c')) {
       continueSession = true
-    } else if (arg === '--spawn' || arg.startsWith('--spawn=')) {
+    } 
+    // 处理会话生成模式参数
+    else if (arg === '--spawn' || arg.startsWith('--spawn=')) {
       if (spawnMode !== undefined) {
         return makeError('--spawn may only be specified once')
       }
@@ -1804,7 +2282,9 @@ export function parseArgs(args: string[]): ParsedArgs {
       } else {
         return makeError(v)
       }
-    } else if (arg === '--capacity' || arg.startsWith('--capacity=')) {
+    } 
+    // 处理会话容量参数
+    else if (arg === '--capacity' || arg.startsWith('--capacity=')) {
       if (capacity !== undefined) {
         return makeError('--capacity may only be specified once')
       }
@@ -1814,30 +2294,33 @@ export function parseArgs(args: string[]): ParsedArgs {
       const v = parseCapacityValue(raw)
       if (typeof v === 'number') capacity = v
       else return makeError(v)
-    } else if (arg === '--create-session-in-dir') {
+    } 
+    // 处理目录会话创建参数
+    else if (arg === '--create-session-in-dir') {
       createSessionInDir = true
     } else if (arg === '--no-create-session-in-dir') {
       createSessionInDir = false
-    } else {
+    } 
+    // 处理未知参数
+    else {
       return makeError(
         `Unknown argument: ${arg}\nRun 'claude remote-control --help' for usage.`,
       )
     }
   }
 
-  // Note: gate check for --spawn/--capacity/--create-session-in-dir is in bridgeMain
-  // (gate-aware error). Flag cross-validation happens here.
+  // 注意：--spawn/--capacity/--create-session-in-dir的功能开关检查在bridgeMain中
+  // （功能开关感知的错误）。参数交叉验证在这里进行。
 
-  // --capacity only makes sense for multi-session modes.
+  // --capacity参数只在多会话模式下有意义
   if (spawnMode === 'single-session' && capacity !== undefined) {
     return makeError(
       `--capacity cannot be used with --spawn=session (single-session mode has fixed capacity 1).`,
     )
   }
 
-  // --session-id / --continue resume a specific session on its original
-  // environment; incompatible with spawn-related flags (which configure
-  // fresh session creation), and mutually exclusive with each other.
+  // --session-id / --continue恢复特定会话在其原始环境中；
+  // 与会话生成相关参数不兼容（这些参数配置新会话创建），且相互排斥。
   if (
     (sessionId || continueSession) &&
     (spawnMode !== undefined ||
@@ -1852,6 +2335,7 @@ export function parseArgs(args: string[]): ParsedArgs {
     return makeError(`--session-id and --continue cannot be used together.`)
   }
 
+  // 返回解析成功的参数配置对象
   return {
     verbose,
     sandbox,
@@ -1867,6 +2351,15 @@ export function parseArgs(args: string[]): ParsedArgs {
     help,
   }
 
+  /**
+   * 🔧 错误信息生成函数
+   * 
+   * 生成包含错误信息的参数配置对象，用于在参数解析失败时返回。
+   * 这个函数确保即使解析失败也能返回完整的配置状态，便于调试。
+   * 
+   * @param error 错误描述信息
+   * @returns 包含错误信息的参数配置对象
+   */
   function makeError(error: string): ParsedArgs {
     return {
       verbose,

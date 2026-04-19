@@ -1,4 +1,18 @@
-import type { ToolUseBlock } from '@anthropic-ai/sdk/resources/index.mjs'
+/**
+ * 查询辅助工具模块
+ *
+ * 本文件在 Claude Code 系统流程中的位置：
+ * - 提供 query() 调用流程中的消息规范化、孤儿权限处理、文件状态缓存提取等辅助功能
+ * - 连接 SDK 消息类型与内部 Message 类型，将内部消息转换为 SDKMessage 格式输出
+ * - 用于 QueryEngine、SDK 集成层以及恢复会话时的文件状态重建
+ *
+ * 主要职责：
+ * - isResultSuccessful：判断查询结果是否成功
+ * - normalizeMessage：将内部 Message 转换为 SDKMessage 生成器
+ * - handleOrphanedPermission：处理会话恢复时未完成的权限请求
+ * - extractReadFilesFromMessages：从消息历史中重建文件状态缓存
+ * - extractBashToolsFromMessages：从消息历史中提取使用过的 CLI 工具名称
+ */
 import last from 'lodash-es/last.js'
 import {
   getSessionId,
@@ -41,17 +55,15 @@ export type PermissionPromptTool = Tool<
   ReturnType<typeof permissionToolOutputSchema>
 >
 
-// Small cache size for ask operations which typically access few files
-// during permission prompts or limited tool operations
+// ask 操作使用的小型缓存（权限提示或有限工具操作期间通常只访问少量文件）
 const ASK_READ_FILE_STATE_CACHE_SIZE = 10
 
 /**
- * Checks if the result should be considered successful based on the last message.
- * Returns true if:
- * - Last message is assistant with text/thinking content
- * - Last message is user with only tool_result blocks
- * - Last message is the user prompt but the API completed with end_turn
- *   (model chose to emit no content blocks)
+ * 根据最后一条消息判断结果是否成功。
+ * 以下情况返回 true：
+ * - 最后一条消息是包含文本/思考内容的助手消息
+ * - 最后一条消息是仅含 tool_result 块的用户消息
+ * - 最后一条消息是用户提示词，但 API 以 end_turn 完成（模型选择不输出任何内容块）
  */
 export function isResultSuccessful(
   message: Message | undefined,
@@ -93,17 +105,17 @@ export function isResultSuccessful(
   return stopReason === 'end_turn'
 }
 
-// Track last sent time for tool progress messages per tool use ID
-// Keep only the last 100 entries to prevent unbounded growth
+// 按工具使用 ID 跟踪工具进度消息的最后发送时间
+// 最多保留 100 条记录以防无限增长
 const MAX_TOOL_PROGRESS_TRACKING_ENTRIES = 100
-const TOOL_PROGRESS_THROTTLE_MS = 30000
+const TOOL_PROGRESS_THROTTLE_MS = 30000 // 30 秒节流间隔
 const toolProgressLastSentTime = new Map<string, number>()
 
 export function* normalizeMessage(message: Message): Generator<SDKMessage> {
   switch (message.type) {
     case 'assistant':
       for (const _ of normalizeMessages([message])) {
-        // Skip empty messages (e.g., "(no content)") that shouldn't be output to SDK
+        // 跳过空消息（如"(no content)"），不应输出到 SDK
         if (!isNotEmptyMessage(_)) {
           continue
         }
@@ -125,7 +137,7 @@ export function* normalizeMessage(message: Message): Generator<SDKMessage> {
         for (const _ of normalizeMessages([message.data.message])) {
           switch (_.type) {
             case 'assistant':
-              // Skip empty messages (e.g., "(no content)") that shouldn't be output to SDK
+              // 跳过空消息（如"(no content)"），不应输出到 SDK
               if (!isNotEmptyMessage(_)) {
                 break
               }
@@ -158,8 +170,8 @@ export function* normalizeMessage(message: Message): Generator<SDKMessage> {
         message.data.type === 'bash_progress' ||
         message.data.type === 'powershell_progress'
       ) {
-        // Filter bash progress to send only one per minute
-        // Only emit for Claude Code Remote for now
+        // 过滤 bash 进度消息，每分钟最多发送一条
+        // 目前仅在 Claude Code Remote 环境下生效
         if (
           !isEnvTruthy(process.env.CLAUDE_CODE_REMOTE) &&
           !process.env.CLAUDE_CODE_CONTAINER_ID
@@ -167,15 +179,15 @@ export function* normalizeMessage(message: Message): Generator<SDKMessage> {
           break
         }
 
-        // Use parentToolUseID as the key since toolUseID changes for each progress message
+        // 使用 parentToolUseID 作为键，因为每条进度消息的 toolUseID 会变化
         const trackingKey = message.parentToolUseID
         const now = Date.now()
         const lastSent = toolProgressLastSentTime.get(trackingKey) || 0
         const timeSinceLastSent = now - lastSent
 
-        // Send if at least 30 seconds have passed since last update
+        // 距上次发送至少 30 秒后才发送
         if (timeSinceLastSent >= TOOL_PROGRESS_THROTTLE_MS) {
-          // Remove oldest entry if we're at capacity (LRU eviction)
+          // 达到容量上限时删除最旧的条目（LRU 淘汰）
           if (
             toolProgressLastSentTime.size >= MAX_TOOL_PROGRESS_TRACKING_ENTRIES
           ) {

@@ -1,3 +1,14 @@
+/**
+ * Beta 功能头部管理模块。
+ *
+ * 在 Claude Code 系统中，该模块负责为 API 请求动态组装 beta 功能头部列表：
+ * - 根据模型、提供商（firstParty / Bedrock / Vertex / Foundry）与用户类型（ant / external）
+ *   自动选取适用的 beta 头部（上下文管理、交错思考、工具搜索、结构化输出、提示缓存等）
+ * - 通过 GrowthBook / Statsig 特性标志按实验进行灰度控制
+ * - 过滤 SDK 传入的自定义 betas（仅允许白名单中的头部）
+ * - 对 Bedrock 提供商分离需放入 extra_body_params 的 beta 头部
+ * - 提供 clearBetasCaches() 以便在单元测试中重置 memoize 缓存
+ */
 import { feature } from 'bun:bundle'
 import memoize from 'lodash-es/memoize.js'
 import {
@@ -37,8 +48,7 @@ import { getInitialSettings } from './settings/settings.js'
 const ALLOWED_SDK_BETAS = [CONTEXT_1M_BETA_HEADER]
 
 /**
- * Filter betas to only include those in the allowlist.
- * Returns allowed and disallowed betas separately.
+ * 将 SDK 传入的 betas 数组按白名单分为允许与禁止两组。
  */
 function partitionBetasByAllowlist(betas: string[]): {
   allowed: string[]
@@ -57,9 +67,9 @@ function partitionBetasByAllowlist(betas: string[]): {
 }
 
 /**
- * Filter SDK betas to only include allowed ones.
- * Warns about disallowed betas and subscriber restrictions.
- * Returns undefined if no valid betas remain or if user is a subscriber.
+ * 过滤 SDK 传入的自定义 betas，仅保留白名单中允许的项。
+ * claude.ai 订阅用户不支持自定义 betas（仅 API key 用户可用），直接返回 undefined。
+ * 对禁止的 beta 头部打印警告。
  */
 export function filterAllowedSdkBetas(
   sdkBetas: string[] | undefined,
@@ -89,6 +99,11 @@ export function filterAllowedSdkBetas(
 // Generally, foundry supports all 1P features;
 // however out of an abundance of caution, we do not enable any which are behind an experiment
 
+/**
+ * 判断指定模型是否支持交错思考（Interleaved Sequential Processing）。
+ * Foundry 提供商默认全部支持；firstParty 仅 claude-4+ 系列支持；
+ * 其他提供商（Bedrock / Vertex）仅限 opus-4 和 sonnet-4 系列。
+ */
 export function modelSupportsISP(model: string): boolean {
   const supported3P = get3PModelCapabilityOverride(
     model,
@@ -111,6 +126,7 @@ export function modelSupportsISP(model: string): boolean {
   )
 }
 
+/** 检测 Vertex 提供商上指定模型是否支持 Web 搜索（仅 Claude 4.0+ 支持）。 */
 function vertexModelSupportsWebSearch(model: string): boolean {
   const canonical = getCanonicalName(model)
   // Web search only supported on Claude 4.0+ models on Vertex
@@ -121,6 +137,7 @@ function vertexModelSupportsWebSearch(model: string): boolean {
   )
 }
 
+/** 判断模型是否支持上下文管理 beta（Claude 4+ 系列；Foundry 全量支持）。 */
 // Context management is supported on Claude 4+ models
 export function modelSupportsContextManagement(model: string): boolean {
   const canonical = getCanonicalName(model)
@@ -138,6 +155,7 @@ export function modelSupportsContextManagement(model: string): boolean {
   )
 }
 
+/** 判断模型是否支持结构化输出（仅 firstParty / Foundry 提供商的特定 claude-4 系列）。 */
 // @[MODEL LAUNCH]: Add the new model ID to this list if it supports structured outputs.
 export function modelSupportsStructuredOutputs(model: string): boolean {
   const canonical = getCanonicalName(model)
@@ -156,6 +174,11 @@ export function modelSupportsStructuredOutputs(model: string): boolean {
   )
 }
 
+/**
+ * 判断模型是否支持 Auto 模式（PI probes / 安全分类器）。
+ * 外部用户仅限 firstParty 提供商；ant 用户通过黑名单排除 claude-3 及早期 claude-4 系列；
+ * GrowthBook allowModels 字段可强制开启指定模型。
+ */
 // @[MODEL LAUNCH]: Add the new model if it supports auto mode (specifically PI probes) — ask in #proj-claude-code-safety-research.
 export function modelSupportsAutoMode(model: string): boolean {
   if (feature('TRANSCRIPT_CLASSIFIER')) {
@@ -195,9 +218,8 @@ export function modelSupportsAutoMode(model: string): boolean {
 }
 
 /**
- * Get the correct tool search beta header for the current API provider.
- * - Claude API / Foundry: advanced-tool-use-2025-11-20
- * - Vertex AI / Bedrock: tool-search-tool-2025-10-19
+ * 返回当前 API 提供商对应的工具搜索 beta 头部。
+ * Vertex / Bedrock 使用 3P 版本头部，其他提供商使用 1P 版本头部。
  */
 export function getToolSearchBetaHeader(): string {
   const provider = getAPIProvider()
@@ -208,9 +230,8 @@ export function getToolSearchBetaHeader(): string {
 }
 
 /**
- * Check if experimental betas should be included.
- * These are betas that are only available on firstParty provider
- * and may not be supported by proxies or other providers.
+ * 判断是否应包含仅限 firstParty 的实验性 betas。
+ * 条件：提供商为 firstParty 或 foundry，且未通过环境变量禁用实验性 betas。
  */
 export function shouldIncludeFirstPartyOnlyBetas(): boolean {
   return (
@@ -220,9 +241,8 @@ export function shouldIncludeFirstPartyOnlyBetas(): boolean {
 }
 
 /**
- * Global-scope prompt caching is firstParty only. Foundry is excluded because
- * GrowthBook never bucketed Foundry users into the rollout experiment — the
- * treatment data is firstParty-only.
+ * 判断是否应使用全局缓存范围（prompt caching scope）。
+ * 仅限 firstParty 提供商（Foundry 未纳入灰度实验数据，故不包含）。
  */
 export function shouldUseGlobalCacheScope(): boolean {
   return (
@@ -231,6 +251,10 @@ export function shouldUseGlobalCacheScope(): boolean {
   )
 }
 
+/**
+ * 根据模型、提供商与用户类型，组装完整的 beta 头部数组（含所有特性标志与实验控制）。
+ * 结果通过 lodash memoize 按模型字符串缓存；调用 clearBetasCaches() 可重置。
+ */
 export const getAllModelBetas = memoize((model: string): string[] => {
   const betaHeaders = []
   const isHaiku = getCanonicalName(model).includes('haiku')
@@ -368,6 +392,10 @@ export const getAllModelBetas = memoize((model: string): string[] => {
   return betaHeaders
 })
 
+/**
+ * 返回指定模型的 beta 头部列表（不含 Bedrock extra_body_params 专用头部）。
+ * Bedrock 提供商会过滤掉需放入 extra_body_params 的 beta 头部。
+ */
 export const getModelBetas = memoize((model: string): string[] => {
   const modelBetas = getAllModelBetas(model)
   if (getAPIProvider() === 'bedrock') {
@@ -376,6 +404,9 @@ export const getModelBetas = memoize((model: string): string[] => {
   return modelBetas
 })
 
+/**
+ * 返回 Bedrock 提供商下需放入 extra_body_params 的 beta 头部列表。
+ */
 export const getBedrockExtraBodyParamsBetas = memoize(
   (model: string): string[] => {
     const modelBetas = getAllModelBetas(model)
@@ -384,15 +415,9 @@ export const getBedrockExtraBodyParamsBetas = memoize(
 )
 
 /**
- * Merge SDK-provided betas with auto-detected model betas.
- * SDK betas are read from global state (set via setSdkBetas in main.tsx).
- * The betas are pre-filtered by filterAllowedSdkBetas which handles
- * subscriber checks and allowlist validation with warnings.
- *
- * @param options.isAgenticQuery - When true, ensures the beta headers needed
- *   for agentic queries are present. For non-Haiku models these are already
- *   included by getAllModelBetas(); for Haiku they're excluded since
- *   non-agentic calls (compaction, classifiers, token estimation) don't need them.
+ * 合并模型自动检测的 betas 与 SDK 传入的自定义 betas（去重）。
+ * SDK betas 已由 filterAllowedSdkBetas 预过滤。
+ * options.isAgenticQuery 为 true 时，确保 Haiku 等模型也包含 agentic 必需的 beta 头部。
  */
 export function getMergedBetas(
   model: string,
@@ -427,6 +452,7 @@ export function getMergedBetas(
   return [...baseBetas, ...sdkBetas.filter(b => !baseBetas.includes(b))]
 }
 
+/** 清除所有 beta 相关的 memoize 缓存（用于测试重置）。 */
 export function clearBetasCaches(): void {
   getAllModelBetas.cache?.clear?.()
   getModelBetas.cache?.clear?.()

@@ -1,5 +1,15 @@
+/**
+ * 浏览器与文件路径打开工具模块。
+ *
+ * 在 Claude Code 系统中，该模块提供跨平台的系统默认程序调用能力：
+ * - openPath()：使用系统默认程序打开文件或文件夹路径
+ *   （macOS: open，Windows: explorer，Linux: xdg-open）
+ * - openBrowser()：打开指定 URL（仅允许 http/https 协议，校验 URL 合法性）
+ *   优先使用 BROWSER 环境变量指定的浏览器，否则使用系统默认浏览器
+ */
 import { execFileNoThrow } from './execFileNoThrow.js'
 
+/** 校验 URL 格式与协议合法性（仅允许 http / https），不合法时抛出错误。 */
 function validateUrl(url: string): void {
   let parsedUrl: URL
 
@@ -18,8 +28,9 @@ function validateUrl(url: string): void {
 }
 
 /**
- * Open a file or folder path using the system's default handler.
- * Uses `open` on macOS, `explorer` on Windows, `xdg-open` on Linux.
+ * 使用系统默认程序打开文件或文件夹路径。
+ * macOS 使用 open，Windows 使用 explorer，Linux 使用 xdg-open。
+ * 成功返回 true，失败返回 false。
  */
 export async function openPath(path: string): Promise<boolean> {
   try {
@@ -36,6 +47,11 @@ export async function openPath(path: string): Promise<boolean> {
   }
 }
 
+/**
+ * 使用系统默认浏览器打开指定 URL。
+ * 优先使用 BROWSER 环境变量指定的浏览器；Windows 使用 rundll32 url,OpenURL。
+ * 校验 URL 合法性（仅允许 http / https 协议），成功返回 true，失败返回 false。
+ */
 export async function openBrowser(url: string): Promise<boolean> {
   try {
     // Parse and validate the URL

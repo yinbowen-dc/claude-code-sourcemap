@@ -1,3 +1,18 @@
+/**
+ * Shell 执行核心模块。
+ *
+ * 在 Claude Code 系统中，该模块是工具层（Bash 工具）与操作系统 shell 之间的
+ * 桥梁，负责：
+ * 1. 检测并选择合适的 shell（bash/zsh/PowerShell）
+ * 2. 构建并执行 shell 命令，支持沙箱模式（bwrap/sandbox-exec）
+ * 3. 管理工作目录（cwd）的跟踪与更新
+ * 4. 将命令输出写入磁盘文件或通过管道实时传递给调用方
+ *
+ * 主要导出：
+ * - `exec()`：执行单条 shell 命令并返回 ShellCommand 句柄
+ * - `findSuitableShell()`：探测可用 shell 路径
+ * - `setCwd()`：更新进程的当前工作目录
+ */
 import { execFileSync, spawn } from 'child_process'
 import { constants as fsConstants, readFileSync, unlinkSync } from 'fs'
 import { type FileHandle, mkdir, open, realpath } from 'fs/promises'
@@ -41,12 +56,17 @@ import type { ShellProvider, ShellType } from './shell/shellProvider.js'
 import { subprocessEnv } from './subprocessEnv.js'
 import { posixPathToWindowsPath } from './windowsPaths.js'
 
+// 默认命令超时时间：30 分钟
 const DEFAULT_TIMEOUT = 30 * 60 * 1000 // 30 minutes
 
 export type ShellConfig = {
   provider: ShellProvider
 }
 
+/**
+ * 检查指定路径的 shell 是否可执行。
+ * 先尝试 accessSync X_OK，若失败（如 Nix 环境）则用 --version 参数实际执行一次验证。
+ */
 function isExecutable(shellPath: string): boolean {
   try {
     accessSync(shellPath, fsConstants.X_OK)
@@ -68,6 +88,14 @@ function isExecutable(shellPath: string): boolean {
 }
 
 /**
+ * 检测并返回最合适的 shell 路径。
+ *
+ * 检测优先级：
+ * 1. 环境变量 CLAUDE_CODE_SHELL（显式覆盖，需为 bash/zsh）
+ * 2. 环境变量 SHELL（若为 bash/zsh 则优先使用）
+ * 3. 通过 which 命令发现的路径 + 标准路径列表
+ * 若最终没有找到可用 shell，抛出友好错误信息。
+ *
  * Determines the best available shell to use.
  */
 export async function findSuitableShell(): Promise<string> {
@@ -122,6 +150,7 @@ export async function findSuitableShell(): Promise<string> {
     supportedShells.unshift(env_shell)
   }
 
+  // 找到第一个实际可执行的 shell
   const shellPath = supportedShells.find(shell => shell && isExecutable(shell))
 
   // If no valid shell found, throw a helpful error
@@ -136,15 +165,20 @@ export async function findSuitableShell(): Promise<string> {
   return shellPath
 }
 
+/**
+ * 内部实现：构建 ShellConfig（包含 ShellProvider）。
+ * 结果会被 memoize，整个 session 只初始化一次。
+ */
 async function getShellConfigImpl(): Promise<ShellConfig> {
   const binShell = await findSuitableShell()
   const provider = await createBashShellProvider(binShell)
   return { provider }
 }
 
-// Memoize the entire shell config so it only happens once per session
+// 对整个 shell 配置进行 memoize，确保每个 session 只执行一次
 export const getShellConfig = memoize(getShellConfigImpl)
 
+/** 懒加载 PowerShell provider，memoize 确保全局只初始化一次 */
 export const getPsProvider = memoize(async (): Promise<ShellProvider> => {
   const psPath = await getCachedPowerShellPath()
   if (!psPath) {
@@ -153,6 +187,7 @@ export const getPsProvider = memoize(async (): Promise<ShellProvider> => {
   return createPowerShellProvider(psPath)
 })
 
+/** 根据 ShellType 获取对应 ShellProvider 的映射表 */
 const resolveProvider: Record<ShellType, () => Promise<ShellProvider>> = {
   bash: async () => (await getShellConfig()).provider,
   powershell: getPsProvider,
@@ -175,8 +210,17 @@ export type ExecOptions = {
 }
 
 /**
- * Execute a shell command using the environment snapshot
- * Creates a new shell process for each command execution
+ * 执行一条 shell 命令，返回代表该命令执行状态的 ShellCommand 句柄。
+ *
+ * 完整流程：
+ * 1. 解析 ShellProvider（bash 或 powershell）
+ * 2. 若启用沙箱，用 SandboxManager 包装命令字符串
+ * 3. 打开输出文件（文件模式）或使用管道模式（pipe 模式）
+ * 4. spawn 子进程，通过 wrapSpawn 创建 ShellCommand
+ * 5. 在命令结果 Promise 中异步读取 cwd 文件并更新工作目录
+ *
+ * Execute a shell command using the environment snapshot.
+ * Creates a new shell process for each command execution.
  */
 export async function exec(
   command: string,
@@ -194,8 +238,10 @@ export async function exec(
   } = options ?? {}
   const commandTimeout = timeout || DEFAULT_TIMEOUT
 
+  // 根据 shellType 获取对应的 provider
   const provider = await resolveProvider[shellType]()
 
+  // 生成随机 4 位十六进制 ID，用于区分不同命令的临时文件
   const id = Math.floor(Math.random() * 0x10000)
     .toString(16)
     .padStart(4, '0')
@@ -206,6 +252,7 @@ export async function exec(
     getClaudeTempDirName(),
   )
 
+  // 构建实际执行的命令字符串及用于跟踪 cwd 的临时文件路径
   const { commandString: builtCommand, cwdFilePath } =
     await provider.buildExecCommand(command, {
       id,
@@ -217,8 +264,7 @@ export async function exec(
 
   let cwd = pwd()
 
-  // Recover if the current working directory no longer exists on disk.
-  // This can happen when a command deletes its own CWD (e.g., temp dir cleanup).
+  // 若当前工作目录已被删除（如临时目录清理），尝试恢复到原始 cwd
   try {
     await realpath(cwd)
   } catch {
@@ -237,7 +283,7 @@ export async function exec(
     }
   }
 
-  // If already aborted, don't spawn the process at all
+  // 若已中止，直接返回，不 spawn 进程
   if (abortSignal.aborted) {
     return createAbortedCommand()
   }
@@ -257,6 +303,7 @@ export async function exec(
   const sandboxBinShell = isSandboxedPowerShell ? '/bin/sh' : binShell
 
   if (shouldUseSandbox) {
+    // 用沙箱包装命令字符串
     commandString = await SandboxManager.wrapWithSandbox(
       commandString,
       sandboxBinShell,
@@ -272,6 +319,7 @@ export async function exec(
     }
   }
 
+  // 确定最终 spawn 使用的二进制路径和参数
   const spawnBinary = isSandboxedPowerShell ? '/bin/sh' : binShell
   const shellArgs = isSandboxedPowerShell
     ? ['-c', commandString]
@@ -301,6 +349,7 @@ export async function exec(
   let outputHandle: FileHandle | undefined
   if (!usePipeMode) {
     const O_NOFOLLOW = fsConstants.O_NOFOLLOW ?? 0
+    // 文件模式：打开输出文件，stdout/stderr 均写入此文件
     outputHandle = await open(
       taskOutput.path,
       process.platform === 'win32'
@@ -313,12 +362,13 @@ export async function exec(
   }
 
   try {
+    // spawn 子进程
     const childProcess = spawn(spawnBinary, shellArgs, {
       env: {
         ...subprocessEnv(),
         SHELL: shellType === 'bash' ? binShell : undefined,
-        GIT_EDITOR: 'true',
-        CLAUDECODE: '1',
+        GIT_EDITOR: 'true',  // 防止 git 命令打开交互式编辑器
+        CLAUDECODE: '1',      // 标记当前在 Claude Code 环境中运行
         ...envOverrides,
         ...(process.env.USER_TYPE === 'ant'
           ? {
@@ -336,6 +386,7 @@ export async function exec(
       windowsHide: true,
     })
 
+    // 用 wrapSpawn 包装子进程，创建可控的 ShellCommand 句柄
     const shellCommand = wrapSpawn(
       childProcess,
       abortSignal,
@@ -394,6 +445,7 @@ export async function exec(
       // Only foreground tasks update the cwd
       if (result && !preventCwdChanges && !result.backgroundTaskId) {
         try {
+          // 同步读取 cwd 文件以获取命令执行后的新工作目录
           let newCwd = readFileSync(nativeCwdFilePath, {
             encoding: 'utf8',
           }).trim()
@@ -412,7 +464,7 @@ export async function exec(
           logEvent('tengu_shell_set_cwd', { success: false })
         }
       }
-      // Clean up the temp file used for cwd tracking
+      // 清理用于 cwd 跟踪的临时文件
       try {
         unlinkSync(nativeCwdFilePath)
       } catch {
@@ -442,9 +494,15 @@ export async function exec(
 }
 
 /**
- * Set the current working directory
+ * 设置当前工作目录。
+ *
+ * 接受绝对或相对路径，内部调用 realpathSync 解析符号链接，
+ * 与 `pwd -P` 的输出保持一致。若路径不存在则抛出友好错误。
+ *
+ * Set the current working directory.
  */
 export function setCwd(path: string, relativeTo?: string): void {
+  // 若为相对路径，先解析为绝对路径
   const resolved = isAbsolute(path)
     ? path
     : resolve(relativeTo || getFsImplementation().cwd(), path)

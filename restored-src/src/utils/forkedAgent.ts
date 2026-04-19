@@ -1,11 +1,12 @@
 /**
- * Helper for running forked agent query loops with usage tracking.
+ * 分叉代理（Forked Agent）查询辅助模块。
  *
- * This utility ensures forked agents:
- * 1. Share identical cache-critical params with the parent to guarantee prompt cache hits
- * 2. Track full usage metrics across the entire query loop
- * 3. Log metrics via the tengu_fork_agent_query event when complete
- * 4. Isolate mutable state to prevent interference with the main agent loop
+ * 在 Claude Code 系统中，该模块为分叉子代理的查询循环提供统一封装，
+ * 确保子代理与父代理共享提示缓存关键参数，并正确追踪用量指标：
+ * 1. 与父代理使用相同的缓存关键参数，保证提示缓存命中率
+ * 2. 跨整个查询循环汇总完整的用量统计数据（Token 消耗等）
+ * 3. 查询完成后通过 tengu_fork_agent_query 事件上报用量指标
+ * 4. 隔离可变状态，防止与主代理循环产生干扰
  */
 
 import type { UUID } from 'crypto'

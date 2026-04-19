@@ -1,2 +1,24 @@
-// Shared frame interval for render throttling and animations (~60fps)
+/**
+ * Ink 渲染层全局常量定义
+ *
+ * 【在 Claude Code 系统中的位置】
+ * 位于 Ink 自定义渲染层的基础配置层，被渲染调度器（ink.tsx）和
+ * 动画系统共同引用，确保帧率相关的时间常量在整个渲染系统中保持一致。
+ *
+ * 【主要功能】
+ * 定义 Ink 渲染系统的核心时间常量，控制渲染帧率（throttle 间隔）
+ * 和动画刷新速率，避免在多个模块中硬编码相同的数值。
+ */
+
+/**
+ * 渲染节流和动画的共享帧间隔（单位：毫秒），约 60fps。
+ *
+ * 用于以下两个场景：
+ * 1. 渲染节流（scheduleRender）：防止 React 状态更新触发过于频繁的终端重绘，
+ *    多次更新在同一帧间隔内会被合并为一次渲染，减少闪烁和 CPU 占用。
+ * 2. 动画系统（useAnimation / Spinner 等）：以此间隔驱动帧更新，
+ *    保证动画以稳定的 ~60fps 速率播放。
+ *
+ * 16ms ≈ 1000ms / 60fps，是主流终端能够流畅渲染的合理上限。
+ */
 export const FRAME_INTERVAL_MS = 16

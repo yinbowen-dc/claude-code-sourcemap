@@ -1,3 +1,10 @@
+/**
+ * 当前工作目录管理模块。
+ *
+ * 在 Claude Code 系统中，该模块通过 AsyncLocalStorage 实现异步上下文隔离的工作目录覆盖：
+ * - getCwd()：获取当前异步上下文的工作目录（优先取覆盖值，其次取 bootstrap state 中的 cwd）
+ * - withCwdOverride()：在指定目录上下文中运行函数，子调用链继承该目录
+ */
 import { AsyncLocalStorage } from 'async_hooks'
 import { getCwdState, getOriginalCwd } from '../bootstrap/state.js'
 

@@ -1,3 +1,23 @@
+/**
+ * 消息指纹（Fingerprint）计算模块。
+ *
+ * 在 Claude Code 系统中，该模块为会话消息计算唯一指纹哈希，
+ * 用于后端校验与消息去重：
+ * - 使用固定盐值（FINGERPRINT_SALT）与消息内容生成 SHA256 哈希
+ * - 盐值须与后端校验逻辑完全一致，否则指纹验证失败
+ * - 从首条用户消息提取文本内容作为指纹计算的输入
+ * - 指纹结果用于防止重放攻击与重复提交检测
+ */
+/**
+ * 消息指纹（Fingerprint）计算模块。
+ *
+ * 在 Claude Code 系统中，该模块为会话消息计算唯一指纹哈希，
+ * 用于后端校验与消息去重：
+ * - 使用固定盐值（FINGERPRINT_SALT）与消息内容生成 SHA256 哈希
+ * - 盐值须与后端校验逻辑完全一致，否则指纹验证失败
+ * - 从首条用户消息提取文本内容作为指纹计算的输入
+ * - 指纹结果用于防止重放攻击与重复提交检测
+ */
 import { createHash } from 'crypto'
 import type { AssistantMessage, UserMessage } from '../types/message.js'
 

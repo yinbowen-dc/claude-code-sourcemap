@@ -1,15 +1,15 @@
 /**
- * Sync file-read path, extracted from file.ts.
+ * 同步文件读取路径模块（从 file.ts 中拆分）。
  *
- * file.ts sits in the settings SCC via log.ts → types/logs.ts → types/message.ts →
- * Tool.ts → commands.ts → … Anything that needs readFileSync from file.ts
- * pulls in the whole chain. This leaf imports only fsOperations and debug,
- * both of which terminate in Node builtins.
- *
- * detectFileEncoding/detectLineEndings stay in file.ts — they call logError
- * (log.ts → SCC) on unexpected failures. The -ForResolvedPath/-ForString
- * helpers here are the pure parts; callers who need the logging wrappers
- * import from file.ts.
+ * 在 Claude Code 系统中，该模块是 file.ts 的轻量叶子模块，
+ * 专门提供不依赖日志链（log.ts → SCC）的纯同步文件读取功能：
+ * - file.ts 处于 settings SCC 环路（log.ts → types/logs.ts → types/message.ts → Tool.ts → commands.ts），
+ *   任何需要 readFileSync 的代码若直接引入 file.ts 会拉取整个依赖链。
+ *   本模块仅依赖 fsOperations 和 debug，两者均以 Node 内置模块为终点，打破循环。
+ * - detectEncodingForResolvedPath()：按已解析路径同步检测文件编码（UTF-8 / Latin-1 / Binary）
+ * - detectLineEndingsForString()：检测字符串中的行尾格式（LF / CRLF）
+ * - 带 ForResolvedPath/ForString 后缀的纯函数版本供内部使用；
+ *   需要错误日志包装的调用方应从 file.ts 导入。
  */
 
 import { logForDebugging } from './debug.js'

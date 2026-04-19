@@ -1,3 +1,21 @@
+/**
+ * 文件读取缓存模块。
+ *
+ * 在 Claude Code 系统中，该模块为文件读取操作提供内存缓存层，
+ * 避免对同一文件进行重复 I/O 操作，提升工具链（如 Read/Edit）的响应速度：
+ * - 缓存 key 为文件路径，value 为文件内容字符串与编码信息
+ * - 通过 mtime/size 变更检测自动失效缓存条目
+ * - 由 file.ts 在读取前统一查询，写入后主动淘汰对应缓存
+ */
+/**
+ * 文件读取缓存模块。
+ *
+ * 在 Claude Code 系统中，该模块为文件读取操作提供内存缓存层，
+ * 避免对同一文件进行重复 I/O 操作，提升工具链（如 Read/Edit）的响应速度：
+ * - 缓存 key 为文件路径，value 为文件内容字符串与编码信息
+ * - 通过 mtime/size 变更检测自动失效缓存条目
+ * - 由 file.ts 在读取前统一查询，写入后主动淘汰对应缓存
+ */
 import { detectFileEncoding } from './file.js'
 import { getFsImplementation } from './fsOperations.js'
 

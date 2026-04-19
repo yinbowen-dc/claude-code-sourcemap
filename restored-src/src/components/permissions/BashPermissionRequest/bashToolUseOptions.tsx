@@ -1,3 +1,17 @@
+/**
+ * BashPermissionRequest/bashToolUseOptions.tsx
+ *
+ * 【在 Claude Code 权限系统中的位置】
+ * 本文件属于 Bash 工具权限请求流程的选项构建层。当 Claude 需要执行 Bash 命令时，
+ * 权限系统会向用户弹出确认对话框，本文件负责构建该对话框中所有可选的用户操作按钮
+ * （"是"/"是，始终允许"/"否"等），并根据当前模式、分类器状态、权限建议动态组合选项列表。
+ *
+ * 【主要功能】
+ * - 定义 BashToolUseOption 类型（所有可能的用户选择值）
+ * - 提供辅助函数 descriptionAlreadyExists / stripBashRedirections
+ * - 导出核心函数 bashToolUseOptions，根据入参动态生成选项数组
+ */
+
 import { BASH_TOOL_NAME } from '../../../tools/BashTool/toolName.js';
 import { extractOutputRedirections } from '../../../utils/bash/commands.js';
 import { isClassifierPermissionsEnabled } from '../../../utils/permissions/bashClassifier.js';
@@ -6,41 +20,58 @@ import type { PermissionUpdate } from '../../../utils/permissions/PermissionUpda
 import { shouldShowAlwaysAllowOptions } from '../../../utils/permissions/permissionsLoader.js';
 import type { OptionWithDescription } from '../../CustomSelect/select.js';
 import { generateShellSuggestionsLabel } from '../shellPermissionHelpers.js';
+
+// 用户在 Bash 权限对话框中可以选择的操作值类型
 export type BashToolUseOption = 'yes' | 'yes-apply-suggestions' | 'yes-prefix-edited' | 'yes-classifier-reviewed' | 'no';
 
 /**
- * Check if a description already exists in the allow list.
- * Compares lowercase and trailing-whitespace-trimmed versions.
+ * 检查某个描述是否已存在于允许列表中。
+ * 比较时忽略大小写并去除末尾空白，避免重复添加相同描述。
  */
 function descriptionAlreadyExists(description: string, existingDescriptions: string[]): boolean {
+  // 将目标描述规范化：转小写并去末尾空白
   const normalized = description.toLowerCase().trimEnd();
+  // 逐一与已有描述对比（同样规范化后比较）
   return existingDescriptions.some(existing => existing.toLowerCase().trimEnd() === normalized);
 }
 
 /**
- * Strip output redirections so filenames don't show as commands in the label.
+ * 去除 Bash 命令中的输出重定向部分，使标签只展示实际命令名，不包含文件路径。
+ * 仅在存在重定向时才使用剥离版本，否则原样返回。
  */
 function stripBashRedirections(command: string): string {
   const {
-    commandWithoutRedirections,
-    redirections
+    commandWithoutRedirections, // 去掉重定向后的命令
+    redirections                // 提取出的重定向列表
   } = extractOutputRedirections(command);
-  // Only use stripped version if there were actual redirections
+  // 只有存在重定向时才使用剥离版本，否则返回原始命令
   return redirections.length > 0 ? commandWithoutRedirections : command;
 }
+
+/**
+ * 根据当前权限状态、用户输入模式、AI 分类器建议等动态构建 Bash 权限对话框的选项列表。
+ *
+ * 【整体流程】
+ * 1. 根据 yesInputMode 决定"是"选项是普通按钮还是带文本输入框的选项
+ * 2. 若未被 allowManagedPermissionRulesOnly 限制，则追加"始终允许"相关选项：
+ *    a. 若存在可编辑前缀（editablePrefix）且建议中无非 Bash 条目，则展示可编辑前缀输入框
+ *    b. 否则若有 AI 生成的建议，则展示生成的建议标签选项
+ *    c. 若 ANT 内部构建且分类器已启用，额外提供分类器描述输入框选项
+ * 3. 根据 noInputMode 决定"否"选项是普通按钮还是带文本输入框的选项
+ */
 export function bashToolUseOptions({
-  suggestions = [],
-  decisionReason,
-  onRejectFeedbackChange,
-  onAcceptFeedbackChange,
-  onClassifierDescriptionChange,
-  classifierDescription,
-  initialClassifierDescriptionEmpty = false,
-  existingAllowDescriptions = [],
-  yesInputMode = false,
-  noInputMode = false,
-  editablePrefix,
-  onEditablePrefixChange
+  suggestions = [],          // AI 生成的权限规则建议列表
+  decisionReason,            // 当前权限决策原因（用于判断是否跳过分类器选项）
+  onRejectFeedbackChange,    // 用户输入"否"反馈时的回调
+  onAcceptFeedbackChange,    // 用户输入"是"反馈时的回调
+  onClassifierDescriptionChange, // 用户编辑分类器描述时的回调
+  classifierDescription,         // 分类器预填的描述文本
+  initialClassifierDescriptionEmpty = false, // 初始分类器描述是否为空（为空时隐藏该选项）
+  existingAllowDescriptions = [], // 已存在的允许描述列表（用于去重）
+  yesInputMode = false,      // "是"选项是否以文本输入框形式呈现
+  noInputMode = false,       // "否"选项是否以文本输入框形式呈现
+  editablePrefix,            // 可编辑的命令前缀规则（如 "npm run:*"）
+  onEditablePrefixChange     // 用户编辑前缀时的回调
 }: {
   suggestions?: PermissionUpdate[];
   decisionReason?: PermissionDecisionReason;
@@ -58,59 +89,68 @@ export function bashToolUseOptions({
   /** Callback when the user edits the prefix value. */
   onEditablePrefixChange?: (value: string) => void;
 }): OptionWithDescription<BashToolUseOption>[] {
+  // 最终返回的选项数组，按顺序追加各个选项
   const options: OptionWithDescription<BashToolUseOption>[] = [];
+
+  // ── "是" 选项 ──────────────────────────────────────────────────────────────
   if (yesInputMode) {
+    // 输入模式：显示带有文本输入框的"是"选项，用户可附加说明
     options.push({
       type: 'input',
       label: 'Yes',
       value: 'yes',
       placeholder: 'and tell Claude what to do next',
       onChange: onAcceptFeedbackChange,
-      allowEmptySubmitToCancel: true
+      allowEmptySubmitToCancel: true // 空输入可取消此模式
     });
   } else {
+    // 普通模式：简单的"是"按钮
     options.push({
       label: 'Yes',
       value: 'yes'
     });
   }
 
-  // Only show "always allow" options when not restricted by allowManagedPermissionRulesOnly
+  // ── "始终允许" 相关选项（受全局配置控制） ──────────────────────────────────
+  // 只有在未被 allowManagedPermissionRulesOnly 限制时才显示这些选项
   if (shouldShowAlwaysAllowOptions()) {
-    // Show an editable input for the prefix rule instead of the
-    // Haiku-generated suggestion label — but only when the suggestions
-    // don't contain non-Bash items (addDirectories, Read rules) that
-    // the editable prefix can't represent.
+    // 检查建议列表中是否包含非 Bash 工具的条目（如 addDirectories 或 Read 规则）
+    // 若存在，则可编辑前缀无法表示这些规则，需回退到普通建议标签模式
     const hasNonBashSuggestions = suggestions.some(s => s.type === 'addDirectories' || s.type === 'addRules' && s.rules?.some(r => r.toolName !== BASH_TOOL_NAME));
+
     if (editablePrefix !== undefined && onEditablePrefixChange && !hasNonBashSuggestions && suggestions.length > 0) {
+      // 优先展示可编辑前缀输入框，让用户直接修改 AI 建议的命令前缀规则
       options.push({
         type: 'input',
         label: 'Yes, and don\u2019t ask again for',
         value: 'yes-prefix-edited',
         placeholder: 'command prefix (e.g., npm run:*)',
-        initialValue: editablePrefix,
+        initialValue: editablePrefix,        // 预填 AI 建议的前缀
         onChange: onEditablePrefixChange,
         allowEmptySubmitToCancel: true,
-        showLabelWithValue: true,
+        showLabelWithValue: true,            // 同时展示标签和当前值
         labelValueSeparator: ': ',
-        resetCursorOnUpdate: true
+        resetCursorOnUpdate: true            // 每次值更新后重置光标位置
       });
     } else if (suggestions.length > 0) {
+      // 没有可编辑前缀时，使用 AI 生成的建议标签（由 generateShellSuggestionsLabel 构建）
       const label = generateShellSuggestionsLabel(suggestions, BASH_TOOL_NAME, stripBashRedirections);
       if (label) {
         options.push({
           label,
-          value: 'yes-apply-suggestions'
+          value: 'yes-apply-suggestions' // 用户选择后会应用 AI 建议的规则
         });
       }
     }
 
-    // Add classifier-reviewed option if enabled, the initial description was
-    // non-empty, the description doesn't already exist in the allow list,
-    // and the decision reason is NOT a server-side classifier block
-    // (prompt-based rules don't help when the server-side classifier triggers first).
-    // Skip when the editable prefix option is already shown — they serve the
-    // same role and having two identical-looking "don't ask again" inputs is confusing.
+    // ── 分类器审查选项（仅限 ANT 内部构建） ─────────────────────────────────
+    // 满足以下所有条件时才显示：
+    //   1. 当前为 ANT 内部构建（"external" === 'ant' 在外部构建中永远为 false）
+    //   2. 可编辑前缀选项未展示（两者功能重叠，同时显示会造成混淆）
+    //   3. 分类器权限已启用
+    //   4. 初始描述非空（空描述无需显示）
+    //   5. 描述不与已有允许列表重复
+    //   6. 决策原因不是服务端分类器触发（服务端分类器触发时，规则添加无效）
     const editablePrefixShown = options.some(o => o.value === 'yes-prefix-edited');
     if ("external" === 'ant' && !editablePrefixShown && isClassifierPermissionsEnabled() && onClassifierDescriptionChange && !initialClassifierDescriptionEmpty && !descriptionAlreadyExists(classifierDescription ?? '', existingAllowDescriptions) && decisionReason?.type !== 'classifier') {
       options.push({
@@ -118,7 +158,7 @@ export function bashToolUseOptions({
         label: 'Yes, and don\u2019t ask again for',
         value: 'yes-classifier-reviewed',
         placeholder: 'describe what to allow...',
-        initialValue: classifierDescription ?? '',
+        initialValue: classifierDescription ?? '', // 预填分类器描述
         onChange: onClassifierDescriptionChange,
         allowEmptySubmitToCancel: true,
         showLabelWithValue: true,
@@ -127,7 +167,10 @@ export function bashToolUseOptions({
       });
     }
   }
+
+  // ── "否" 选项 ──────────────────────────────────────────────────────────────
   if (noInputMode) {
+    // 输入模式：显示带有文本输入框的"否"选项，用户可说明希望 Claude 改变的行为
     options.push({
       type: 'input',
       label: 'No',
@@ -137,11 +180,12 @@ export function bashToolUseOptions({
       allowEmptySubmitToCancel: true
     });
   } else {
+    // 普通模式：简单的"否"按钮
     options.push({
       label: 'No',
       value: 'no'
     });
   }
+
   return options;
 }
-//# sourceMappingURL=data:application/json;charset=utf-8;base64,eyJ2ZXJzaW9uIjozLCJuYW1lcyI6WyJCQVNIX1RPT0xfTkFNRSIsImV4dHJhY3RPdXRwdXRSZWRpcmVjdGlvbnMiLCJpc0NsYXNzaWZpZXJQZXJtaXNzaW9uc0VuYWJsZWQiLCJQZXJtaXNzaW9uRGVjaXNpb25SZWFzb24iLCJQZXJtaXNzaW9uVXBkYXRlIiwic2hvdWxkU2hvd0Fsd2F5c0FsbG93T3B0aW9ucyIsIk9wdGlvbldpdGhEZXNjcmlwdGlvbiIsImdlbmVyYXRlU2hlbGxTdWdnZXN0aW9uc0xhYmVsIiwiQmFzaFRvb2xVc2VPcHRpb24iLCJkZXNjcmlwdGlvbkFscmVhZHlFeGlzdHMiLCJkZXNjcmlwdGlvbiIsImV4aXN0aW5nRGVzY3JpcHRpb25zIiwibm9ybWFsaXplZCIsInRvTG93ZXJDYXNlIiwidHJpbUVuZCIsInNvbWUiLCJleGlzdGluZyIsInN0cmlwQmFzaFJlZGlyZWN0aW9ucyIsImNvbW1hbmQiLCJjb21tYW5kV2l0aG91dFJlZGlyZWN0aW9ucyIsInJlZGlyZWN0aW9ucyIsImxlbmd0aCIsImJhc2hUb29sVXNlT3B0aW9ucyIsInN1Z2dlc3Rpb25zIiwiZGVjaXNpb25SZWFzb24iLCJvblJlamVjdEZlZWRiYWNrQ2hhbmdlIiwib25BY2NlcHRGZWVkYmFja0NoYW5nZSIsIm9uQ2xhc3NpZmllckRlc2NyaXB0aW9uQ2hhbmdlIiwiY2xhc3NpZmllckRlc2NyaXB0aW9uIiwiaW5pdGlhbENsYXNzaWZpZXJEZXNjcmlwdGlvbkVtcHR5IiwiZXhpc3RpbmdBbGxvd0Rlc2NyaXB0aW9ucyIsInllc0lucHV0TW9kZSIsIm5vSW5wdXRNb2RlIiwiZWRpdGFibGVQcmVmaXgiLCJvbkVkaXRhYmxlUHJlZml4Q2hhbmdlIiwidmFsdWUiLCJvcHRpb25zIiwicHVzaCIsInR5cGUiLCJsYWJlbCIsInBsYWNlaG9sZGVyIiwib25DaGFuZ2UiLCJhbGxvd0VtcHR5U3VibWl0VG9DYW5jZWwiLCJoYXNOb25CYXNoU3VnZ2VzdGlvbnMiLCJzIiwicnVsZXMiLCJyIiwidG9vbE5hbWUiLCJ1bmRlZmluZWQiLCJpbml0aWFsVmFsdWUiLCJzaG93TGFiZWxXaXRoVmFsdWUiLCJsYWJlbFZhbHVlU2VwYXJhdG9yIiwicmVzZXRDdXJzb3JPblVwZGF0ZSIsImVkaXRhYmxlUHJlZml4U2hvd24iLCJvIl0sInNvdXJjZXMiOlsiYmFzaFRvb2xVc2VPcHRpb25zLnRzeCJdLCJzb3VyY2VzQ29udGVudCI6WyJpbXBvcnQgeyBCQVNIX1RPT0xfTkFNRSB9IGZyb20gJy4uLy4uLy4uL3Rvb2xzL0Jhc2hUb29sL3Rvb2xOYW1lLmpzJ1xuaW1wb3J0IHsgZXh0cmFjdE91dHB1dFJlZGlyZWN0aW9ucyB9IGZyb20gJy4uLy4uLy4uL3V0aWxzL2Jhc2gvY29tbWFuZHMuanMnXG5pbXBvcnQgeyBpc0NsYXNzaWZpZXJQZXJtaXNzaW9uc0VuYWJsZWQgfSBmcm9tICcuLi8uLi8uLi91dGlscy9wZXJtaXNzaW9ucy9iYXNoQ2xhc3NpZmllci5qcydcbmltcG9ydCB0eXBlIHsgUGVybWlzc2lvbkRlY2lzaW9uUmVhc29uIH0gZnJvbSAnLi4vLi4vLi4vdXRpbHMvcGVybWlzc2lvbnMvUGVybWlzc2lvblJlc3VsdC5qcydcbmltcG9ydCB0eXBlIHsgUGVybWlzc2lvblVwZGF0ZSB9IGZyb20gJy4uLy4uLy4uL3V0aWxzL3Blcm1pc3Npb25zL1Blcm1pc3Npb25VcGRhdGVTY2hlbWEuanMnXG5pbXBvcnQgeyBzaG91bGRTaG93QWx3YXlzQWxsb3dPcHRpb25zIH0gZnJvbSAnLi4vLi4vLi4vdXRpbHMvcGVybWlzc2lvbnMvcGVybWlzc2lvbnNMb2FkZXIuanMnXG5pbXBvcnQgdHlwZSB7IE9wdGlvbldpdGhEZXNjcmlwdGlvbiB9IGZyb20gJy4uLy4uL0N1c3RvbVNlbGVjdC9zZWxlY3QuanMnXG5pbXBvcnQgeyBnZW5lcmF0ZVNoZWxsU3VnZ2VzdGlvbnNMYWJlbCB9IGZyb20gJy4uL3NoZWxsUGVybWlzc2lvbkhlbHBlcnMuanMnXG5cbmV4cG9ydCB0eXBlIEJhc2hUb29sVXNlT3B0aW9uID1cbiAgfCAneWVzJ1xuICB8ICd5ZXMtYXBwbHktc3VnZ2VzdGlvbnMnXG4gIHwgJ3llcy1wcmVmaXgtZWRpdGVkJ1xuICB8ICd5ZXMtY2xhc3NpZmllci1yZXZpZXdlZCdcbiAgfCAnbm8nXG5cbi8qKlxuICogQ2hlY2sgaWYgYSBkZXNjcmlwdGlvbiBhbHJlYWR5IGV4aXN0cyBpbiB0aGUgYWxsb3cgbGlzdC5cbiAqIENvbXBhcmVzIGxvd2VyY2FzZSBhbmQgdHJhaWxpbmctd2hpdGVzcGFjZS10cmltbWVkIHZlcnNpb25zLlxuICovXG5mdW5jdGlvbiBkZXNjcmlwdGlvbkFscmVhZHlFeGlzdHMoXG4gIGRlc2NyaXB0aW9uOiBzdHJpbmcsXG4gIGV4aXN0aW5nRGVzY3JpcHRpb25zOiBzdHJpbmdbXSxcbik6IGJvb2xlYW4ge1xuICBjb25zdCBub3JtYWxpemVkID0gZGVzY3JpcHRpb24udG9Mb3dlckNhc2UoKS50cmltRW5kKClcbiAgcmV0dXJuIGV4aXN0aW5nRGVzY3JpcHRpb25zLnNvbWUoXG4gICAgZXhpc3RpbmcgPT4gZXhpc3RpbmcudG9Mb3dlckNhc2UoKS50cmltRW5kKCkgPT09IG5vcm1hbGl6ZWQsXG4gIClcbn1cblxuLyoqXG4gKiBTdHJpcCBvdXRwdXQgcmVkaXJlY3Rpb25zIHNvIGZpbGVuYW1lcyBkb24ndCBzaG93IGFzIGNvbW1hbmRzIGluIHRoZSBsYWJlbC5cbiAqL1xuZnVuY3Rpb24gc3RyaXBCYXNoUmVkaXJlY3Rpb25zKGNvbW1hbmQ6IHN0cmluZyk6IHN0cmluZyB7XG4gIGNvbnN0IHsgY29tbWFuZFdpdGhvdXRSZWRpcmVjdGlvbnMsIHJlZGlyZWN0aW9ucyB9ID1cbiAgICBleHRyYWN0T3V0cHV0UmVkaXJlY3Rpb25zKGNvbW1hbmQpXG4gIC8vIE9ubHkgdXNlIHN0cmlwcGVkIHZlcnNpb24gaWYgdGhlcmUgd2VyZSBhY3R1YWwgcmVkaXJlY3Rpb25zXG4gIHJldHVybiByZWRpcmVjdGlvbnMubGVuZ3RoID4gMCA/IGNvbW1hbmRXaXRob3V0UmVkaXJlY3Rpb25zIDogY29tbWFuZFxufVxuXG5leHBvcnQgZnVuY3Rpb24gYmFzaFRvb2xVc2VPcHRpb25zKHtcbiAgc3VnZ2VzdGlvbnMgPSBbXSxcbiAgZGVjaXNpb25SZWFzb24sXG4gIG9uUmVqZWN0RmVlZGJhY2tDaGFuZ2UsXG4gIG9uQWNjZXB0RmVlZGJhY2tDaGFuZ2UsXG4gIG9uQ2xhc3NpZmllckRlc2NyaXB0aW9uQ2hhbmdlLFxuICBjbGFzc2lmaWVyRGVzY3JpcHRpb24sXG4gIGluaXRpYWxDbGFzc2lmaWVyRGVzY3JpcHRpb25FbXB0eSA9IGZhbHNlLFxuICBleGlzdGluZ0FsbG93RGVzY3JpcHRpb25zID0gW10sXG4gIHllc0lucHV0TW9kZSA9IGZhbHNlLFxuICBub0lucHV0TW9kZSA9IGZhbHNlLFxuICBlZGl0YWJsZVByZWZpeCxcbiAgb25FZGl0YWJsZVByZWZpeENoYW5nZSxcbn06IHtcbiAgc3VnZ2VzdGlvbnM/OiBQZXJtaXNzaW9uVXBkYXRlW11cbiAgZGVjaXNpb25SZWFzb24/OiBQZXJtaXNzaW9uRGVjaXNpb25SZWFzb25cbiAgb25SZWplY3RGZWVkYmFja0NoYW5nZTogKHZhbHVlOiBzdHJpbmcpID0+IHZvaWRcbiAgb25BY2NlcHRGZWVkYmFja0NoYW5nZTogKHZhbHVlOiBzdHJpbmcpID0+IHZvaWRcbiAgb25DbGFzc2lmaWVyRGVzY3JpcHRpb25DaGFuZ2U/OiAodmFsdWU6IHN0cmluZykgPT4gdm9pZFxuICBjbGFzc2lmaWVyRGVzY3JpcHRpb24/OiBzdHJpbmdcbiAgLyoqIFdoZXRoZXIgdGhlIGluaXRpYWwgY2xhc3NpZmllciBkZXNjcmlwdGlvbiB3YXMgZW1wdHkuIFdoZW4gdHJ1ZSwgaGlkZXMgdGhlIG9wdGlvbi4gKi9cbiAgaW5pdGlhbENsYXNzaWZpZXJEZXNjcmlwdGlvbkVtcHR5PzogYm9vbGVhblxuICBleGlzdGluZ0FsbG93RGVzY3JpcHRpb25zPzogc3RyaW5nW11cbiAgeWVzSW5wdXRNb2RlPzogYm9vbGVhblxuICBub0lucHV0TW9kZT86IGJvb2xlYW5cbiAgLyoqIEVkaXRhYmxlIHByZWZpeCBydWxlIGNvbnRlbnQgKGUuZy4sIFwibnBtIHJ1bjoqXCIpLiBXaGVuIHNldCwgcmVwbGFjZXMgSGFpa3UtYmFzZWQgc3VnZ2VzdGlvbnMuICovXG4gIGVkaXRhYmxlUHJlZml4Pzogc3RyaW5nXG4gIC8qKiBDYWxsYmFjayB3aGVuIHRoZSB1c2VyIGVkaXRzIHRoZSBwcmVmaXggdmFsdWUuICovXG4gIG9uRWRpdGFibGVQcmVmaXhDaGFuZ2U/OiAodmFsdWU6IHN0cmluZykgPT4gdm9pZFxufSk6IE9wdGlvbldpdGhEZXNjcmlwdGlvbjxCYXNoVG9vbFVzZU9wdGlvbj5bXSB7XG4gIGNvbnN0IG9wdGlvbnM6IE9wdGlvbldpdGhEZXNjcmlwdGlvbjxCYXNoVG9vbFVzZU9wdGlvbj5bXSA9IFtdXG5cbiAgaWYgKHllc0lucHV0TW9kZSkge1xuICAgIG9wdGlvbnMucHVzaCh7XG4gICAgICB0eXBlOiAnaW5wdXQnLFxuICAgICAgbGFiZWw6ICdZZXMnLFxuICAgICAgdmFsdWU6ICd5ZXMnLFxuICAgICAgcGxhY2Vob2xkZXI6ICdhbmQgdGVsbCBDbGF1ZGUgd2hhdCB0byBkbyBuZXh0JyxcbiAgICAgIG9uQ2hhbmdlOiBvbkFjY2VwdEZlZWRiYWNrQ2hhbmdlLFxuICAgICAgYWxsb3dFbXB0eVN1Ym1pdFRvQ2FuY2VsOiB0cnVlLFxuICAgIH0pXG4gIH0gZWxzZSB7XG4gICAgb3B0aW9ucy5wdXNoKHtcbiAgICAgIGxhYmVsOiAnWWVzJyxcbiAgICAgIHZhbHVlOiAneWVzJyxcbiAgICB9KVxuICB9XG5cbiAgLy8gT25seSBzaG93IFwiYWx3YXlzIGFsbG93XCIgb3B0aW9ucyB3aGVuIG5vdCByZXN0cmljdGVkIGJ5IGFsbG93TWFuYWdlZFBlcm1pc3Npb25SdWxlc09ubHlcbiAgaWYgKHNob3VsZFNob3dBbHdheXNBbGxvd09wdGlvbnMoKSkge1xuICAgIC8vIFNob3cgYW4gZWRpdGFibGUgaW5wdXQgZm9yIHRoZSBwcmVmaXggcnVsZSBpbnN0ZWFkIG9mIHRoZVxuICAgIC8vIEhhaWt1LWdlbmVyYXRlZCBzdWdnZXN0aW9uIGxhYmVsIOKAlCBidXQgb25seSB3aGVuIHRoZSBzdWdnZXN0aW9uc1xuICAgIC8vIGRvbid0IGNvbnRhaW4gbm9uLUJhc2ggaXRlbXMgKGFkZERpcmVjdG9yaWVzLCBSZWFkIHJ1bGVzKSB0aGF0XG4gICAgLy8gdGhlIGVkaXRhYmxlIHByZWZpeCBjYW4ndCByZXByZXNlbnQuXG4gICAgY29uc3QgaGFzTm9uQmFzaFN1Z2dlc3Rpb25zID0gc3VnZ2VzdGlvbnMuc29tZShcbiAgICAgIHMgPT5cbiAgICAgICAgcy50eXBlID09PSAnYWRkRGlyZWN0b3JpZXMnIHx8XG4gICAgICAgIChzLnR5cGUgPT09ICdhZGRSdWxlcycgJiZcbiAgICAgICAgICBzLnJ1bGVzPy5zb21lKHIgPT4gci50b29sTmFtZSAhPT0gQkFTSF9UT09MX05BTUUpKSxcbiAgICApXG4gICAgaWYgKFxuICAgICAgZWRpdGFibGVQcmVmaXggIT09IHVuZGVmaW5lZCAmJlxuICAgICAgb25FZGl0YWJsZVByZWZpeENoYW5nZSAmJlxuICAgICAgIWhhc05vbkJhc2hTdWdnZXN0aW9ucyAmJlxuICAgICAgc3VnZ2VzdGlvbnMubGVuZ3RoID4gMFxuICAgICkge1xuICAgICAgb3B0aW9ucy5wdXNoKHtcbiAgICAgICAgdHlwZTogJ2lucHV0JyxcbiAgICAgICAgbGFiZWw6ICdZZXMsIGFuZCBkb25cXHUyMDE5dCBhc2sgYWdhaW4gZm9yJyxcbiAgICAgICAgdmFsdWU6ICd5ZXMtcHJlZml4LWVkaXRlZCcsXG4gICAgICAgIHBsYWNlaG9sZGVyOiAnY29tbWFuZCBwcmVmaXggKGUuZy4sIG5wbSBydW46KiknLFxuICAgICAgICBpbml0aWFsVmFsdWU6IGVkaXRhYmxlUHJlZml4LFxuICAgICAgICBvbkNoYW5nZTogb25FZGl0YWJsZVByZWZpeENoYW5nZSxcbiAgICAgICAgYWxsb3dFbXB0eVN1Ym1pdFRvQ2FuY2VsOiB0cnVlLFxuICAgICAgICBzaG93TGFiZWxXaXRoVmFsdWU6IHRydWUsXG4gICAgICAgIGxhYmVsVmFsdWVTZXBhcmF0b3I6ICc6ICcsXG4gICAgICAgIHJlc2V0Q3Vyc29yT25VcGRhdGU6IHRydWUsXG4gICAgICB9KVxuICAgIH0gZWxzZSBpZiAoc3VnZ2VzdGlvbnMubGVuZ3RoID4gMCkge1xuICAgICAgY29uc3QgbGFiZWwgPSBnZW5lcmF0ZVNoZWxsU3VnZ2VzdGlvbnNMYWJlbChcbiAgICAgICAgc3VnZ2VzdGlvbnMsXG4gICAgICAgIEJBU0hfVE9PTF9OQU1FLFxuICAgICAgICBzdHJpcEJhc2hSZWRpcmVjdGlvbnMsXG4gICAgICApXG5cbiAgICAgIGlmIChsYWJlbCkge1xuICAgICAgICBvcHRpb25zLnB1c2goe1xuICAgICAgICAgIGxhYmVsLFxuICAgICAgICAgIHZhbHVlOiAneWVzLWFwcGx5LXN1Z2dlc3Rpb25zJyxcbiAgICAgICAgfSlcbiAgICAgIH1cbiAgICB9XG5cbiAgICAvLyBBZGQgY2xhc3NpZmllci1yZXZpZXdlZCBvcHRpb24gaWYgZW5hYmxlZCwgdGhlIGluaXRpYWwgZGVzY3JpcHRpb24gd2FzXG4gICAgLy8gbm9uLWVtcHR5LCB0aGUgZGVzY3JpcHRpb24gZG9lc24ndCBhbHJlYWR5IGV4aXN0IGluIHRoZSBhbGxvdyBsaXN0LFxuICAgIC8vIGFuZCB0aGUgZGVjaXNpb24gcmVhc29uIGlzIE5PVCBhIHNlcnZlci1zaWRlIGNsYXNzaWZpZXIgYmxvY2tcbiAgICAvLyAocHJvbXB0LWJhc2VkIHJ1bGVzIGRvbid0IGhlbHAgd2hlbiB0aGUgc2VydmVyLXNpZGUgY2xhc3NpZmllciB0cmlnZ2VycyBmaXJzdCkuXG4gICAgLy8gU2tpcCB3aGVuIHRoZSBlZGl0YWJsZSBwcmVmaXggb3B0aW9uIGlzIGFscmVhZHkgc2hvd24g4oCUIHRoZXkgc2VydmUgdGhlXG4gICAgLy8gc2FtZSByb2xlIGFuZCBoYXZpbmcgdHdvIGlkZW50aWNhbC1sb29raW5nIFwiZG9uJ3QgYXNrIGFnYWluXCIgaW5wdXRzIGlzIGNvbmZ1c2luZy5cbiAgICBjb25zdCBlZGl0YWJsZVByZWZpeFNob3duID0gb3B0aW9ucy5zb21lKFxuICAgICAgbyA9PiBvLnZhbHVlID09PSAneWVzLXByZWZpeC1lZGl0ZWQnLFxuICAgIClcbiAgICBpZiAoXG4gICAgICBcImV4dGVybmFsXCIgPT09ICdhbnQnICYmXG4gICAgICAhZWRpdGFibGVQcmVmaXhTaG93biAmJlxuICAgICAgaXNDbGFzc2lmaWVyUGVybWlzc2lvbnNFbmFibGVkKCkgJiZcbiAgICAgIG9uQ2xhc3NpZmllckRlc2NyaXB0aW9uQ2hhbmdlICYmXG4gICAgICAhaW5pdGlhbENsYXNzaWZpZXJEZXNjcmlwdGlvbkVtcHR5ICYmXG4gICAgICAhZGVzY3JpcHRpb25BbHJlYWR5RXhpc3RzKFxuICAgICAgICBjbGFzc2lmaWVyRGVzY3JpcHRpb24gPz8gJycsXG4gICAgICAgIGV4aXN0aW5nQWxsb3dEZXNjcmlwdGlvbnMsXG4gICAgICApICYmXG4gICAgICBkZWNpc2lvblJlYXNvbj8udHlwZSAhPT0gJ2NsYXNzaWZpZXInXG4gICAgKSB7XG4gICAgICBvcHRpb25zLnB1c2goe1xuICAgICAgICB0eXBlOiAnaW5wdXQnLFxuICAgICAgICBsYWJlbDogJ1llcywgYW5kIGRvblxcdTIwMTl0IGFzayBhZ2FpbiBmb3InLFxuICAgICAgICB2YWx1ZTogJ3llcy1jbGFzc2lmaWVyLXJldmlld2VkJyxcbiAgICAgICAgcGxhY2Vob2xkZXI6ICdkZXNjcmliZSB3aGF0IHRvIGFsbG93Li4uJyxcbiAgICAgICAgaW5pdGlhbFZhbHVlOiBjbGFzc2lmaWVyRGVzY3JpcHRpb24gPz8gJycsXG4gICAgICAgIG9uQ2hhbmdlOiBvbkNsYXNzaWZpZXJEZXNjcmlwdGlvbkNoYW5nZSxcbiAgICAgICAgYWxsb3dFbXB0eVN1Ym1pdFRvQ2FuY2VsOiB0cnVlLFxuICAgICAgICBzaG93TGFiZWxXaXRoVmFsdWU6IHRydWUsXG4gICAgICAgIGxhYmVsVmFsdWVTZXBhcmF0b3I6ICc6ICcsXG4gICAgICAgIHJlc2V0Q3Vyc29yT25VcGRhdGU6IHRydWUsXG4gICAgICB9KVxuICAgIH1cbiAgfVxuXG4gIGlmIChub0lucHV0TW9kZSkge1xuICAgIG9wdGlvbnMucHVzaCh7XG4gICAgICB0eXBlOiAnaW5wdXQnLFxuICAgICAgbGFiZWw6ICdObycsXG4gICAgICB2YWx1ZTogJ25vJyxcbiAgICAgIHBsYWNlaG9sZGVyOiAnYW5kIHRlbGwgQ2xhdWRlIHdoYXQgdG8gZG8gZGlmZmVyZW50bHknLFxuICAgICAgb25DaGFuZ2U6IG9uUmVqZWN0RmVlZGJhY2tDaGFuZ2UsXG4gICAgICBhbGxvd0VtcHR5U3VibWl0VG9DYW5jZWw6IHRydWUsXG4gICAgfSlcbiAgfSBlbHNlIHtcbiAgICBvcHRpb25zLnB1c2goe1xuICAgICAgbGFiZWw6ICdObycsXG4gICAgICB2YWx1ZTogJ25vJyxcbiAgICB9KVxuICB9XG5cbiAgcmV0dXJuIG9wdGlvbnNcbn1cbiJdLCJtYXBwaW5ncyI6IkFBQUEsU0FBU0EsY0FBYyxRQUFRLHFDQUFxQztBQUNwRSxTQUFTQyx5QkFBeUIsUUFBUSxpQ0FBaUM7QUFDM0UsU0FBU0MsOEJBQThCLFFBQVEsOENBQThDO0FBQzdGLGNBQWNDLHdCQUF3QixRQUFRLGdEQUFnRDtBQUM5RixjQUFjQyxnQkFBZ0IsUUFBUSxzREFBc0Q7QUFDNUYsU0FBU0MsNEJBQTRCLFFBQVEsaURBQWlEO0FBQzlGLGNBQWNDLHFCQUFxQixRQUFRLDhCQUE4QjtBQUN6RSxTQUFTQyw2QkFBNkIsUUFBUSw4QkFBOEI7QUFFNUUsT0FBTyxLQUFLQyxpQkFBaUIsR0FDekIsS0FBSyxHQUNMLHVCQUF1QixHQUN2QixtQkFBbUIsR0FDbkIseUJBQXlCLEdBQ3pCLElBQUk7O0FBRVI7QUFDQTtBQUNBO0FBQ0E7QUFDQSxTQUFTQyx3QkFBd0JBLENBQy9CQyxXQUFXLEVBQUUsTUFBTSxFQUNuQkMsb0JBQW9CLEVBQUUsTUFBTSxFQUFFLENBQy9CLEVBQUUsT0FBTyxDQUFDO0VBQ1QsTUFBTUMsVUFBVSxHQUFHRixXQUFXLENBQUNHLFdBQVcsQ0FBQyxDQUFDLENBQUNDLE9BQU8sQ0FB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

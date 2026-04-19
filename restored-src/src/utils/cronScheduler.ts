@@ -1,3 +1,12 @@
+/**
+ * Cron 调度核心模块。
+ *
+ * 在 Claude Code 系统中，该模块是 .claude/scheduled_tasks.json 任务调度的非 React 核心，
+ * 在 REPL（通过 useScheduledTasks）和 SDK/-p 模式（print.ts）中共用：
+ * - 轮询 getScheduledTasksEnabled() 直到启用
+ * - 加载任务并监听文件变化（file watch）
+ * - 按 cron 表达式计算下次执行时间，到期时触发任务回调
+ */
 // Non-React scheduler core for .claude/scheduled_tasks.json.
 // Shared by REPL (via useScheduledTasks) and SDK/-p mode (print.ts).
 //

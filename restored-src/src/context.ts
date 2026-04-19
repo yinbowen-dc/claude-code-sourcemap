@@ -1,3 +1,17 @@
+/**
+ * 会话上下文构建模块 - 为每次对话组装注入到系统提示的上下文内容
+ *
+ * 在整个系统流程中的位置：
+ * - 位于 query.ts / QueryEngine.ts 调用链的上游，是系统提示内容的来源之一
+ * - getSystemContext() 提供 git 状态等系统级信息，注入到 system prompt 中
+ * - getUserContext() 提供 CLAUDE.md 内容和当前日期，作为用户级上下文
+ * - 两个函数均使用 memoize 缓存，在一次会话中只读取一次（避免重复 I/O）
+ *
+ * 关键设计点：
+ * - git 状态是快照，不会在对话中途更新（仅在会话开始时采集）
+ * - CLAUDE.md 内容通过 setCachedClaudeMdContent 同步给 yoloClassifier.ts，避免循环依赖
+ * - systemPromptInjection 是内部调试用的临时注入（仅 ant 员工可见，BREAK_CACHE 特性门控）
+ */
 import { feature } from 'bun:bundle'
 import memoize from 'lodash-es/memoize.js'
 import {
@@ -17,15 +31,21 @@ import { getBranch, getDefaultBranch, getIsGit, gitExe } from './utils/git.js'
 import { shouldIncludeGitInstructions } from './utils/gitSettings.js'
 import { logError } from './utils/log.js'
 
+// git status 输出的最大字符数，超出部分截断并提示用户用 BashTool 查看完整状态
 const MAX_STATUS_CHARS = 2000
 
-// System prompt injection for cache breaking (ant-only, ephemeral debugging state)
+// 系统提示缓存破坏注入（仅 ant 内部使用，用于调试时强制刷新缓存，非持久化状态）
 let systemPromptInjection: string | null = null
 
+/** 获取当前系统提示注入内容 */
 export function getSystemPromptInjection(): string | null {
   return systemPromptInjection
 }
 
+/**
+ * 设置系统提示注入内容并立即清除上下文缓存
+ * 注入内容变化时必须清缓存，否则 getSystemContext/getUserContext 会返回旧值
+ */
 export function setSystemPromptInjection(value: string | null): void {
   systemPromptInjection = value
   // Clear context caches immediately when injection changes
@@ -33,6 +53,17 @@ export function setSystemPromptInjection(value: string | null): void {
   getSystemContext.cache.clear?.()
 }
 
+/**
+ * 获取 git 仓库状态快照（memoized，整个会话只执行一次）
+ *
+ * 流程：
+ * 1. 检查是否为 git 仓库，不是则返回 null
+ * 2. 并行执行：获取当前分支、默认分支、git status、最近提交、用户名
+ * 3. 对超长 status 输出进行截断（> 2000 字符）
+ * 4. 拼装成可读字符串返回，注入到 system prompt
+ *
+ * 注意：CCR 远程模式或禁用 git 指令时直接返回 null，跳过 git 操作
+ */
 export const getGitStatus = memoize(async (): Promise<string | null> => {
   if (process.env.NODE_ENV === 'test') {
     // Avoid cycles in tests

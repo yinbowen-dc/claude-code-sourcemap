@@ -1,3 +1,18 @@
+/**
+ * 文件描述符（FD）凭据读取模块（CCR 环境鉴权）。
+ *
+ * 在 Claude Code 系统中，该模块负责从文件描述符或磁盘预置文件中读取
+ * CCR（Claude Code Remote）环境注入的鉴权凭据（OAuth token 和 API key）。
+ *
+ * 读取优先级：
+ * 1. 文件描述符（FD）：由 Go env-manager 通过管道传入，进程内一次性读取
+ * 2. 预置文件（well-known file）：FD 读取成功后写入磁盘，供无法继承 FD 的
+ *    子进程（如 tmux 内启动的 shell）使用
+ *
+ * 路径常量：
+ * - CCR_OAUTH_TOKEN_PATH: /home/claude/.claude/remote/.oauth_token
+ * - CCR_API_KEY_PATH: /home/claude/.claude/remote/.api_key
+ */
 import { mkdirSync, writeFileSync } from 'fs'
 import {
   getApiKeyFromFd,
@@ -23,9 +38,8 @@ export const CCR_API_KEY_PATH = `${CCR_TOKEN_DIR}/.api_key`
 export const CCR_SESSION_INGRESS_TOKEN_PATH = `${CCR_TOKEN_DIR}/.session_ingress_token`
 
 /**
- * Best-effort write of the token to a well-known location for subprocess
- * access. CCR-gated: outside CCR there's no /home/claude/ and no reason to
- * put a token on disk that the FD was meant to keep off disk.
+ * 将 token 以尽力方式写入磁盘预置路径，供子进程访问。
+ * 仅在 CCR 环境（CLAUDE_CODE_REMOTE=1）中执行；非 CCR 环境跳过。
  */
 export function maybePersistTokenForSubprocesses(
   path: string,
@@ -50,9 +64,8 @@ export function maybePersistTokenForSubprocesses(
 }
 
 /**
- * Fallback read from a well-known file. The path only exists in CCR (env-manager
- * creates the directory), so file-not-found is the expected outcome everywhere
- * else — treated as "no fallback", not an error.
+ * 从磁盘预置路径读取 token（回退路径）。
+ * 仅在 CCR 中存在该路径，在其他环境中文件不存在时静默返回 null。
  */
 export function readTokenFromWellKnownFile(
   path: string,
@@ -82,17 +95,8 @@ export function readTokenFromWellKnownFile(
 }
 
 /**
- * Shared FD-or-well-known-file credential reader.
- *
- * Priority order:
- *  1. File descriptor (legacy path) — env var points at a pipe FD passed by
- *     the Go env-manager via cmd.ExtraFiles. Pipe is drained on first read
- *     and doesn't cross exec/tmux boundaries.
- *  2. Well-known file — written by this function on successful FD read (and
- *     eventually by the env-manager directly). Covers subprocesses that can't
- *     inherit the FD.
- *
- * Returns null if neither source has a credential. Cached in global state.
+ * 通用 FD 或磁盘预置文件凭据读取器。
+ * 先尝试 FD，失败时回退到磁盘预置文件；结果缓存到全局状态，避免重复读取。
  */
 function getCredentialFromFd({
   envVar,
@@ -166,9 +170,9 @@ function getCredentialFromFd({
 }
 
 /**
- * Get the CCR-injected OAuth token. See getCredentialFromFd for FD-vs-disk
- * rationale. Env var: CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR.
- * Well-known file: /home/claude/.claude/remote/.oauth_token.
+ * 获取 CCR 注入的 OAuth token。
+ * 环境变量：CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR
+ * 预置文件：/home/claude/.claude/remote/.oauth_token
  */
 export function getOAuthTokenFromFileDescriptor(): string | null {
   return getCredentialFromFd({
@@ -181,9 +185,9 @@ export function getOAuthTokenFromFileDescriptor(): string | null {
 }
 
 /**
- * Get the CCR-injected API key. See getCredentialFromFd for FD-vs-disk
- * rationale. Env var: CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR.
- * Well-known file: /home/claude/.claude/remote/.api_key.
+ * 获取 CCR 注入的 API key。
+ * 环境变量：CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR
+ * 预置文件：/home/claude/.claude/remote/.api_key
  */
 export function getApiKeyFromFileDescriptor(): string | null {
   return getCredentialFromFd({

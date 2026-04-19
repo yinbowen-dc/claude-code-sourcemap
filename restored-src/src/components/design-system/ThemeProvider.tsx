@@ -1,3 +1,26 @@
+/**
+ * ThemeProvider.tsx — 主题系统 Provider 与相关 Hooks
+ *
+ * 在 Claude Code 系统流程中的位置：
+ *   设计系统（design-system）层 → 主题管理 → 全局主题上下文提供者
+ *
+ * 主要功能：
+ *   1. ThemeProvider：React Context Provider，向整棵组件树提供主题状态。
+ *      管理三类状态：
+ *        - themeSetting：用户持久化偏好（可为 'auto'/'dark'/'light'）
+ *        - previewTheme：主题选择器打开时的临时预览主题（null 表示无预览）
+ *        - systemTheme：当设置为 'auto' 时，通过 OSC 11 协议检测到的终端实际主题
+ *   2. useTheme()：最常用的 Hook，返回 [已解析主题名, setter]，
+ *      解析后永不返回 'auto'（自动转换为实际的 'dark'/'light'）。
+ *   3. useThemeSetting()：返回原始配置值（包含 'auto'），供主题选择器使用。
+ *   4. usePreviewTheme()：返回预览相关操作（setPreviewTheme/savePreview/cancelPreview）。
+ *   5. AUTO_THEME 特性标志：通过 feature('AUTO_THEME') 动态加载 systemThemeWatcher，
+ *      在外部构建中通过 dead-code elimination 移除，避免包体积膨胀。
+ *
+ * 使用场景：
+ *   在应用根部包裹整个 UI 树，使 ThemedBox/ThemedText 等组件
+ *   通过 useTheme() 获取当前主题进行颜色解析。
+ */
 import { c as _c } from "react/compiler-runtime";
 import { feature } from 'bun:bundle';
 import React, { createContext, useContext, useEffect, useMemo, useState } from 'react';
@@ -5,19 +28,21 @@ import useStdin from '../../ink/hooks/use-stdin.js';
 import { getGlobalConfig, saveGlobalConfig } from '../../utils/config.js';
 import { getSystemThemeName, type SystemTheme } from '../../utils/systemTheme.js';
 import type { ThemeName, ThemeSetting } from '../../utils/theme.js';
+// ThemeContext 的值类型：包含主题读写所有操作
 type ThemeContextValue = {
-  /** The saved user preference. May be 'auto'. */
+  /** 用户保存的主题偏好，可能是 'auto'（跟随系统） */
   themeSetting: ThemeSetting;
   setThemeSetting: (setting: ThemeSetting) => void;
   setPreviewTheme: (setting: ThemeSetting) => void;
   savePreview: () => void;
   cancelPreview: () => void;
-  /** The resolved theme to render with. Never 'auto'. */
+  /** 实际用于渲染的主题名称，永远不会是 'auto' */
   currentTheme: ThemeName;
 };
 
-// Non-'auto' default so useTheme() works without a provider (tests, tooling).
+// 默认主题为 'dark'（非 'auto'），保证 useTheme() 在无 Provider 时（测试/工具环境）也能正常使用
 const DEFAULT_THEME: ThemeName = 'dark';
+// 创建 ThemeContext，提供安全的空操作默认值（Provider 未挂载时不会报错）
 const ThemeContext = createContext<ThemeContextValue>({
   themeSetting: DEFAULT_THEME,
   setThemeSetting: () => {},
@@ -31,74 +56,110 @@ type Props = {
   initialState?: ThemeSetting;
   onThemeSave?: (setting: ThemeSetting) => void;
 };
+/**
+ * defaultInitialTheme — 读取全局配置中用户保存的主题偏好
+ * 作为 ThemeProvider 的默认 initialState 获取函数。
+ */
 function defaultInitialTheme(): ThemeSetting {
   return getGlobalConfig().theme;
 }
+
+/**
+ * defaultSaveTheme — 将主题偏好写回全局配置文件
+ * 作为 ThemeProvider 的默认 onThemeSave 回调。
+ */
 function defaultSaveTheme(setting: ThemeSetting): void {
   saveGlobalConfig(current => ({
     ...current,
     theme: setting
   }));
 }
+/**
+ * ThemeProvider — 主题上下文 Provider 组件
+ *
+ * 整体流程：
+ *   1. 初始化 themeSetting 状态（从 initialState 或读取全局配置）
+ *   2. 初始化 previewTheme 状态（主题选择器临时预览，null=无预览）
+ *   3. 初始化 systemTheme 状态：仅当初始设置为 'auto' 时才调用 getSystemThemeName()
+ *      获取终端实际主题（通过 $COLORFGBG 环境变量或 OSC 11），否则默认 'dark'
+ *   4. activeSetting = previewTheme ?? themeSetting（预览模式优先）
+ *   5. useEffect 监听 activeSetting 变化：当且仅当 activeSetting==='auto' 且
+ *      AUTO_THEME feature flag 开启时，动态加载 systemThemeWatcher 并启动 OSC 11 监听
+ *   6. currentTheme = activeSetting==='auto' ? systemTheme : activeSetting（解析 auto）
+ *   7. useMemo 构建 context value（含所有操作函数），deps 为 [themeSetting, previewTheme, currentTheme, onThemeSave]
+ *   8. 渲染 ThemeContext.Provider
+ *
+ * 在系统中的作用：
+ *   整个 Claude Code 终端 UI 的主题管理核心，
+ *   所有主题读写操作通过此 Provider 统一协调。
+ */
 export function ThemeProvider({
   children,
   initialState,
   onThemeSave = defaultSaveTheme
 }: Props) {
+  // 主题偏好设置状态（持久化到全局配置）
   const [themeSetting, setThemeSetting] = useState(initialState ?? defaultInitialTheme);
+  // 预览主题状态（主题选择器打开时的临时设置，关闭后恢复为 null）
   const [previewTheme, setPreviewTheme] = useState<ThemeSetting | null>(null);
 
-  // Track terminal theme for 'auto' resolution. Seeds from $COLORFGBG (or
-  // 'dark' if unset); the OSC 11 watcher corrects it on first poll.
+  // 跟踪终端实际主题，用于 'auto' 模式的解析。
+  // 初始值：若初始设置为 'auto' 则调用 getSystemThemeName() 读取 $COLORFGBG，
+  // 否则默认 'dark'；OSC 11 watcher 启动后会修正为更精确的值。
   const [systemTheme, setSystemTheme] = useState<SystemTheme>(() => (initialState ?? themeSetting) === 'auto' ? getSystemThemeName() : 'dark');
 
-  // The setting currently in effect (preview wins while picker is open)
+  // activeSetting：当前实际生效的设置（预览模式下以预览主题为准）
   const activeSetting = previewTheme ?? themeSetting;
   const {
     internal_querier
   } = useStdin();
 
-  // Watch for live terminal theme changes while 'auto' is active.
-  // Positive feature() pattern so the watcher import is dead-code-eliminated
-  // in external builds.
+  // 当 activeSetting 为 'auto' 时，动态加载并启动 OSC 11 终端主题监听。
+  // feature('AUTO_THEME') 正向检查模式：外部构建中 dead-code-eliminated，
+  // 不会将 watcher 代码打包进去。
   useEffect(() => {
     if (feature('AUTO_THEME')) {
+      // 非 auto 模式或无法查询终端时提前退出
       if (activeSetting !== 'auto' || !internal_querier) return;
       let cleanup: (() => void) | undefined;
       let cancelled = false;
+      // 动态导入避免在非 auto 模式下加载 watcher 代码
       void import('../../utils/systemThemeWatcher.js').then(({
         watchSystemTheme
       }) => {
-        if (cancelled) return;
+        if (cancelled) return; // 组件已卸载，忽略回调
         cleanup = watchSystemTheme(internal_querier, setSystemTheme);
       });
       return () => {
-        cancelled = true;
-        cleanup?.();
+        cancelled = true;   // 标记已取消，防止 Promise 回调在卸载后执行
+        cleanup?.();        // 清理 OSC 11 监听器
       };
     }
   }, [activeSetting, internal_querier]);
+  // 解析 currentTheme：'auto' → 取 systemTheme，否则直接取 activeSetting
   const currentTheme: ThemeName = activeSetting === 'auto' ? systemTheme : activeSetting;
+  // 构建 context value，useMemo 避免每次渲染都创建新对象导致子树重渲染
   const value = useMemo<ThemeContextValue>(() => ({
     themeSetting,
     setThemeSetting: (newSetting: ThemeSetting) => {
       setThemeSetting(newSetting);
-      setPreviewTheme(null);
-      // Switching to 'auto' restarts the watcher (activeSetting dep), whose
-      // first poll fires immediately. Seed from the cache so the OSC
-      // round-trip doesn't flash the wrong palette.
+      setPreviewTheme(null); // 确认新设置时清除预览状态
+      // 切换到 'auto' 时重启 watcher（activeSetting dep 变化触发 useEffect）。
+      // 用缓存值预填 systemTheme，避免 OSC 11 往返延迟期间闪烁错误调色板。
       if (newSetting === 'auto') {
         setSystemTheme(getSystemThemeName());
       }
-      onThemeSave?.(newSetting);
+      onThemeSave?.(newSetting); // 回调写入配置文件
     },
     setPreviewTheme: (newSetting_0: ThemeSetting) => {
       setPreviewTheme(newSetting_0);
+      // 预览 'auto' 时也需要初始化 systemTheme
       if (newSetting_0 === 'auto') {
         setSystemTheme(getSystemThemeName());
       }
     },
     savePreview: () => {
+      // 将当前预览主题确认为正式主题设置并保存
       if (previewTheme !== null) {
         setThemeSetting(previewTheme);
         setPreviewTheme(null);
@@ -106,45 +167,75 @@ export function ThemeProvider({
       }
     },
     cancelPreview: () => {
+      // 取消预览，恢复到用户已保存的 themeSetting
       if (previewTheme !== null) {
         setPreviewTheme(null);
       }
     },
     currentTheme
   }), [themeSetting, previewTheme, currentTheme, onThemeSave]);
+  // 渲染 Provider，将主题 context 注入子树
   return <ThemeContext.Provider value={value}>{children}</ThemeContext.Provider>;
 }
 
 /**
- * Returns the resolved theme for rendering (never 'auto') and a setter that
- * accepts any ThemeSetting (including 'auto').
+ * useTheme — 获取已解析的当前主题名称（永不为 'auto'）及主题 setter
+ *
+ * 整体流程：
+ *   1. 从 ThemeContext 取出 currentTheme（已解析为 'dark'/'light'）和 setThemeSetting
+ *   2. React Compiler 记忆化（_c(3)）：仅当两者之一变化时重新构建数组，避免无谓引用变化
+ *   3. 返回 [currentTheme, setThemeSetting] 元组
+ *
+ * 在系统中的作用：
+ *   ThemedBox/ThemedText 等组件通过此 Hook 获取当前主题进行颜色解析。
  */
 export function useTheme() {
+  // 初始化大小为 3 的记忆缓存（输入2个，输出1个）
   const $ = _c(3);
   const {
     currentTheme,
     setThemeSetting
   } = useContext(ThemeContext);
   let t0;
+  // 若 currentTheme 或 setThemeSetting 变化，重新构建数组并缓存
   if ($[0] !== currentTheme || $[1] !== setThemeSetting) {
     t0 = [currentTheme, setThemeSetting];
     $[0] = currentTheme;
     $[1] = setThemeSetting;
     $[2] = t0;
   } else {
+    // 缓存命中：直接返回上次数组，保持引用稳定性
     t0 = $[2];
   }
   return t0;
 }
 
 /**
- * Returns the raw theme setting as stored in config. Use this in UI that
- * needs to show 'auto' as a distinct choice (e.g., ThemePicker).
+ * useThemeSetting — 获取原始主题设置值（包括 'auto'）
+ *
+ * 整体流程：
+ *   直接从 ThemeContext 取出 themeSetting 并返回，不经过解析。
+ *
+ * 在系统中的作用：
+ *   主题选择器（ThemePicker）使用此 Hook 显示包含 'auto' 在内的完整选项。
  */
 export function useThemeSetting() {
   return useContext(ThemeContext).themeSetting;
 }
+
+/**
+ * usePreviewTheme — 获取主题预览操作对象
+ *
+ * 整体流程：
+ *   1. 从 ThemeContext 取出三个预览相关方法
+ *   2. React Compiler 记忆化（_c(4)）：任一方法引用变化时重新构建对象
+ *   3. 返回 { setPreviewTheme, savePreview, cancelPreview }
+ *
+ * 在系统中的作用：
+ *   主题选择器打开时，通过此 Hook 管理临时预览状态。
+ */
 export function usePreviewTheme() {
+  // 初始化大小为 4 的记忆缓存（输入3个，输出1个）
   const $ = _c(4);
   const {
     setPreviewTheme,
@@ -152,6 +243,7 @@ export function usePreviewTheme() {
     cancelPreview
   } = useContext(ThemeContext);
   let t0;
+  // 若任一方法引用变化，重新构建对象
   if ($[0] !== cancelPreview || $[1] !== savePreview || $[2] !== setPreviewTheme) {
     t0 = {
       setPreviewTheme,
@@ -163,6 +255,7 @@ export function usePreviewTheme() {
     $[2] = setPreviewTheme;
     $[3] = t0;
   } else {
+    // 缓存命中：复用对象，保持引用稳定性
     t0 = $[3];
   }
   return t0;

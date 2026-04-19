@@ -1,3 +1,28 @@
+/**
+ * DiffDetailView.tsx — 单文件差异内容详情展示组件
+ *
+ * 在 Claude Code 系统流程中的位置：
+ *   工具响应层 → 差异展示 → 单文件详情视图（DiffDialog 的内容区）
+ *
+ * 主要功能：
+ *   1. DiffDetailView：React 组件，渲染单个文件的完整差异内容。
+ *      根据文件状态分 4 种渲染路径：
+ *      - isUntracked：新未追踪文件，显示提示运行 git add 的说明
+ *      - isBinary：二进制文件，显示"无法展示 diff"提示
+ *      - isLargeFile：超大文件（>1MB），显示超限提示
+ *      - 正常文件：使用 StructuredDiff 逐块（hunk）渲染，支持字级别 diff 和语法高亮
+ *
+ * 核心技术：
+ *   - StructuredDiff：字级别差异渲染 + 语法高亮（需要 filePath 和 fileContent）
+ *   - readFileSafe：同步读取文件内容，用于语法检测和多行结构处理
+ *   - useTerminalSize：获取终端列宽，用于计算 diff 宽度（减去边框和内边距共 4 列）
+ *   - 最多渲染 400 行（解析器限制），超出时显示截断提示
+ *
+ * React Compiler 缓存槽分配（_c(53)）：
+ *   $[0]：filePath 为空时的静态返回值（sentinel 缓存）
+ *   $[1]-$[6]：以 filePath 为依赖的文件内容读取结果（content、firstLine、fileContent）
+ *   $[7]-$[52]：四条渲染路径及最终 JSX 的各层缓存
+ */
 import { c as _c } from "react/compiler-runtime";
 import type { StructuredPatchHunk } from 'diff';
 import { resolve } from 'path';
@@ -8,6 +33,8 @@ import { getCwd } from '../../utils/cwd.js';
 import { readFileSafe } from '../../utils/file.js';
 import { Divider } from '../design-system/Divider.js';
 import { StructuredDiff } from '../StructuredDiff.js';
+
+// Props 类型：filePath 文件路径，hunks 差异块数组，及各文件状态标志
 type Props = {
   filePath: string;
   hunks: StructuredPatchHunk[];
@@ -18,11 +45,332 @@ type Props = {
 };
 
 /**
- * Displays the diff content for a single file.
- * Uses StructuredDiff for word-level diffing and syntax highlighting.
- * No scrolling - renders all lines (max 400 due to parsing limits).
+ * DiffDetailView 组件
+ *
+ * 整体流程：
+ *   1. 解构所有 Props（filePath、hunks 及状态标志）
+ *   2. 获取终端列宽（columns），用于计算 diff 渲染宽度
+ *   3. 通过 useMemo 读取文件内容（等效）：
+ *      - filePath 为空 → 返回 { firstLine: null, fileContent: undefined }（sentinel 缓存）
+ *      - filePath 有值 → resolve 绝对路径，readFileSafe 读取内容，提取首行和完整内容
+ *      缓存于 $[0]-$[6]
+ *   4. isUntracked 分支：渲染文件名 + "(untracked)" + git add 提示
+ *   5. isBinary 分支：渲染文件名 + "Binary file - cannot display diff"
+ *   6. isLargeFile 分支：渲染文件名 + "Large file - diff exceeds 1 MB limit"
+ *   7. 正常分支：渲染文件名（可选 "(truncated)" 标记）+ Divider +
+ *      hunks 的 StructuredDiff 组件列表（或"No diff content"）+
+ *      可选截断提示文本
+ *
+ * 在系统中的角色：
+ *   作为 DiffDialog 中的详情内容区，提供单文件的完整可读差异展示。
  */
 export function DiffDetailView(t0) {
+  // _c(53)：初始化 53 个 React Compiler 记忆缓存槽
+  const $ = _c(53);
+  const {
+    filePath,
+    hunks,
+    isLargeFile,
+    isBinary,
+    isTruncated,
+    isUntracked
+  } = t0;
+
+  // 获取终端宽度，用于计算 StructuredDiff 的可用列数
+  const {
+    columns
+  } = useTerminalSize();
+
+  let t1;
+  // bb0 标签块：等效于 useMemo，以 filePath 为依赖读取文件内容
+  bb0: {
+    if (!filePath) {
+      // filePath 为空：返回空值对象（sentinel 缓存，只创建一次）
+      let t2;
+      if ($[0] === Symbol.for("react.memo_cache_sentinel")) {
+        t2 = {
+          firstLine: null,
+          fileContent: undefined
+        };
+        $[0] = t2;
+      } else {
+        t2 = $[0];
+      }
+      t1 = t2;
+      break bb0;
+    }
+
+    // filePath 有值：读取文件内容（以 filePath 为依赖缓存）
+    let content;
+    let t2;
+    if ($[1] !== filePath) {
+      // filePath 变化：重新解析绝对路径并读取文件
+      const fullPath = resolve(getCwd(), filePath);
+      content = readFileSafe(fullPath);
+      // 提取首行（用于语法检测），文件不存在时返回 null
+      t2 = content?.split("\n")[0] ?? null;
+      $[1] = filePath;   // 存储依赖
+      $[2] = content;    // 存储文件内容
+      $[3] = t2;         // 存储首行
+    } else {
+      // filePath 未变：复用缓存的内容和首行
+      content = $[2];
+      t2 = $[3];
+    }
+
+    // 将 null content 转换为 undefined（类型兼容）
+    const t3 = content ?? undefined;
+    let t4;
+    // 以 firstLine 和 fileContent 为双重依赖缓存返回对象
+    if ($[4] !== t2 || $[5] !== t3) {
+      t4 = {
+        firstLine: t2,
+        fileContent: t3
+      };
+      $[4] = t2;   // 存储 firstLine 依赖
+      $[5] = t3;   // 存储 fileContent 依赖
+      $[6] = t4;   // 存储结果对象
+    } else {
+      t4 = $[6];
+    }
+    t1 = t4;
+  }
+
+  // 解构文件内容相关值
+  const {
+    firstLine,
+    fileContent
+  } = t1;
+
+  // 分支 1：未追踪文件（新文件尚未 git add）
+  if (isUntracked) {
+    let t2;
+    // $[7]-$[8] 槽：以 filePath 为依赖缓存文件名标题
+    if ($[7] !== filePath) {
+      t2 = <Text bold={true}>{filePath}</Text>;
+      $[7] = filePath;
+      $[8] = t2;
+    } else {
+      t2 = $[8];
+    }
+    let t3;
+    // $[9] 槽：静态 "(untracked)" 标签，sentinel 缓存
+    if ($[9] === Symbol.for("react.memo_cache_sentinel")) {
+      t3 = <Text dimColor={true}> (untracked)</Text>;
+      $[9] = t3;
+    } else {
+      t3 = $[9];
+    }
+    let t4;
+    // $[10]-$[11] 槽：以 t2（文件名）为依赖缓存标题行 Box
+    if ($[10] !== t2) {
+      t4 = <Box>{t2}{t3}</Box>;
+      $[10] = t2;
+      $[11] = t4;
+    } else {
+      t4 = $[11];
+    }
+    let t5;
+    // $[12] 槽：静态 Divider，sentinel 缓存
+    if ($[12] === Symbol.for("react.memo_cache_sentinel")) {
+      t5 = <Divider padding={4} />;
+      $[12] = t5;
+    } else {
+      t5 = $[12];
+    }
+    let t6;
+    // $[13] 槽：静态"New file not yet staged"文本，sentinel 缓存
+    if ($[13] === Symbol.for("react.memo_cache_sentinel")) {
+      t6 = <Text dimColor={true} italic={true}>New file not yet staged.</Text>;
+      $[13] = t6;
+    } else {
+      t6 = $[13];
+    }
+    let t7;
+    // $[14]-$[15] 槽：以 filePath 为依赖缓存 git add 提示文本
+    if ($[14] !== filePath) {
+      t7 = <Box flexDirection="column">{t6}<Text dimColor={true} italic={true}>Run `git add {filePath}` to see line counts.</Text></Box>;
+      $[14] = filePath;
+      $[15] = t7;
+    } else {
+      t7 = $[15];
+    }
+    let t8;
+    // $[16]-$[18] 槽：以 t4（标题行）和 t7（提示文本）为依赖缓存完整布局
+    if ($[16] !== t4 || $[17] !== t7) {
+      t8 = <Box flexDirection="column" width="100%">{t4}{t5}{t7}</Box>;
+      $[16] = t4;
+      $[17] = t7;
+      $[18] = t8;
+    } else {
+      t8 = $[18];
+    }
+    return t8;
+  }
+
+  // 分支 2：二进制文件（无法展示文本 diff）
+  if (isBinary) {
+    let t2;
+    // $[19]-$[20] 槽：以 filePath 为依赖缓存文件名标题行
+    if ($[19] !== filePath) {
+      t2 = <Box><Text bold={true}>{filePath}</Text></Box>;
+      $[19] = filePath;
+      $[20] = t2;
+    } else {
+      t2 = $[20];
+    }
+    let t3;
+    // $[21] 槽：静态 Divider，sentinel 缓存
+    if ($[21] === Symbol.for("react.memo_cache_sentinel")) {
+      t3 = <Divider padding={4} />;
+      $[21] = t3;
+    } else {
+      t3 = $[21];
+    }
+    let t4;
+    // $[22] 槽：静态二进制文件提示，sentinel 缓存
+    if ($[22] === Symbol.for("react.memo_cache_sentinel")) {
+      t4 = <Box flexDirection="column"><Text dimColor={true} italic={true}>Binary file - cannot display diff</Text></Box>;
+      $[22] = t4;
+    } else {
+      t4 = $[22];
+    }
+    let t5;
+    // $[23]-$[24] 槽：以 t2（标题行）为依赖缓存完整布局
+    if ($[23] !== t2) {
+      t5 = <Box flexDirection="column" width="100%">{t2}{t3}{t4}</Box>;
+      $[23] = t2;
+      $[24] = t5;
+    } else {
+      t5 = $[24];
+    }
+    return t5;
+  }
+
+  // 分支 3：超大文件（diff 超过 1MB 限制）
+  if (isLargeFile) {
+    let t2;
+    // $[25]-$[26] 槽：以 filePath 为依赖缓存文件名标题行
+    if ($[25] !== filePath) {
+      t2 = <Box><Text bold={true}>{filePath}</Text></Box>;
+      $[25] = filePath;
+      $[26] = t2;
+    } else {
+      t2 = $[26];
+    }
+    let t3;
+    // $[27] 槽：静态 Divider，sentinel 缓存
+    if ($[27] === Symbol.for("react.memo_cache_sentinel")) {
+      t3 = <Divider padding={4} />;
+      $[27] = t3;
+    } else {
+      t3 = $[27];
+    }
+    let t4;
+    // $[28] 槽：静态大文件提示，sentinel 缓存
+    if ($[28] === Symbol.for("react.memo_cache_sentinel")) {
+      t4 = <Box flexDirection="column"><Text dimColor={true} italic={true}>Large file - diff exceeds 1 MB limit</Text></Box>;
+      $[28] = t4;
+    } else {
+      t4 = $[28];
+    }
+    let t5;
+    // $[29]-$[30] 槽：以 t2（标题行）为依赖缓存完整布局
+    if ($[29] !== t2) {
+      t5 = <Box flexDirection="column" width="100%">{t2}{t3}{t4}</Box>;
+      $[29] = t2;
+      $[30] = t5;
+    } else {
+      t5 = $[30];
+    }
+    return t5;
+  }
+
+  // 分支 4：正常文件 diff 渲染
+  let t2;
+  // $[31]-$[32] 槽：以 filePath 为依赖缓存文件名加粗文本
+  if ($[31] !== filePath) {
+    t2 = <Text bold={true}>{filePath}</Text>;
+    $[31] = filePath;
+    $[32] = t2;
+  } else {
+    t2 = $[32];
+  }
+  let t3;
+  // $[33]-$[34] 槽：以 isTruncated 为依赖缓存截断标记文本（条件渲染）
+  if ($[33] !== isTruncated) {
+    t3 = isTruncated && <Text dimColor={true}> (truncated)</Text>;
+    $[33] = isTruncated;
+    $[34] = t3;
+  } else {
+    t3 = $[34];
+  }
+  let t4;
+  // $[35]-$[37] 槽：以 t2（文件名）和 t3（截断标记）为依赖缓存标题行 Box
+  if ($[35] !== t2 || $[36] !== t3) {
+    t4 = <Box>{t2}{t3}</Box>;
+    $[35] = t2;
+    $[36] = t3;
+    $[37] = t4;
+  } else {
+    t4 = $[37];
+  }
+  let t5;
+  // $[38] 槽：静态 Divider，sentinel 缓存
+  if ($[38] === Symbol.for("react.memo_cache_sentinel")) {
+    t5 = <Divider padding={4} />;
+    $[38] = t5;
+  } else {
+    t5 = $[38];
+  }
+  let t6;
+  // $[39]-$[44] 槽：以 columns、fileContent、filePath、firstLine、hunks 为五重依赖缓存 diff 块
+  if ($[39] !== columns || $[40] !== fileContent || $[41] !== filePath || $[42] !== firstLine || $[43] !== hunks) {
+    // 无 hunk 时显示"No diff content"；有 hunk 时逐块渲染 StructuredDiff
+    // 宽度 = 终端列数 - 外边距 2 - 边框 2 = columns - 4
+    t6 = hunks.length === 0 ? <Text dimColor={true}>No diff content</Text> : hunks.map((hunk, index) => <StructuredDiff key={index} patch={hunk} filePath={filePath} firstLine={firstLine} fileContent={fileContent} dim={false} width={columns - 2 - 2} />);
+    $[39] = columns;       // 存储 columns 依赖
+    $[40] = fileContent;   // 存储 fileContent 依赖
+    $[41] = filePath;      // 存储 filePath 依赖
+    $[42] = firstLine;     // 存储 firstLine 依赖
+    $[43] = hunks;         // 存储 hunks 依赖
+    $[44] = t6;            // 存储 diff 块结果
+  } else {
+    // 所有依赖均未变：复用缓存的 diff 块
+    t6 = $[44];
+  }
+  let t7;
+  // $[45]-$[46] 槽：以 t6（diff 块）为依赖缓存 diff 块容器
+  if ($[45] !== t6) {
+    t7 = <Box flexDirection="column">{t6}</Box>;
+    $[45] = t6;
+    $[46] = t7;
+  } else {
+    t7 = $[46];
+  }
+  let t8;
+  // $[47]-$[48] 槽：以 isTruncated 为依赖缓存截断提示文本（条件渲染）
+  if ($[47] !== isTruncated) {
+    t8 = isTruncated && <Text dimColor={true} italic={true}>… diff truncated (exceeded 400 line limit)</Text>;
+    $[47] = isTruncated;
+    $[48] = t8;
+  } else {
+    t8 = $[48];
+  }
+  let t9;
+  // $[49]-$[52] 槽：以 t4（标题行）、t7（diff 块）、t8（截断提示）为依赖缓存完整布局
+  if ($[49] !== t4 || $[50] !== t7 || $[51] !== t8) {
+    t9 = <Box flexDirection="column" width="100%">{t4}{t5}{t7}{t8}</Box>;
+    $[49] = t4;   // 存储标题行依赖
+    $[50] = t7;   // 存储 diff 块依赖
+    $[51] = t8;   // 存储截断提示依赖
+    $[52] = t9;   // 存储完整布局
+  } else {
+    // 均未变：复用缓存的完整布局
+    t9 = $[52];
+  }
+  return t9;
+}
   const $ = _c(53);
   const {
     filePath,

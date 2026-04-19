@@ -1,3 +1,26 @@
+/**
+ * 【ExitWorktreeTool 提示词模块】
+ *
+ * 在 Claude Code 系统流程中的位置：
+ *   本文件为 ExitWorktreeTool 提供发送给 Claude 模型的工具使用说明（system prompt 片段）。
+ *   ExitWorktreeTool.ts 的 prompt() 钩子调用 getExitWorktreeToolPrompt() 生成此内容。
+ *
+ * 主要功能：
+ *   - 说明工具的作用域：仅操作本会话中由 EnterWorktree 创建的 worktree
+ *   - 描述使用时机：用户明确要求"退出 worktree"时调用
+ *   - 列出 action 参数的语义（keep / remove）和 discard_changes 的用法
+ *   - 说明退出后的行为：恢复原始 CWD、清除缓存、tmux 会话处理
+ */
+
+/**
+ * 生成 ExitWorktreeTool 的工具提示词字符串。
+ *
+ * 内容结构：
+ * - Scope：说明哪些 worktree 在操作范围内（仅限当前会话 EnterWorktree 创建的）
+ * - When to Use：仅限用户明确要求退出时调用
+ * - Parameters：action（keep/remove）和 discard_changes（强制丢弃变更标志）
+ * - Behavior：退出效果——恢复 CWD、清缓存、tmux 处理
+ */
 export function getExitWorktreeToolPrompt(): string {
   return `Exit a worktree session created by EnterWorktree and return the session to the original working directory.
 

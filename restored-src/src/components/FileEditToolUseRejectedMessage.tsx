@@ -1,3 +1,22 @@
+/**
+ * FileEditToolUseRejectedMessage.tsx — 文件编辑工具被用户拒绝时的消息展示组件
+ *
+ * 在 Claude Code 系统流程中的位置：
+ *   工具调用结果渲染 → FileEditToolUseRejectedMessage
+ *   → 当用户拒绝 FileEditTool 的写入/更新操作时，展示操作被拒绝的摘要或内容预览
+ *
+ * 主要功能：
+ *   FileEditToolUseRejectedMessage：React 函数组件，根据操作类型和显示模式，
+ *   以四条渲染路径之一展示被拒绝的文件操作摘要：
+ *     路径1：condensed 模式（非 verbose）→ 仅显示纯文本提示
+ *     路径2：write 操作 + 有 content → 显示截断的代码高亮预览（最多 MAX_LINES_TO_RENDER 行）
+ *     路径3：无 patch 或 patch 为空 → 仅显示纯文本提示
+ *     路径4：update 操作 + 有效 patch → 显示完整的结构化 diff（dim 模式）
+ *
+ * React Compiler 优化：
+ *   - 使用 _c(38) 分配 38 个记忆化缓存槽，对所有 JSX 节点和计算值进行细粒度缓存
+ *   - 每个 JSX 片段在依赖 props 未变化时直接复用缓存，避免不必要的重渲染
+ */
 import { c as _c } from "react/compiler-runtime";
 import type { StructuredPatchHunk } from 'diff';
 import { relative } from 'path';
@@ -8,6 +27,7 @@ import { Box, Text } from '../ink.js';
 import { HighlightedCode } from './HighlightedCode.js';
 import { MessageResponse } from './MessageResponse.js';
 import { StructuredDiffList } from './StructuredDiffList.js';
+// 内容预览模式下最多渲染的行数，超出部分用"… +N lines"折叠
 const MAX_LINES_TO_RENDER = 10;
 type Props = {
   file_path: string;
@@ -21,7 +41,30 @@ type Props = {
   style?: 'condensed';
   verbose: boolean;
 };
+/**
+ * FileEditToolUseRejectedMessage
+ *
+ * 整体流程：
+ *   1. 从 props 解构所有字段，获取终端列宽（columns）用于计算代码/diff 宽度
+ *   2. 构建通用文本头部（text）：
+ *      "User rejected {operation} to {filePath}"
+ *      - verbose=true → 显示绝对路径；verbose=false → 显示相对于 cwd 的路径
+ *   3. 按优先级依次检查四条渲染路径：
+ *      路径1：style==='condensed' && !verbose → 仅返回文本提示（MessageResponse）
+ *      路径2：operation==='write' && content !== undefined
+ *             → 截断为 MAX_LINES_TO_RENDER 行，展示 HighlightedCode（dim）
+ *               + 可选的"… +N lines"折叠提示
+ *      路径3：!patch || patch.length===0 → 仅返回文本提示（MessageResponse）
+ *      路径4：其他（update 操作有效 patch）
+ *             → 展示 StructuredDiffList（dim），columns-12 宽度
+ *
+ * 在系统中的角色：
+ *   是 FileEditTool 操作被用户拒绝时的唯一展示组件，
+ *   与 FileEditToolUpdatedMessage（成功路径）相对应，
+ *   为用户提供被拒绝操作的内容上下文。
+ */
 export function FileEditToolUseRejectedMessage(t0) {
+  // React Compiler 分配 38 个缓存槽，对所有 JSX 和计算值进行细粒度记忆化
   const $ = _c(38);
   const {
     file_path,
@@ -33,9 +76,13 @@ export function FileEditToolUseRejectedMessage(t0) {
     style,
     verbose
   } = t0;
+  // 获取终端列宽，用于确定代码预览和 diff 的渲染宽度
   const {
     columns
   } = useTerminalSize();
+
+  // ── 构建文本头部（t1）：含 operation 类型的操作描述 ──
+  // 缓存槽 $[0]/$[1]：operation 变化时重新创建"User rejected {operation} to"文本节点
   let t1;
   if ($[0] !== operation) {
     t1 = <Text color="subtle">User rejected {operation} to </Text>;
@@ -44,6 +91,9 @@ export function FileEditToolUseRejectedMessage(t0) {
   } else {
     t1 = $[1];
   }
+
+  // 缓存槽 $[2]/$[3]/$[4]：file_path 或 verbose 变化时重新计算展示路径
+  // verbose=true → 绝对路径；verbose=false → 相对于 getCwd() 的路径
   let t2;
   if ($[2] !== file_path || $[3] !== verbose) {
     t2 = verbose ? file_path : relative(getCwd(), file_path);
@@ -53,6 +103,8 @@ export function FileEditToolUseRejectedMessage(t0) {
   } else {
     t2 = $[4];
   }
+
+  // 缓存槽 $[5]/$[6]：路径字符串变化时重新创建加粗路径文本节点
   let t3;
   if ($[5] !== t2) {
     t3 = <Text bold={true} color="subtle">{t2}</Text>;
@@ -61,6 +113,8 @@ export function FileEditToolUseRejectedMessage(t0) {
   } else {
     t3 = $[6];
   }
+
+  // 缓存槽 $[7]/$[8]/$[9]：t1 或 t3 变化时重新创建文本头部行容器
   let t4;
   if ($[7] !== t1 || $[8] !== t3) {
     t4 = <Box flexDirection="row">{t1}{t3}</Box>;
@@ -70,8 +124,12 @@ export function FileEditToolUseRejectedMessage(t0) {
   } else {
     t4 = $[9];
   }
+  // text：最终的操作描述标题，供所有渲染路径复用
   const text = t4;
+
+  // ── 渲染路径1：condensed 模式（非 verbose）→ 只显示简短文本 ──
   if (style === "condensed" && !verbose) {
+    // 缓存槽 $[10]/$[11]：text 未变化则复用之前的 MessageResponse 节点
     let t5;
     if ($[10] !== text) {
       t5 = <MessageResponse>{text}</MessageResponse>;
@@ -82,13 +140,18 @@ export function FileEditToolUseRejectedMessage(t0) {
     }
     return t5;
   }
+
+  // ── 渲染路径2：write 操作 + 有 content → 显示截断的代码高亮预览 ──
   if (operation === "write" && content !== undefined) {
     let plusLines;
     let t5;
+    // 缓存槽 $[12]-$[15]：content 或 verbose 变化时重新计算行数和截断内容
     if ($[12] !== content || $[13] !== verbose) {
       const lines = content.split("\n");
       const numLines = lines.length;
+      // plusLines：超出 MAX_LINES_TO_RENDER 的行数，用于"… +N lines"提示
       plusLines = numLines - MAX_LINES_TO_RENDER;
+      // verbose=true → 显示完整内容；verbose=false → 截断为前 MAX_LINES_TO_RENDER 行
       t5 = verbose ? content : lines.slice(0, MAX_LINES_TO_RENDER).join("\n");
       $[12] = content;
       $[13] = verbose;
@@ -98,9 +161,13 @@ export function FileEditToolUseRejectedMessage(t0) {
       plusLines = $[14];
       t5 = $[15];
     }
+    // truncatedContent：最终传给 HighlightedCode 的代码字符串
     const truncatedContent = t5;
+    // 若截断后内容为空，显示"(No content)"占位符
     const t6 = truncatedContent || "(No content)";
+    // 代码预览宽度 = 终端列宽 - 12（留出边距）
     const t7 = columns - 12;
+    // 缓存槽 $[16]-$[19]：file_path、代码内容或宽度变化时重新创建 HighlightedCode 节点
     let t8;
     if ($[16] !== file_path || $[17] !== t6 || $[18] !== t7) {
       t8 = <HighlightedCode code={t6} filePath={file_path} width={t7} dim={true} />;
@@ -111,6 +178,8 @@ export function FileEditToolUseRejectedMessage(t0) {
     } else {
       t8 = $[19];
     }
+    // 缓存槽 $[20]-$[22]：plusLines 或 verbose 变化时重新计算"… +N lines"折叠提示
+    // 仅在非 verbose 模式且有超出行数时显示
     let t9;
     if ($[20] !== plusLines || $[21] !== verbose) {
       t9 = !verbose && plusLines > 0 && <Text dimColor={true}>… +{plusLines} lines</Text>;
@@ -120,6 +189,7 @@ export function FileEditToolUseRejectedMessage(t0) {
     } else {
       t9 = $[22];
     }
+    // 缓存槽 $[23]-$[26]：任意子节点变化时重新创建完整的 write 预览容器
     let t10;
     if ($[23] !== t8 || $[24] !== t9 || $[25] !== text) {
       t10 = <MessageResponse><Box flexDirection="column">{text}{t8}{t9}</Box></MessageResponse>;
@@ -132,7 +202,10 @@ export function FileEditToolUseRejectedMessage(t0) {
     }
     return t10;
   }
+
+  // ── 渲染路径3：无 patch 或 patch 为空 → 只显示文本提示 ──
   if (!patch || patch.length === 0) {
+    // 缓存槽 $[27]/$[28]：text 未变化则复用之前的 MessageResponse 节点
     let t5;
     if ($[27] !== text) {
       t5 = <MessageResponse>{text}</MessageResponse>;
@@ -143,9 +216,14 @@ export function FileEditToolUseRejectedMessage(t0) {
     }
     return t5;
   }
+
+  // ── 渲染路径4：update 操作 + 有效 patch → 显示结构化 diff ──
+  // diff 渲染宽度 = 终端列宽 - 12
   const t5 = columns - 12;
+  // 缓存槽 $[29]-$[34]：任意 diff 相关 prop 变化时重新创建 StructuredDiffList 节点
   let t6;
   if ($[29] !== fileContent || $[30] !== file_path || $[31] !== firstLine || $[32] !== patch || $[33] !== t5) {
+    // dim={true}：以灰显方式渲染 diff，表示这是被拒绝的变更
     t6 = <StructuredDiffList hunks={patch} dim={true} width={t5} filePath={file_path} firstLine={firstLine} fileContent={fileContent} />;
     $[29] = fileContent;
     $[30] = file_path;
@@ -156,6 +234,7 @@ export function FileEditToolUseRejectedMessage(t0) {
   } else {
     t6 = $[34];
   }
+  // 缓存槽 $[35]-$[37]：t6 或 text 变化时重新创建完整的 update diff 容器
   let t7;
   if ($[35] !== t6 || $[36] !== text) {
     t7 = <MessageResponse><Box flexDirection="column">{text}{t6}</Box></MessageResponse>;

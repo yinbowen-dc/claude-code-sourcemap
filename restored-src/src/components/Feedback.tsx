@@ -1,3 +1,25 @@
+/**
+ * Feedback.tsx — 反馈与缺陷报告组件
+ *
+ * 在 Claude Code 系统流程中的位置：
+ *   用户命令层 → /bug 命令 → 收集反馈/缺陷报告 → 提交到 Anthropic API
+ *
+ * 主要功能：
+ *   1. Feedback 组件：多步骤对话框（输入 → 确认 → 提交中 → 完成），
+ *      收集用户描述、环境信息、对话转录并提交到 Anthropic 反馈 API。
+ *   2. redactSensitiveInfo：对字符串进行敏感信息脱敏（API Key、AWS 密钥、Token 等）。
+ *   3. createGitHubIssueUrl：根据反馈数据构造 GitHub Issue 预填 URL（含 URL 长度截断逻辑）。
+ *   4. generateTitle：调用 Claude Haiku 为 bug 描述生成简洁的 GitHub Issue 标题。
+ *   5. submitFeedback：通过 axios 将反馈数据 POST 到 Anthropic 内部 API，
+ *      处理 OAuth 刷新、超时（30s）、ZDR 组织（自定义数据保留策略）等边界情况。
+ *
+ * 步骤状态机：
+ *   userInput → consent → submitting → done
+ *
+ * 安全考虑：
+ *   所有用于上报或 URL 的文本均经过 redactSensitiveInfo 脱敏，
+ *   错误日志也通过 sanitizeAndLogError 过滤后才写入日志系统。
+ */
 import axios from 'axios';
 import { readFile, stat } from 'fs/promises';
 import * as React from 'react';
@@ -30,7 +52,7 @@ import { Dialog } from './design-system/Dialog.js';
 import { KeyboardShortcutHint } from './design-system/KeyboardShortcutHint.js';
 import TextInput from './TextInput.js';
 
-// This value was determined experimentally by testing the URL length limit
+// GitHub Issue URL 最大长度（通过实验测试确定的上限）
 const GITHUB_URL_LIMIT = 7250;
 const GITHUB_ISSUES_REPO_URL = "external" === 'ant' ? 'https://github.com/anthropics/claude-cli-internal/issues' : 'https://github.com/anthropics/claude-code/issues';
 type Props = {
@@ -67,6 +89,24 @@ type FeedbackData = {
   rawTranscriptJsonl?: string;
 };
 
+/**
+ * redactSensitiveInfo
+ *
+ * 整体流程：
+ *   对输入字符串依次应用多个正则替换，覆盖以下敏感信息类型：
+ *   - Anthropic API Key（sk-ant...）：带/不带引号两种格式
+ *   - AWS 访问密钥（AKIA... / AWS key: "..."）
+ *   - Google Cloud API Key（AIza...）
+ *   - GCP 服务账号邮件（...@...iam.gserviceaccount.com）
+ *   - 通用 x-api-key 请求头中的值
+ *   - Authorization / Bearer Token
+ *   - AWS/GCP 环境变量赋值
+ *   - 通用 API_KEY/TOKEN/SECRET/PASSWORD 变量赋值
+ *
+ * 在系统中的角色：
+ *   作为所有对外上报（反馈、日志、GitHub URL）的安全过滤层，
+ *   防止用户的 API 密钥等敏感信息意外泄露到 Anthropic 服务端或 GitHub。
+ */
 // Utility function to redact sensitive information from strings
 export function redactSensitiveInfo(text: string): string {
   let redacted = text;
@@ -112,6 +152,17 @@ export function redactSensitiveInfo(text: string): string {
   return redacted;
 }
 
+/**
+ * getSanitizedErrorLogs
+ *
+ * 整体流程：
+ *   从内存错误日志列表中取出所有条目，
+ *   对每个条目的 error 字段调用 redactSensitiveInfo 进行脱敏，
+ *   返回脱敏后的副本列表（不修改原始日志）。
+ *
+ * 在系统中的角色：
+ *   在提交反馈报告时被调用，确保附带的错误日志不含敏感凭证。
+ */
 // Get sanitized error logs with sensitive information redacted
 function getSanitizedErrorLogs(): Array<{
   error?: string;
@@ -134,6 +185,19 @@ function getSanitizedErrorLogs(): Array<{
     return errorCopy;
   });
 }
+/**
+ * loadRawTranscriptJsonl
+ *
+ * 整体流程：
+ *   1. 获取当前会话转录文件路径（getTranscriptPath）
+ *   2. 检查文件大小，超过 MAX_TRANSCRIPT_READ_BYTES 则跳过并记录警告
+ *   3. 在大小合规时读取文件内容（UTF-8 字符串）返回
+ *   4. 任何异常（文件不存在、权限错误等）均静默返回 null
+ *
+ * 在系统中的角色：
+ *   提交反馈时附带原始 JSONL 格式转录，
+ *   帮助 Anthropic 工程师复现用户会话中的问题场景。
+ */
 async function loadRawTranscriptJsonl(): Promise<string | null> {
   try {
     const transcriptPath = getTranscriptPath();
@@ -151,6 +215,26 @@ async function loadRawTranscriptJsonl(): Promise<string | null> {
     return null;
   }
 }
+/**
+ * Feedback 组件
+ *
+ * 整体流程（步骤状态机）：
+ *   1. userInput：用户在 TextInput 中输入问题描述；
+ *      按 Enter 进入 consent 步骤；Esc 取消退出。
+ *   2. consent：展示报告内容预览（描述、环境、Git 信息、转录）；
+ *      按 Enter/Space 确认，调用 submitReport；Esc 取消。
+ *   3. submitting：展示"Submitting report…"等待提示；
+ *      submitReport 异步执行，完成后进入 done 或返回 userInput（失败时）。
+ *   4. done：展示成功/失败消息；
+ *      按 Enter 可在浏览器中打开预填 GitHub Issue；
+ *      按任意其他键关闭对话框。
+ *
+ * 并发操作：
+ *   submitFeedback（提交数据）与 generateTitle（生成 Issue 标题）并行执行。
+ *
+ * 在系统中的角色：
+ *   由 /bug 命令触发，是 Claude Code 向 Anthropic 内部收集用户反馈的入口。
+ */
 export function Feedback({
   abortSignal,
   messages,
@@ -390,6 +474,22 @@ export function Feedback({
         </Box>}
     </Dialog>;
 }
+/**
+ * createGitHubIssueUrl
+ *
+ * 整体流程：
+ *   1. 对标题和描述分别调用 redactSensitiveInfo 脱敏
+ *   2. 构造 Issue body 前缀（描述、环境信息、Feedback ID、错误 JSON 起始标记）
+ *   3. 计算 URL 中可用于错误 JSON 的字节空间
+ *   4. 三种情况处理：
+ *      a. 描述本身就超出 URL 限制 → 截断整个 body
+ *      b. 错误 JSON 可完整放入 → 直接拼接
+ *      c. 错误 JSON 超出空间 → 截断错误 JSON（避免切断 %XX 编码序列）
+ *
+ * 在系统中的角色：
+ *   让用户在报告提交后一键跳转到 GitHub 并预填 Issue 内容，
+ *   降低用户重复填写信息的负担。
+ */
 export function createGitHubIssueUrl(feedbackId: string, title: string, description: string, errors: Array<{
   error?: string;
   timestamp?: string;
@@ -444,6 +544,19 @@ export function createGitHubIssueUrl(feedbackId: string, title: string, descript
   }
   return baseUrl + encodedPrefix + truncatedEncodedErrors + ellipsis + encodedSuffix + encodedNote;
 }
+/**
+ * generateTitle
+ *
+ * 整体流程：
+ *   调用 Claude Haiku 模型，以 bug 描述作为 user prompt，
+ *   由系统提示要求模型生成 ≤80 字符的技术性 GitHub Issue 标题（含 [Bug]/[Feature Request] 前缀）。
+ *   若响应中包含 API 错误前缀（startsWithApiErrorPrefix），
+ *   或调用本身抛出异常，均回退到 createFallbackTitle。
+ *
+ * 在系统中的角色：
+ *   在 submitFeedback 并行执行时同步生成 Issue 标题，
+ *   提交完成后用于构造 GitHub Issue URL 的 title 参数。
+ */
 async function generateTitle(description: string, abortSignal: AbortSignal): Promise<string> {
   try {
     const response = await queryHaiku({
@@ -472,6 +585,16 @@ async function generateTitle(description: string, abortSignal: AbortSignal): Pro
     return createFallbackTitle(description);
   }
 }
+/**
+ * createFallbackTitle
+ *
+ * 整体流程：
+ *   当 generateTitle 调用失败或返回 API 错误时，
+ *   从 description 的第一行提取标题：
+ *   - ≤60 字符且 >5 字符 → 直接使用
+ *   - >60 字符 → 在最近的单词边界截断并加省略号
+ *   - 极短时（<10 字符）→ 返回通用 'Bug Report'
+ */
 function createFallbackTitle(description: string): string {
   // Create a safe fallback title based on the bug description
 
@@ -498,6 +621,13 @@ function createFallbackTitle(description: string): string {
   return truncated.length < 10 ? 'Bug Report' : truncated;
 }
 
+/**
+ * sanitizeAndLogError
+ *
+ * 整体流程：
+ *   对捕获的错误（Error 实例或任意值）先通过 redactSensitiveInfo 脱敏，
+ *   再调用 logError 写入内存日志，确保堆栈信息中不含敏感凭证。
+ */
 // Helper function to sanitize and log errors without exposing API keys
 function sanitizeAndLogError(err: unknown): void {
   if (err instanceof Error) {
@@ -515,6 +645,22 @@ function sanitizeAndLogError(err: unknown): void {
     logError(new Error(errorString));
   }
 }
+/**
+ * submitFeedback
+ *
+ * 整体流程：
+ *   1. 若处于 essentialTrafficOnly 模式（高度隐私模式），直接返回失败
+ *   2. 刷新 OAuth Token（checkAndRefreshOAuthTokenIfNeeded），防止 401
+ *   3. 获取认证请求头（getAuthHeaders）；若获取失败直接返回失败
+ *   4. 通过 axios POST 将 FeedbackData 发送到 Anthropic 反馈 API（30s 超时）
+ *   5. 成功（HTTP 200 + feedback_id）→ 返回 { success: true, feedbackId }
+ *   6. 用户取消（axios.isCancel）→ 静默返回失败，不记录错误
+ *   7. HTTP 403 + ZDR 组织标志 → 返回 { success: false, isZdrOrg: true }
+ *   8. 其他错误 → sanitizeAndLogError 后返回失败
+ *
+ * 在系统中的角色：
+ *   是反馈数据从客户端发出的唯一出口，通过 Anthropic 内部 API 存储报告。
+ */
 async function submitFeedback(data: FeedbackData, signal?: AbortSignal): Promise<{
   success: boolean;
   feedbackId?: string;

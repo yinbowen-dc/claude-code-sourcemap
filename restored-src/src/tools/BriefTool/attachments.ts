@@ -1,4 +1,19 @@
 /**
+ * BriefTool/attachments.ts
+ *
+ * 【在 Claude Code 系统中的位置】
+ * 本文件属于 BriefTool 工具模块，为 SendUserMessage 和 SendUserFile 工具
+ * 提供共用的附件验证与解析逻辑。
+ * 放置于 BriefTool/ 目录的原因：`./upload.js` 的动态 import 保持相对路径可解析，
+ * 同时使 upload.ts（含 axios、crypto、auth 工具等重依赖）在非 BRIDGE_MODE 构建中
+ * 能被 tree-shaking 完全消除。
+ *
+ * 【主要功能】
+ * - ResolvedAttachment：解析后的附件数据类型（路径、大小、是否图像、可选 file_uuid）。
+ * - validateAttachmentPaths：校验附件路径是否存在且为普通文件，返回 ValidationResult。
+ * - resolveAttachments：串行 stat 获取附件元数据，并在 BRIDGE_MODE 下并行上传，
+ *   返回含 file_uuid（若可用）的 ResolvedAttachment 数组。
+ *
  * Shared attachment validation + resolution for SendUserMessage and
  * SendUserFile. Lives in BriefTool/ so the dynamic `./upload.js` import
  * inside the feature('BRIDGE_MODE') guard stays relative and upload.ts
@@ -23,6 +38,19 @@ export type ResolvedAttachment = {
   file_uuid?: string
 }
 
+/**
+ * validateAttachmentPaths
+ *
+ * 【函数作用】
+ * 校验附件路径列表中的每个路径是否合法可用。
+ * 对每个路径执行以下检查：
+ *   1. 路径必须存在（ENOENT → 返回含当前 cwd 的错误消息，帮助调试相对路径问题）
+ *   2. 必须为普通文件（非目录、非设备文件等）
+ *   3. 必须可访问（EACCES/EPERM → 权限拒绝错误）
+ * 首个不合法路径触发 errorCode=1 的 ValidationResult，全部通过则返回 { result: true }。
+ *
+ * @param rawPaths - 用户提供的原始路径列表（可含 ~ 等需展开的形式）
+ */
 export async function validateAttachmentPaths(
   rawPaths: string[],
 ): Promise<ValidationResult> {
@@ -60,6 +88,30 @@ export async function validateAttachmentPaths(
   return { result: true }
 }
 
+/**
+ * resolveAttachments
+ *
+ * 【函数作用】
+ * 将原始路径列表解析为完整的 ResolvedAttachment 数组，并在 BRIDGE_MODE 下执行云端上传。
+ *
+ * 【执行流程】
+ *   1. 串行 stat 各路径（本地操作，速度快），构建含 path/size/isImage 的基础结构；
+ *      串行而非并行，以保证输出顺序确定性。
+ *   2. 若 feature('BRIDGE_MODE') 为 true（仅在 bridge 构建中启用），则：
+ *      a. 判断是否需要上传（replBridgeEnabled=true 或 CLAUDE_CODE_BRIEF_UPLOAD=true）
+ *      b. 动态 import './upload.js'（tree-shaking 优化，非 bridge 构建不引入）
+ *      c. Promise.all 并行上传（网络操作，速度慢）；上传失败 resolve undefined，
+ *         附件仍保留本地元数据（供本地渲染器使用）
+ *      d. 合并 file_uuid 到结果中
+ *   3. 非 BRIDGE_MODE：直接返回本地元数据数组
+ *
+ * 【TOCTOU 说明】
+ * validateInput 在调用此函数前已校验路径，但文件在校验后、stat 前可能被移动，
+ * 若发生此情况，stat 错误将向上传播，让模型感知到问题。
+ *
+ * @param rawPaths - 用户提供的原始路径列表
+ * @param uploadCtx - 上传上下文（replBridgeEnabled、AbortSignal）
+ */
 export async function resolveAttachments(
   rawPaths: string[],
   uploadCtx: { replBridgeEnabled: boolean; signal?: AbortSignal },

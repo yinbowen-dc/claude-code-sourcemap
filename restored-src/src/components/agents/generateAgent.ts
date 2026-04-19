@@ -1,3 +1,21 @@
+/**
+ * generateAgent.ts — AI 驱动的 Agent 自动生成模块
+ *
+ * 【在 Claude Code 系统流程中的位置】
+ * 本文件位于 src/components/agents/ 目录下，是新建 Agent 向导中"AI 生成"路径的核心。
+ * 由 GenerateStep（向导步骤组件）调用，通过向 Claude API 发送用户描述，
+ * 自动生成 Agent 的 identifier、whenToUse 和 systemPrompt。
+ *
+ * 【主要功能】
+ * 1. 定义两段系统提示：AGENT_CREATION_SYSTEM_PROMPT（Agent 架构设计提示）
+ *    和 AGENT_MEMORY_INSTRUCTIONS（记忆功能扩展提示，按需附加）
+ * 2. generateAgent 函数：
+ *    - 构建用户消息（包含防重名提示）
+ *    - 注入用户上下文（CLAUDE.md 等项目信息）
+ *    - 调用 queryModelWithoutStreaming 发起非流式 API 请求
+ *    - 解析响应中的 JSON 对象，提取 identifier/whenToUse/systemPrompt
+ *    - 上报分析事件（tengu_agent_definition_generated）
+ */
 import type { ContentBlock } from '@anthropic-ai/sdk/resources/index.mjs'
 import { getUserContext } from 'src/context.js'
 import { queryModelWithoutStreaming } from 'src/services/api/claude.js'
@@ -17,12 +35,26 @@ import {
 import { jsonParse } from '../../utils/slowOperations.js'
 import { asSystemPrompt } from '../../utils/systemPromptType.js'
 
+// 生成的 Agent 数据结构：标识符、触发描述、系统提示
 type GeneratedAgent = {
   identifier: string
   whenToUse: string
   systemPrompt: string
 }
 
+/**
+ * AGENT_CREATION_SYSTEM_PROMPT — Agent 创建的主系统提示
+ *
+ * 定义 AI 在生成 Agent 配置时的行为规范：
+ * 1. 提取核心意图（Extract Core Intent）
+ * 2. 设计专家人格（Design Expert Persona）
+ * 3. 构建完整指令（Architect Comprehensive Instructions）
+ * 4. 优化性能（Optimize for Performance）
+ * 5. 创建标识符（Create Identifier）：小写字母+数字+连字符，2-4 个词
+ * 6. 编写使用示例（Example agent descriptions）：包含带 Commentary 的对话示例
+ *
+ * 输出要求：严格的 JSON 对象格式，包含 identifier、whenToUse、systemPrompt 三个字段
+ */
 const AGENT_CREATION_SYSTEM_PROMPT = `You are an elite AI agent architect specializing in crafting high-performance agent configurations. Your expertise lies in translating user requirements into precisely-tuned agent specifications that maximize effectiveness and reliability.
 
 **Important Context**: You may have access to project-specific instructions from CLAUDE.md files and other context that may include coding standards, project structure, and custom requirements. Consider this context when creating agents to ensure they align with the project's established patterns and practices.
@@ -72,7 +104,7 @@ When a user describes what they want an agent to do, you will:
       user: "Hello"
       assistant: "I'm going to use the ${AGENT_TOOL_NAME} tool to launch the greeting-responder agent to respond with a friendly joke"
       <commentary>
-      Since the user is greeting, use the greeting-responder agent to respond with a friendly joke. 
+      Since the user is greeting, use the greeting-responder agent to respond with a friendly joke.
       </commentary>
     </example>
   - If the user mentioned or implied that the agent should be used proactively, you should include examples of this.
@@ -96,6 +128,13 @@ Key principles for your system prompts:
 Remember: The agents you create should be autonomous experts capable of handling their designated tasks with minimal additional guidance. Your system prompts are their complete operational manual.
 `
 
+/**
+ * AGENT_MEMORY_INSTRUCTIONS — Agent 记忆功能扩展提示
+ *
+ * 当 isAutoMemoryEnabled() 为 true 时，追加到主系统提示之后。
+ * 指导 AI 在用户描述中检测到记忆需求时，在 systemPrompt 中加入
+ * 特定于领域的记忆更新指令（如"Update your agent memory as you discover..."）。
+ */
 // Agent memory instructions to include in the system prompt when memory is mentioned or relevant
 const AGENT_MEMORY_INSTRUCTIONS = `
 
@@ -119,33 +158,57 @@ const AGENT_MEMORY_INSTRUCTIONS = `
    The memory instructions should be specific to what the agent would naturally learn while performing its core tasks.
 `
 
+/**
+ * generateAgent — 通过 AI 自动生成 Agent 配置
+ *
+ * 流程：
+ * 1. 构建防重名提示：若已有同名 Agent，在消息中注明不可用的标识符列表
+ * 2. 创建用户消息对象，要求 AI 返回纯 JSON
+ * 3. 获取用户上下文（CLAUDE.md 等项目配置），注入消息列表
+ * 4. 根据 isAutoMemoryEnabled 决定是否在系统提示中附加记忆指令
+ * 5. 调用 queryModelWithoutStreaming 发起 API 请求（禁用思考模式、无工具）
+ * 6. 从响应中提取所有 text 块，合并为字符串
+ * 7. 用 jsonParse 解析 JSON；失败时用正则提取第一个 JSON 对象重试
+ * 8. 校验必要字段；上报分析事件；返回 GeneratedAgent 对象
+ *
+ * @param userPrompt - 用户对 Agent 功能的描述
+ * @param model - 用于生成的 Claude 模型名
+ * @param existingIdentifiers - 已存在的 Agent 标识符列表（防止重名）
+ * @param abortSignal - 用于取消请求的 AbortSignal
+ */
 export async function generateAgent(
   userPrompt: string,
   model: ModelName,
   existingIdentifiers: string[],
   abortSignal: AbortSignal,
 ): Promise<GeneratedAgent> {
+  // 若已有同名 Agent，在提示中列出禁用的标识符，防止 AI 生成重复名称
   const existingList =
     existingIdentifiers.length > 0
       ? `\n\nIMPORTANT: The following identifiers already exist and must NOT be used: ${existingIdentifiers.join(', ')}`
       : ''
 
+  // 构建请求消息：包含用户描述和防重名约束，要求只返回 JSON
   const prompt = `Create an agent configuration based on this request: "${userPrompt}".${existingList}
   Return ONLY the JSON object, no other text.`
 
   const userMessage = createUserMessage({ content: prompt })
 
+  // 获取用户上下文（包括 CLAUDE.md 内容、项目信息等）
   // Fetch user and system contexts
   const userContext = await getUserContext()
 
+  // 将用户上下文注入消息列表（添加到第一条消息之前）
   // Prepend user context to messages and append system context to system prompt
   const messagesWithContext = prependUserContext([userMessage], userContext)
 
+  // 根据是否启用自动记忆功能，决定使用哪个版本的系统提示
   // Include memory instructions when the feature is enabled
   const systemPrompt = isAutoMemoryEnabled()
     ? AGENT_CREATION_SYSTEM_PROMPT + AGENT_MEMORY_INSTRUCTIONS
     : AGENT_CREATION_SYSTEM_PROMPT
 
+  // 调用 Claude API（非流式）：禁用思考模式，不使用任何工具
   const response = await queryModelWithoutStreaming({
     messages: normalizeMessagesForAPI(messagesWithContext),
     systemPrompt: asSystemPrompt([systemPrompt]),
@@ -159,20 +222,24 @@ export async function generateAgent(
       agents: [],
       isNonInteractiveSession: false,
       hasAppendSystemPrompt: false,
-      querySource: 'agent_creation',
+      querySource: 'agent_creation',  // 标记请求来源为 agent_creation
       mcpTools: [],
     },
   })
 
+  // 提取响应中所有 text 类型的内容块，拼接为完整响应文本
   const textBlocks = response.message.content.filter(
     (block): block is ContentBlock & { type: 'text' } => block.type === 'text',
   )
   const responseText = textBlocks.map(block => block.text).join('\n')
 
+  // 解析响应文本为 JSON 对象
   let parsed: GeneratedAgent
   try {
+    // 首先尝试直接解析（去除首尾空白）
     parsed = jsonParse(responseText.trim())
   } catch {
+    // 直接解析失败时，用正则提取第一个 {...} 块重试
     const jsonMatch = responseText.match(/\{[\s\S]*\}/)
     if (!jsonMatch) {
       throw new Error('No JSON object found in response')
@@ -180,15 +247,18 @@ export async function generateAgent(
     parsed = jsonParse(jsonMatch[0])
   }
 
+  // 校验必要字段是否都存在
   if (!parsed.identifier || !parsed.whenToUse || !parsed.systemPrompt) {
     throw new Error('Invalid agent configuration generated')
   }
 
+  // 上报分析事件，记录生成的 Agent 标识符（类型断言确保不含代码/路径信息）
   logEvent('tengu_agent_definition_generated', {
     agent_identifier:
       parsed.identifier as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
   })
 
+  // 返回结构化的 Agent 配置
   return {
     identifier: parsed.identifier,
     whenToUse: parsed.whenToUse,

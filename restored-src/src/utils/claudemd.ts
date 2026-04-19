@@ -1,28 +1,20 @@
 /**
- * Files are loaded in the following order:
+ * CLAUDE.md 记忆文件加载模块。
  *
- * 1. Managed memory (eg. /etc/claude-code/CLAUDE.md) - Global instructions for all users
- * 2. User memory (~/.claude/CLAUDE.md) - Private global instructions for all projects
- * 3. Project memory (CLAUDE.md, .claude/CLAUDE.md, and .claude/rules/*.md in project roots) - Instructions checked into the codebase
- * 4. Local memory (CLAUDE.local.md in project roots) - Private project-specific instructions
+ * 在 Claude Code 系统中，该模块负责发现和加载各层级的 CLAUDE.md 记忆文件，
+ * 按以下优先级顺序加载（越靠后优先级越高，模型将更关注）：
+ * 1. 托管记忆（/etc/claude-code/CLAUDE.md）— 面向所有用户的全局指令
+ * 2. 用户记忆（~/.claude/CLAUDE.md）— 跨项目全局私有指令
+ * 3. 项目记忆（CLAUDE.md / .claude/CLAUDE.md / .claude/rules/*.md）— 代码库级指令
+ * 4. 本地记忆（CLAUDE.local.md）— 项目专属私有指令
  *
- * Files are loaded in reverse order of priority, i.e. the latest files are highest priority
- * with the model paying more attention to them.
+ * 文件发现：从当前目录向上遍历至根目录，更接近当前目录的文件优先级更高。
  *
- * File discovery:
- * - User memory is loaded from the user's home directory
- * - Project and Local files are discovered by traversing from the current directory up to root
- * - Files closer to the current directory have higher priority (loaded later)
- * - CLAUDE.md, .claude/CLAUDE.md, and all .md files in .claude/rules/ are checked in each directory for Project memory
+ * @include 指令：记忆文件可通过 @path / @./relative / @~/home / @/absolute 引用其他文件，
+ * 仅在叶文本节点中有效（不在代码块内），循环引用通过已处理文件集防止，不存在的文件静默忽略。
  *
- * Memory @include directive:
- * - Memory files can include other files using @ notation
- * - Syntax: @path, @./relative/path, @~/home/path, or @/absolute/path
- * - @path (without prefix) is treated as a relative path (same as @./path)
- * - Works in leaf text nodes only (not inside code blocks or code strings)
- * - Included files are added as separate entries before the including file
- * - Circular references are prevented by tracking processed files
- * - Non-existent files are silently ignored
+ * Files are loaded in reverse order of priority — later files have higher priority.
+ * Memory @include directive: @path, @./relative/path, @~/home/path, or @/absolute/path.
  */
 
 import { feature } from 'bun:bundle'
@@ -247,14 +239,30 @@ function pathInOriginalCwd(path: string): boolean {
 }
 
 /**
- * Parses raw content to extract both content and glob patterns from frontmatter
- * @param rawContent Raw file content with frontmatter
- * @returns Object with content and globs (undefined if no paths or match-all pattern)
+ * 从记忆文件的 frontmatter 中解析内容和 glob 路径匹配模式。
+ *
+ * frontmatter 形如：
+ * ```
+ * ---
+ * paths:
+ *   - src/**
+ *   - tests/**
+ * ---
+ * 实际内容...
+ * ```
+ *
+ * 处理规则：
+ * - `/**` 后缀会被去掉——ignore 库在匹配路径时已同时包含目录本身及其内部条目
+ * - 若 paths 为空或全部为 `**`（匹配所有），等价于无 glob 限制，返回 `paths: undefined`
+ *
+ * @param rawContent 含 frontmatter 的原始文件内容
+ * @returns `{ content, paths? }` — content 为去掉 frontmatter 后的正文，paths 为 glob 模式数组或 undefined
  */
 function parseFrontmatterPaths(rawContent: string): {
   content: string
   paths?: string[]
 } {
+  // 解析 frontmatter，content 为去除 frontmatter 后的正文
   const { frontmatter, content } = parseFrontmatter(rawContent)
 
   if (!frontmatter.paths) {
@@ -263,14 +271,12 @@ function parseFrontmatterPaths(rawContent: string): {
 
   const patterns = splitPathInFrontmatter(frontmatter.paths)
     .map(pattern => {
-      // Remove /** suffix - ignore library treats 'path' as matching both
-      // the path itself and everything inside it
+      // 去掉 /** 后缀——ignore 库会将路径同时匹配到目录本身及其内部条目
       return pattern.endsWith('/**') ? pattern.slice(0, -3) : pattern
     })
     .filter((p: string) => p.length > 0)
 
-  // If all patterns are ** (match-all), treat as no globs (undefined)
-  // This means the file applies to all paths
+  // 全为 ** 等价于无限制，返回 undefined 表示该文件适用于所有路径
   if (patterns.length === 0 || patterns.every((p: string) => p === '**')) {
     return { content }
   }
@@ -279,27 +285,41 @@ function parseFrontmatterPaths(rawContent: string): {
 }
 
 /**
- * Strip block-level HTML comments (<!-- ... -->) from markdown content.
+ * 从 Markdown 内容中剥除块级 HTML 注释（`<!-- ... -->`）。
  *
- * Uses the marked lexer to identify comments at the block level only, so
- * comments inside inline code spans and fenced code blocks are preserved.
- * Inline HTML comments inside a paragraph are also left intact; the intended
- * use case is authorial notes that occupy their own lines.
+ * 使用 marked Lexer 在块级别（block-level）识别注释，因此：
+ * - 代码块（fenced code block）和行内代码（code span）内的注释保留不变
+ * - 段落内的行内 HTML 注释也保留——该函数仅针对独立成行的注释块
+ * - 未关闭的注释（只有 `<!--` 无对应 `-->`）不做处理，避免 typo 导致整个文件内容消失
  *
- * Unclosed comments (`<!--` with no matching `-->`) are left in place so a
- * typo doesn't silently swallow the rest of the file.
+ * @param content 原始 Markdown 字符串
+ * @returns `{ content: string, stripped: boolean }` — 去掉注释后的文本，以及是否发生了剥除
  */
 export function stripHtmlComments(content: string): {
   content: string
   stripped: boolean
 } {
+  // 快速路径：无 <!-- 则无需 lex，直接返回
   if (!content.includes('<!--')) {
     return { content, stripped: false }
   }
-  // gfm:false is fine here — html-block detection is a CommonMark rule.
+  // gfm:false 足够用于 html-block 检测（CommonMark 规则），与 GFM 无关
   return stripHtmlCommentsFromTokens(new Lexer({ gfm: false }).lex(content))
 }
 
+/**
+ * 基于预先 lex 好的 token 列表执行 HTML 注释剥除。
+ *
+ * 从 `stripHtmlComments` 和 `parseMemoryFileContent` 共享调用，
+ * 避免对同一份内容重复执行 lex。
+ *
+ * 处理规则：
+ * - `html` 类型 token 且以 `<!--` 开头：用正则剥除其中所有注释跨度，保留注释外的残余文本
+ * - 其他 token：原样拼回输出
+ *
+ * @param tokens marked Lexer 生成的 token 数组
+ * @returns 去掉 HTML 注释后的 `{ content, stripped }` 结果
+ */
 function stripHtmlCommentsFromTokens(tokens: ReturnType<Lexer['lex']>): {
   content: string
   stripped: boolean
@@ -307,21 +327,19 @@ function stripHtmlCommentsFromTokens(tokens: ReturnType<Lexer['lex']>): {
   let result = ''
   let stripped = false
 
-  // A well-formed HTML comment span. Non-greedy so multiple comments on the
-  // same line are matched independently; [\s\S] to span newlines.
+  // 非贪心匹配，允许同一行出现多个注释；[\s\S] 支持跨行匹配
   const commentSpan = /<!--[\s\S]*?-->/g
 
   for (const token of tokens) {
     if (token.type === 'html') {
       const trimmed = token.raw.trimStart()
       if (trimmed.startsWith('<!--') && trimmed.includes('-->')) {
-        // Per CommonMark, a type-2 HTML block ends at the *line* containing
-        // `-->`, so text after `-->` on that line is part of this token.
-        // Strip only the comment spans and keep any residual content.
+        // CommonMark type-2 HTML block 在包含 --> 的行结束；
+        // 剥除注释跨度后，保留该 token 中注释以外的残余内容
         const residue = token.raw.replace(commentSpan, '')
         stripped = true
         if (residue.trim().length > 0) {
-          // Residual content exists (e.g. `<!-- note --> Use bun`): keep it.
+          // 残余内容不为空（如 `<!-- note --> Use bun`）则保留
           result += residue
         }
         continue
@@ -334,11 +352,24 @@ function stripHtmlCommentsFromTokens(tokens: ReturnType<Lexer['lex']>): {
 }
 
 /**
- * Parses raw memory file content into a MemoryFileInfo. Pure function — no I/O.
+ * 将原始记忆文件内容解析为 `MemoryFileInfo`，纯函数——不产生 I/O。
  *
- * When includeBasePath is given, @include paths are resolved in the same lex
- * pass and returned alongside the parsed file (so processMemoryFile doesn't
- * need to lex the same content a second time).
+ * 处理流程：
+ * 1. 检测文件扩展名，非文本类型（图片、PDF 等）直接跳过，返回 null
+ * 2. 解析 frontmatter，剥离路径 glob 并获取正文（`parseFrontmatterPaths`）
+ * 3. 若内容含 `<!--` 或需要解析 @include，统一执行一次 Lexer（gfm:false），
+ *    避免对同一内容多次 lex
+ * 4. 剥除 HTML 注释（仅当内容实际含注释时）
+ * 5. 提取 @include 路径（仅当 `includeBasePath` 存在时）
+ * 6. AutoMem / TeamMem 类型额外调用 `truncateEntrypointContent` 截断到行数/字节上限
+ * 7. 计算 `contentDiffersFromDisk`：三种转换（frontmatter 剥离、注释剥除、截断）
+ *    任一发生则为 true，同时保存原始内容到 `rawContent`
+ *
+ * @param rawContent 磁盘上的原始文件内容
+ * @param filePath 文件绝对路径（用于扩展名检测和调试日志）
+ * @param type 记忆文件类型
+ * @param includeBasePath 可选；传入时同步提取 @include 路径，与 lex 复用同一 token 列表
+ * @returns `{ info: MemoryFileInfo | null, includePaths: string[] }`
  */
 function parseMemoryFileContent(
   rawContent: string,
@@ -346,7 +377,7 @@ function parseMemoryFileContent(
   type: MemoryType,
   includeBasePath?: string,
 ): { info: MemoryFileInfo | null; includePaths: string[] } {
-  // Skip non-text files to prevent loading binary data (images, PDFs, etc.) into memory
+  // 非文本文件扩展名（图片、PDF 等）跳过，防止二进制数据加载进记忆
   const ext = extname(filePath).toLowerCase()
   if (ext && !TEXT_FILE_EXTENSIONS.has(ext)) {
     logForDebugging(`Skipping non-text file in @include: ${filePath}`)
@@ -356,35 +387,34 @@ function parseMemoryFileContent(
   const { content: withoutFrontmatter, paths } =
     parseFrontmatterPaths(rawContent)
 
-  // Lex once so strip and @include-extract share the same tokens. gfm:false
-  // is required by extract (so ~/path doesn't tokenize as strikethrough) and
-  // doesn't affect strip (html blocks are a CommonMark rule).
+  // 共用一次 lex：gfm:false 由 @include 提取需要（~/path 不被识别为删除线），
+  // 对注释剥除同样适用（html block 是 CommonMark 规则）
   const hasComment = withoutFrontmatter.includes('<!--')
   const tokens =
     hasComment || includeBasePath !== undefined
       ? new Lexer({ gfm: false }).lex(withoutFrontmatter)
       : undefined
 
-  // Only rebuild via tokens when a comment actually needs stripping —
-  // marked normalises \r\n during lex, so round-tripping a CRLF file
-  // through token.raw would spuriously flip contentDiffersFromDisk.
+  // 仅在确实含注释时才通过 token 重建字符串——
+  // marked 在 lex 时会将 \r\n 规范化，对 CRLF 文件直接 round-trip 会误判 contentDiffersFromDisk
   const strippedContent =
     hasComment && tokens
       ? stripHtmlCommentsFromTokens(tokens).content
       : withoutFrontmatter
 
+  // 仅在调用方需要 @include 解析时提取路径
   const includePaths =
     tokens && includeBasePath !== undefined
       ? extractIncludePathsFromTokens(tokens, includeBasePath)
       : []
 
-  // Truncate MEMORY.md entrypoints to the line AND byte caps
+  // AutoMem / TeamMem 的入口文件需额外截断到行数和字节上限
   let finalContent = strippedContent
   if (type === 'AutoMem' || type === 'TeamMem') {
     finalContent = truncateEntrypointContent(strippedContent).content
   }
 
-  // Covers frontmatter strip, HTML comment strip, and MEMORY.md truncation
+  // 涵盖 frontmatter 剥除、HTML 注释剥除、MEMORY.md 截断三种转换
   const contentDiffersFromDisk = finalContent !== rawContent
   return {
     info: {
@@ -393,33 +423,54 @@ function parseMemoryFileContent(
       content: finalContent,
       globs: paths,
       contentDiffersFromDisk,
+      // contentDiffersFromDisk 时保存原始内容，供缓存层做去重和变更检测
       rawContent: contentDiffersFromDisk ? rawContent : undefined,
     },
     includePaths,
   }
 }
 
+/**
+ * 处理读取记忆文件时发生的错误，区分可忽略错误和需要上报的错误。
+ *
+ * - ENOENT（文件不存在）/ EISDIR（是目录）：正常情况，静默忽略
+ * - EACCES（权限不足）：可操作的错误，上报 analytics 事件但不抛出；
+ *   事件中不记录完整路径以避免 PII 泄露，仅记录是否在 claude config 目录下
+ * - 其他错误：静默忽略（调用方 safelyReadMemoryFileAsync 也不重新抛出）
+ *
+ * @param error 捕获到的异常
+ * @param filePath 出错的文件路径（仅用于 has_home_dir 判断）
+ */
 function handleMemoryFileReadError(error: unknown, filePath: string): void {
   const code = getErrnoCode(error)
-  // ENOENT = file doesn't exist, EISDIR = is a directory — both expected
+  // 文件不存在或路径是目录，属于预期情况，直接忽略
   if (code === 'ENOENT' || code === 'EISDIR') {
     return
   }
-  // Log permission errors (EACCES) as they're actionable
+  // 权限错误（EACCES）属于可操作问题，上报 analytics 但不记录完整路径（PII 安全）
   if (code === 'EACCES') {
-    // Don't log the full file path to avoid PII/security issues
     logEvent('tengu_claude_md_permission_error', {
       is_access_error: 1,
+      // 仅标记是否在 claude 配置目录下，不泄露具体路径
       has_home_dir: filePath.includes(getClaudeConfigHomeDir()) ? 1 : 0,
     })
   }
 }
 
 /**
- * Used by processMemoryFile → getMemoryFiles so the event loop stays
- * responsive during the directory walk (many readFile attempts, most
- * ENOENT). When includeBasePath is given, @include paths are resolved in
- * the same lex pass and returned alongside the parsed file.
+ * 异步读取记忆文件并解析为 `MemoryFileInfo`，出错时静默返回 null。
+ *
+ * 在 `processMemoryFile → getMemoryFiles` 调用链中使用异步版本，
+ * 保持事件循环响应性——目录向上遍历过程中会产生大量 readFile 调用，
+ * 大多数以 ENOENT 告终，同步版本会阻塞事件循环。
+ *
+ * 当 `includeBasePath` 有值时，@include 路径在同一 lex pass 中被提取，
+ * 与文件内容共用同一 token 列表，无需二次 lex。
+ *
+ * @param filePath 要读取的文件绝对路径
+ * @param type 记忆文件类型（User / Project / Local / Managed / AutoMem / TeamMem）
+ * @param includeBasePath 可选；有值时同步提取 @include 路径
+ * @returns `{ info, includePaths }` — 读取/解析失败时 info 为 null，includePaths 为 []
  */
 async function safelyReadMemoryFileAsync(
   filePath: string,
@@ -428,9 +479,11 @@ async function safelyReadMemoryFileAsync(
 ): Promise<{ info: MemoryFileInfo | null; includePaths: string[] }> {
   try {
     const fs = getFsImplementation()
+    // 异步读取文件内容，保持事件循环响应
     const rawContent = await fs.readFile(filePath, { encoding: 'utf-8' })
     return parseMemoryFileContent(rawContent, filePath, type, includeBasePath)
   } catch (error) {
+    // 区分可忽略错误（ENOENT/EISDIR）和需上报错误（EACCES），均不重新抛出
     handleMemoryFileReadError(error, filePath)
     return { info: null, includePaths: [] }
   }
@@ -445,34 +498,52 @@ type MarkdownToken = {
   items?: MarkdownToken[]
 }
 
-// Extract @path include references from pre-lexed tokens and resolve to
-// absolute paths. Skips html tokens so @paths inside block comments are
-// ignored — the caller may pass pre-strip tokens.
+/**
+ * 从预先 lex 好的 Markdown token 列表中提取 `@path` 引用，并解析为绝对路径。
+ *
+ * 支持的 @include 语法：
+ * - `@path/to/file`  — 相对于 basePath 所在目录
+ * - `@./relative`    — 显式相对路径
+ * - `@~/home/path`   — 相对于用户主目录
+ * - `@/absolute`     — 绝对路径
+ *
+ * 跳过规则：
+ * - `code` / `codespan` token：避免误匹配代码块内的 @mentions
+ * - `html` token 中纯注释部分：注释内的 @path 不应被包含；但注释外的残余文本仍会处理
+ * - 以 `@`、`#%^&*()` 等特殊字符开头的 token：非文件路径
+ *
+ * gfm:false 由调用方确保——GFM 删除线语法会将 `@~/path` 误解为删除线。
+ *
+ * @param tokens marked Lexer（gfm:false）生成的 token 列表
+ * @param basePath @include 相对路径的参照文件路径（通常为包含 @include 的 CLAUDE.md 路径）
+ * @returns 去重后的绝对路径数组
+ */
 function extractIncludePathsFromTokens(
   tokens: ReturnType<Lexer['lex']>,
   basePath: string,
 ): string[] {
   const absolutePaths = new Set<string>()
 
-  // Extract @paths from a text string and add resolved paths to absolutePaths.
+  // 从文本字符串中提取 @path 引用，并将解析后的绝对路径加入 absolutePaths
   function extractPathsFromText(textContent: string) {
+    // 正则匹配行首或空白后跟 @ 的路径引用，支持路径中的转义空格（\ ）
     const includeRegex = /(?:^|\s)@((?:[^\s\\]|\\ )+)/g
     let match
     while ((match = includeRegex.exec(textContent)) !== null) {
       let path = match[1]
       if (!path) continue
 
-      // Strip fragment identifiers (#heading, #section-name, etc.)
+      // 去掉片段标识符（#heading、#section-name 等），它们不是文件路径的一部分
       const hashIndex = path.indexOf('#')
       if (hashIndex !== -1) {
         path = path.substring(0, hashIndex)
       }
       if (!path) continue
 
-      // Unescape the spaces in the path
+      // 将路径中的转义空格 "\ " 还原为普通空格
       path = path.replace(/\\ /g, ' ')
 
-      // Accept @path, @./path, @~/path, or @/path
+      // 仅接受合法路径前缀：./、~/、/（非根目录）或以字母数字._-开头的相对路径
       if (path) {
         const isValidPath =
           path.startsWith('./') ||
@@ -483,6 +554,7 @@ function extractIncludePathsFromTokens(
             path.match(/^[a-zA-Z0-9._-]/))
 
         if (isValidPath) {
+          // expandPath 处理 ~/home、./relative、/absolute 三种形式
           const resolvedPath = expandPath(path, dirname(basePath))
           absolutePaths.add(resolvedPath)
         }
@@ -490,16 +562,16 @@ function extractIncludePathsFromTokens(
     }
   }
 
-  // Recursively process elements to find text nodes
+  // 递归遍历 token 树，在叶子文本节点中查找 @path 引用
   function processElements(elements: MarkdownToken[]) {
     for (const element of elements) {
+      // 跳过代码块和行内代码——其中的 @mentions 不应被当作文件引用
       if (element.type === 'code' || element.type === 'codespan') {
         continue
       }
 
-      // For html tokens that contain comments, strip the comment spans and
-      // check the residual for @paths (e.g. `<!-- note --> @./file.md`).
-      // Other html tokens (non-comment tags) are skipped entirely.
+      // html token：对于含注释的块，剥除注释后检查残余文本中的 @path；
+      // 非注释型 html 标签（如 <div>）直接跳过
       if (element.type === 'html') {
         const raw = element.raw || ''
         const trimmed = raw.trimStart()
@@ -513,17 +585,17 @@ function extractIncludePathsFromTokens(
         continue
       }
 
-      // Process text nodes
+      // 文本节点：直接提取 @path 引用
       if (element.type === 'text') {
         extractPathsFromText(element.text || '')
       }
 
-      // Recurse into children tokens
+      // 递归处理子 token（段落、标题、链接等嵌套结构）
       if (element.tokens) {
         processElements(element.tokens)
       }
 
-      // Special handling for list structures
+      // 列表项的特殊处理（items 字段而非 tokens 字段）
       if (element.items) {
         processElements(element.items)
       }
@@ -537,14 +609,19 @@ function extractIncludePathsFromTokens(
 const MAX_INCLUDE_DEPTH = 5
 
 /**
- * Checks whether a CLAUDE.md file path is excluded by the claudeMdExcludes setting.
- * Only applies to User, Project, and Local memory types.
- * Managed, AutoMem, and TeamMem types are never excluded.
+ * 判断指定 CLAUDE.md 文件路径是否被 `claudeMdExcludes` 设置排除。
  *
- * Matches both the original path and the realpath-resolved path to handle symlinks
- * (e.g., /tmp -> /private/tmp on macOS).
+ * 排除逻辑：
+ * - 仅适用于 User、Project、Local 类型；Managed、AutoMem、TeamMem 始终不排除
+ * - 使用 picomatch 对规范化（反斜杠→正斜杠）后的路径做 glob 匹配
+ * - 同时匹配原始路径和 realpath 解析后的路径，处理 macOS 上 /tmp → /private/tmp 的符号链接
+ *
+ * @param filePath 要检测的文件路径
+ * @param type 记忆文件类型
+ * @returns 若文件应被排除则返回 true
  */
 function isClaudeMdExcluded(filePath: string, type: MemoryType): boolean {
+  // Managed / AutoMem / TeamMem 类型始终不排除
   if (type !== 'User' && type !== 'Project' && type !== 'Local') {
     return false
   }
@@ -555,13 +632,10 @@ function isClaudeMdExcluded(filePath: string, type: MemoryType): boolean {
   }
 
   const matchOpts = { dot: true }
+  // 将 Windows 反斜杠统一为正斜杠，便于 picomatch 匹配
   const normalizedPath = filePath.replaceAll('\\', '/')
 
-  // Build an expanded pattern list that includes realpath-resolved versions of
-  // absolute patterns. This handles symlinks like /tmp -> /private/tmp on macOS:
-  // the user writes "/tmp/project/CLAUDE.md" in their exclude, but the system
-  // resolves the CWD to "/private/tmp/project/...", so the file path uses the
-  // real path. By resolving the patterns too, both sides match.
+  // 同时解析模式中的符号链接前缀，使 /tmp/project 和 /private/tmp/project 都能匹配
   const expandedPatterns = resolveExcludePatterns(patterns).filter(
     p => p.length > 0,
   )
@@ -573,38 +647,45 @@ function isClaudeMdExcluded(filePath: string, type: MemoryType): boolean {
 }
 
 /**
- * Expands exclude patterns by resolving symlinks in absolute path prefixes.
- * For each absolute pattern (starting with /), tries to resolve the longest
- * existing directory prefix via realpathSync and adds the resolved version.
- * Glob patterns (containing *) have their static prefix resolved.
+ * 将 `claudeMdExcludes` 中的绝对路径 glob 模式展开为含符号链接解析版本的列表。
+ *
+ * 仅处理绝对路径模式（以 `/` 开头）；纯 glob 模式（如 `**\/*.md`）不含文件系统前缀，跳过。
+ * 对含 glob 字符的模式，找出第一个 glob 字符前的静态前缀目录并解析符号链接；
+ * 若解析结果与原路径不同，则将解析后的版本追加到列表，实现双版本同时匹配。
+ *
+ * 在同步调用链中（`isClaudeMdExcluded → processMemoryFile → getMemoryFiles`）使用同步 I/O。
+ *
+ * @param patterns 原始 glob 模式数组（来自 settings.claudeMdExcludes）
+ * @returns 含原始模式和符号链接解析版本的展开数组
  */
 function resolveExcludePatterns(patterns: string[]): string[] {
   const fs = getFsImplementation()
+  // 统一将反斜杠替换为正斜杠（Windows 兼容）
   const expanded: string[] = patterns.map(p => p.replaceAll('\\', '/'))
 
   for (const normalized of expanded) {
-    // Only resolve absolute patterns — glob-only patterns like "**/*.md" don't have
-    // a filesystem prefix to resolve
+    // 仅处理绝对路径模式，相对 glob 无法从文件系统解析符号链接
     if (!normalized.startsWith('/')) {
       continue
     }
 
-    // Find the static prefix before any glob characters
+    // 找到第一个 glob 字符的位置，取其前的静态前缀
     const globStart = normalized.search(/[*?{[]/)
     const staticPrefix =
       globStart === -1 ? normalized : normalized.slice(0, globStart)
     const dirToResolve = dirname(staticPrefix)
 
     try {
-      // sync IO: called from sync context (isClaudeMdExcluded -> processMemoryFile -> getMemoryFiles)
+      // 同步调用——在同步调用链中（isClaudeMdExcluded → processMemoryFile → getMemoryFiles）
       const resolvedDir = fs.realpathSync(dirToResolve).replaceAll('\\', '/')
       if (resolvedDir !== dirToResolve) {
+        // 解析结果与原路径不同（存在符号链接），追加解析后的版本
         const resolvedPattern =
           resolvedDir + normalized.slice(dirToResolve.length)
         expanded.push(resolvedPattern)
       }
     } catch {
-      // Directory doesn't exist; skip resolution for this pattern
+      // 目录不存在，跳过此模式的符号链接解析
     }
   }
 
@@ -612,8 +693,24 @@ function resolveExcludePatterns(patterns: string[]): string[] {
 }
 
 /**
- * Recursively processes a memory file and all its @include references
- * Returns an array of MemoryFileInfo objects with includes first, then main file
+ * 递归处理一个记忆文件及其所有 `@include` 引用，返回包含主文件和所有包含文件的数组。
+ *
+ * 处理顺序：主文件先入列，然后依次递归其 @include 文件（父文件在前，子文件在后）。
+ *
+ * 防护机制：
+ * - `processedPaths`：已处理路径集合，防止循环引用；Windows 驱动器盘符大小写不一致时通过规范化处理
+ * - `depth >= MAX_INCLUDE_DEPTH`：超过最大嵌套深度时跳过
+ * - `isClaudeMdExcluded`：被 `claudeMdExcludes` 设置排除的文件跳过
+ * - 符号链接：提前解析 realpath，同时将原始路径和解析路径都加入 `processedPaths`
+ * - 外部文件（不在 originalCwd 内）：`includeExternal` 为 false 时跳过
+ *
+ * @param filePath 要处理的文件绝对路径
+ * @param type 记忆文件类型
+ * @param processedPaths 已处理文件路径集合（由调用方维护，跨递归共享）
+ * @param includeExternal 是否允许加载 cwd 外部的 @include 引用文件
+ * @param depth 当前递归深度（初始为 0）
+ * @param parent 包含当前文件的父文件路径（用于填充 MemoryFileInfo.parent）
+ * @returns MemoryFileInfo 数组，主文件在前，@include 文件在后
  */
 export async function processMemoryFile(
   filePath: string,
@@ -623,25 +720,25 @@ export async function processMemoryFile(
   depth: number = 0,
   parent?: string,
 ): Promise<MemoryFileInfo[]> {
-  // Skip if already processed or max depth exceeded.
-  // Normalize paths for comparison to handle Windows drive letter casing
-  // differences (e.g., C:\Users vs c:\Users).
+  // 跳过已处理或超过最大嵌套深度的文件；
+  // 规范化路径以处理 Windows 驱动器盘符大小写差异（如 C:\Users 与 c:\Users）
   const normalizedPath = normalizePathForComparison(filePath)
   if (processedPaths.has(normalizedPath) || depth >= MAX_INCLUDE_DEPTH) {
     return []
   }
 
-  // Skip if path is excluded by claudeMdExcludes setting
+  // 被 claudeMdExcludes 设置排除的文件不加载
   if (isClaudeMdExcluded(filePath, type)) {
     return []
   }
 
-  // Resolve symlink path early for @import resolution
+  // 提前解析符号链接，@import 路径解析以 realpath 为基准，避免重复处理同一物理文件
   const { resolvedPath, isSymlink } = safeResolvePath(
     getFsImplementation(),
     filePath,
   )
 
+  // 同时记录原始路径和解析路径，防止通过不同路径重入
   processedPaths.add(normalizedPath)
   if (isSymlink) {
     processedPaths.add(normalizePathForComparison(resolvedPath))
@@ -649,34 +746,36 @@ export async function processMemoryFile(
 
   const { info: memoryFile, includePaths: resolvedIncludePaths } =
     await safelyReadMemoryFileAsync(filePath, type, resolvedPath)
+  // 内容为空（文件不存在或读取失败）则跳过
   if (!memoryFile || !memoryFile.content.trim()) {
     return []
   }
 
-  // Add parent information
+  // 填充父文件路径（用于 /memory 界面展示包含层级）
   if (parent) {
     memoryFile.parent = parent
   }
 
   const result: MemoryFileInfo[] = []
 
-  // Add the main file first (parent before children)
+  // 主文件先入列（父文件在子文件之前）
   result.push(memoryFile)
 
   for (const resolvedIncludePath of resolvedIncludePaths) {
+    // 外部文件（cwd 之外）：须 includeExternal=true 才加载
     const isExternal = !pathInOriginalCwd(resolvedIncludePath)
     if (isExternal && !includeExternal) {
       continue
     }
 
-    // Recursively process included files with this file as parent
+    // 递归处理 @include 文件，将当前文件作为父文件传入
     const includedFiles = await processMemoryFile(
       resolvedIncludePath,
       type,
       processedPaths,
       includeExternal,
       depth + 1,
-      filePath, // Pass current file as parent
+      filePath, // 当前文件作为子文件的父文件
     )
     result.push(...includedFiles)
   }
@@ -685,14 +784,26 @@ export async function processMemoryFile(
 }
 
 /**
- * Processes all .md files in the .claude/rules/ directory and its subdirectories
- * @param rulesDir The path to the rules directory
- * @param type Type of memory file (User, Project, Local)
- * @param processedPaths Set of already processed file paths
- * @param includeExternal Whether to include external files
- * @param conditionalRule If true, only include files with frontmatter paths; if false, only include files without frontmatter paths
- * @param visitedDirs Set of already visited directory real paths (for cycle detection)
- * @returns Array of MemoryFileInfo objects
+ * 递归处理 `.claude/rules/` 目录（及子目录）中的所有 `.md` 文件。
+ *
+ * 文件过滤规则由 `conditionalRule` 参数控制：
+ * - `conditionalRule: false`：仅加载**无** frontmatter paths 的文件（无条件规则）
+ * - `conditionalRule: true`：仅加载**有** frontmatter paths 的文件（条件规则，需额外 glob 匹配）
+ *
+ * 符号链接处理：
+ * - 对目录条目使用 `safeResolvePath` 检测符号链接
+ * - 若是符号链接目录，`visitedDirs` 同时记录原始路径和 realpath，防止循环遍历
+ * - 对文件使用 `stat` 确认类型（避免 Dirent.isDirectory() 对符号链接的误判）
+ *
+ * 权限错误上报：EACCES 上报 analytics 但不抛出，其他 I/O 错误同样静默返回 []。
+ *
+ * @param rulesDir 规则目录路径
+ * @param type 记忆文件类型
+ * @param processedPaths 已处理文件路径集合（会被修改）
+ * @param includeExternal 是否允许加载 cwd 外部的 @include 引用文件
+ * @param conditionalRule true 仅含 frontmatter paths 的文件；false 仅不含的文件
+ * @param visitedDirs 已访问目录真实路径集合（用于循环检测，默认新建空集合）
+ * @returns MemoryFileInfo 数组
  */
 export async function processMdRules({
   rulesDir,
@@ -709,6 +820,7 @@ export async function processMdRules({
   conditionalRule: boolean
   visitedDirs?: Set<string>
 }): Promise<MemoryFileInfo[]> {
+  // 同一目录已访问过则直接返回，防止符号链接环路
   if (visitedDirs.has(rulesDir)) {
     return []
   }
@@ -716,11 +828,13 @@ export async function processMdRules({
   try {
     const fs = getFsImplementation()
 
+    // 解析符号链接，获取目录的真实路径
     const { resolvedPath: resolvedRulesDir, isSymlink } = safeResolvePath(
       fs,
       rulesDir,
     )
 
+    // 同时记录原始路径和 realpath，避免通过不同路径重入
     visitedDirs.add(rulesDir)
     if (isSymlink) {
       visitedDirs.add(resolvedRulesDir)
@@ -729,6 +843,7 @@ export async function processMdRules({
     const result: MemoryFileInfo[] = []
     let entries: import('fs').Dirent[]
     try {
+      // 读取目录条目，ENOENT / EACCES / ENOTDIR 均视为目录不存在，返回空
       entries = await fs.readdir(resolvedRulesDir)
     } catch (e: unknown) {
       const code = getErrnoCode(e)
@@ -745,13 +860,14 @@ export async function processMdRules({
         entryPath,
       )
 
-      // Use Dirent methods for non-symlinks to avoid extra stat calls.
-      // For symlinks, we need stat to determine what the target is.
+      // 非符号链接时直接使用 Dirent 方法，避免额外 stat 调用；
+      // 符号链接需要 stat 目标文件来确定类型
       const stats = isSymlink ? await fs.stat(resolvedEntryPath) : null
       const isDirectory = stats ? stats.isDirectory() : entry.isDirectory()
       const isFile = stats ? stats.isFile() : entry.isFile()
 
       if (isDirectory) {
+        // 目录：递归处理，传入同一 visitedDirs 集合防止环路
         result.push(
           ...(await processMdRules({
             rulesDir: resolvedEntryPath,
@@ -763,6 +879,7 @@ export async function processMdRules({
           })),
         )
       } else if (isFile && entry.name.endsWith('.md')) {
+        // 仅处理 .md 文件，根据 conditionalRule 决定保留有/无 globs 的文件
         const files = await processMemoryFile(
           resolvedEntryPath,
           type,
@@ -777,6 +894,7 @@ export async function processMdRules({
 
     return result
   } catch (error) {
+    // EACCES 权限错误上报 analytics（不含完整路径以避免 PII 泄露）
     if (error instanceof Error && error.message.includes('EACCES')) {
       logEvent('tengu_claude_rules_md_permission_error', {
         is_access_error: 1,
@@ -787,6 +905,27 @@ export async function processMdRules({
   }
 }
 
+/**
+ * 发现并加载所有层级的记忆文件，使用 lodash memoize 缓存结果。
+ *
+ * 加载顺序（低优先级 → 高优先级，越靠后模型越关注）：
+ * 1. Managed（/etc/claude-code/CLAUDE.md + rules/）—— 面向所有用户的全局指令
+ * 2. User（~/.claude/CLAUDE.md + rules/）—— 跨项目私有指令（需 userSettings 启用）
+ * 3. Project（从根目录到 CWD 的每层 CLAUDE.md / .claude/CLAUDE.md / .claude/rules/*.md）
+ * 4. Local（CLAUDE.local.md，私有且不提交到版本控制）
+ * 5. AutoMem（MEMORY.md 自动记忆入口，需功能开关）
+ * 6. TeamMem（团队共享记忆入口，需 TEAMMEM feature flag）
+ *
+ * 嵌套 worktree 处理：检测 gitRoot ≠ canonicalRoot 且嵌套关系，跳过主 repo 内
+ * 但 worktree 外的 Project 类型文件（避免同一内容被加载两次），Local 文件不受影响。
+ *
+ * --add-dir 支持：`CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD` 环境变量启用时，
+ * 从额外目录加载 Project 类型文件。
+ *
+ * @param forceIncludeExternal 强制允许加载 cwd 外部的 @include 引用文件
+ *   （仅用于 getExternalClaudeMdIncludes 的审批检查，普通调用不传）
+ * @returns 按加载顺序排列的 MemoryFileInfo 数组
+ */
 export const getMemoryFiles = memoize(
   async (forceIncludeExternal: boolean = false): Promise<MemoryFileInfo[]> => {
     const startTime = Date.now()
@@ -795,12 +934,13 @@ export const getMemoryFiles = memoize(
     const result: MemoryFileInfo[] = []
     const processedPaths = new Set<string>()
     const config = getCurrentProjectConfig()
+    // forceIncludeExternal 强制开启时，或项目已授权外部包含时，允许加载外部文件
     const includeExternal =
       forceIncludeExternal ||
       config.hasClaudeMdExternalIncludesApproved ||
       false
 
-    // Process Managed file first (always loaded - policy settings)
+    // 1. 加载 Managed 文件（始终加载，用于全局策略指令）
     const managedClaudeMd = getMemoryPath('Managed')
     result.push(
       ...(await processMemoryFile(
@@ -810,7 +950,7 @@ export const getMemoryFiles = memoize(
         includeExternal,
       )),
     )
-    // Process Managed .claude/rules/*.md files
+    // 加载 Managed .claude/rules/*.md 中的无条件规则
     const managedClaudeRulesDir = getManagedClaudeRulesDir()
     result.push(
       ...(await processMdRules({
@@ -822,7 +962,7 @@ export const getMemoryFiles = memoize(
       })),
     )
 
-    // Process User file (only if userSettings is enabled)
+    // 2. 加载 User 文件（需 userSettings 启用）
     if (isSettingSourceEnabled('userSettings')) {
       const userClaudeMd = getMemoryPath('User')
       result.push(
@@ -830,10 +970,10 @@ export const getMemoryFiles = memoize(
           userClaudeMd,
           'User',
           processedPaths,
-          true, // User memory can always include external files
+          true, // User 记忆始终允许包含外部文件
         )),
       )
-      // Process User ~/.claude/rules/*.md files
+      // 加载 User ~/.claude/rules/*.md 中的无条件规则
       const userClaudeRulesDir = getUserClaudeRulesDir()
       result.push(
         ...(await processMdRules({
@@ -846,25 +986,19 @@ export const getMemoryFiles = memoize(
       )
     }
 
-    // Then process Project and Local files
+    // 3. 加载 Project 和 Local 文件：收集从 originalCwd 向上直到根目录的所有目录
     const dirs: string[] = []
     const originalCwd = getOriginalCwd()
     let currentDir = originalCwd
 
+    // 向上遍历目录树，收集路径（从 CWD 到根目录，不含根目录）
     while (currentDir !== parse(currentDir).root) {
       dirs.push(currentDir)
       currentDir = dirname(currentDir)
     }
 
-    // When running from a git worktree nested inside its main repo (e.g.,
-    // .claude/worktrees/<name>/ from `claude -w`), the upward walk passes
-    // through both the worktree root and the main repo root. Both contain
-    // checked-in files like CLAUDE.md and .claude/rules/*.md, so the same
-    // content gets loaded twice. Skip Project-type (checked-in) files from
-    // directories above the worktree but within the main repo — the worktree
-    // already has its own checkout. CLAUDE.local.md is gitignored so it only
-    // exists in the main repo and is still loaded.
-    // See: https://github.com/anthropics/claude-code/issues/29599
+    // 嵌套 worktree 检测：gitRoot（worktree 工作目录）≠ canonicalRoot（主 repo 根目录）
+    // 且 gitRoot 在 canonicalRoot 内部时，说明当前在嵌套 worktree 中
     const gitRoot = findGitRoot(originalCwd)
     const canonicalRoot = findCanonicalGitRoot(originalCwd)
     const isNestedWorktree =
@@ -874,16 +1008,15 @@ export const getMemoryFiles = memoize(
         normalizePathForComparison(canonicalRoot) &&
       pathInWorkingPath(gitRoot, canonicalRoot)
 
-    // Process from root downward to CWD
+    // 反转目录列表，从根目录向下加载（根目录优先级最低，CWD 最高）
     for (const dir of dirs.reverse()) {
-      // In a nested worktree, skip checked-in files from the main repo's
-      // working tree (dirs inside canonicalRoot but outside the worktree).
+      // 嵌套 worktree 中跳过主 repo 内（但 worktree 外）的 Project 文件，避免重复加载
       const skipProject =
         isNestedWorktree &&
         pathInWorkingPath(dir, canonicalRoot) &&
         !pathInWorkingPath(dir, gitRoot)
 
-      // Try reading CLAUDE.md (Project) - only if projectSettings is enabled
+      // 加载 Project 类型文件（需 projectSettings 启用且未被跳过）
       if (isSettingSourceEnabled('projectSettings') && !skipProject) {
         const projectPath = join(dir, 'CLAUDE.md')
         result.push(
@@ -895,7 +1028,7 @@ export const getMemoryFiles = memoize(
           )),
         )
 
-        // Try reading .claude/CLAUDE.md (Project)
+        // 加载 .claude/CLAUDE.md（Project）
         const dotClaudePath = join(dir, '.claude', 'CLAUDE.md')
         result.push(
           ...(await processMemoryFile(
@@ -906,7 +1039,7 @@ export const getMemoryFiles = memoize(
           )),
         )
 
-        // Try reading .claude/rules/*.md files (Project)
+        // 加载 .claude/rules/*.md 中的无条件规则（Project）
         const rulesDir = join(dir, '.claude', 'rules')
         result.push(
           ...(await processMdRules({
@@ -919,7 +1052,7 @@ export const getMemoryFiles = memoize(
         )
       }
 
-      // Try reading CLAUDE.local.md (Local) - only if localSettings is enabled
+      // 加载 Local 类型文件 CLAUDE.local.md（需 localSettings 启用）
       if (isSettingSourceEnabled('localSettings')) {
         const localPath = join(dir, 'CLAUDE.local.md')
         result.push(
@@ -933,14 +1066,12 @@ export const getMemoryFiles = memoize(
       }
     }
 
-    // Process CLAUDE.md from additional directories (--add-dir) if env var is enabled
-    // This is controlled by CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD and defaults to off
-    // Note: we don't check isSettingSourceEnabled('projectSettings') here because --add-dir
-    // is an explicit user action and the SDK defaults settingSources to [] when not specified
+    // 4. 额外目录（--add-dir）支持：环境变量启用时从额外目录加载 Project 文件
+    // 注：不检查 projectSettings，因为 --add-dir 是用户显式操作，SDK 默认 settingSources 为 []
     if (isEnvTruthy(process.env.CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD)) {
       const additionalDirs = getAdditionalDirectoriesForClaudeMd()
       for (const dir of additionalDirs) {
-        // Try reading CLAUDE.md from the additional directory
+        // 从额外目录加载 CLAUDE.md
         const projectPath = join(dir, 'CLAUDE.md')
         result.push(
           ...(await processMemoryFile(
@@ -951,7 +1082,7 @@ export const getMemoryFiles = memoize(
           )),
         )
 
-        // Try reading .claude/CLAUDE.md from the additional directory
+        // 从额外目录加载 .claude/CLAUDE.md
         const dotClaudePath = join(dir, '.claude', 'CLAUDE.md')
         result.push(
           ...(await processMemoryFile(
@@ -962,7 +1093,7 @@ export const getMemoryFiles = memoize(
           )),
         )
 
-        // Try reading .claude/rules/*.md files from the additional directory
+        // 从额外目录加载 .claude/rules/*.md 中的无条件规则
         const rulesDir = join(dir, '.claude', 'rules')
         result.push(
           ...(await processMdRules({
@@ -976,7 +1107,7 @@ export const getMemoryFiles = memoize(
       }
     }
 
-    // Memdir entrypoint (memory.md) - only if feature is on and file exists
+    // 5. AutoMem（MEMORY.md）入口文件：功能开关启用且文件存在时加载
     if (isAutoMemoryEnabled()) {
       const { info: memdirEntry } = await safelyReadMemoryFileAsync(
         getAutoMemEntrypoint(),
@@ -991,7 +1122,7 @@ export const getMemoryFiles = memoize(
       }
     }
 
-    // Team memory entrypoint - only if feature is on and file exists
+    // 6. TeamMem（团队共享记忆）入口文件：TEAMMEM feature 启用时加载
     if (feature('TEAMMEM') && teamMemPaths!.isTeamMemoryEnabled()) {
       const { info: teamMemEntry } = await safelyReadMemoryFileAsync(
         teamMemPaths!.getTeamMemEntrypoint(),
@@ -1022,6 +1153,7 @@ export const getMemoryFiles = memoize(
       typeCounts[f.type] = (typeCounts[f.type] ?? 0) + 1
     }
 
+    // 仅在会话首次加载时上报 analytics 事件，避免重复记录
     if (!hasLoggedInitialLoad) {
       hasLoggedInitialLoad = true
       logEvent('tengu_claudemd__initial_load', {
@@ -1039,23 +1171,18 @@ export const getMemoryFiles = memoize(
       })
     }
 
-    // Fire InstructionsLoaded hook for each instruction file loaded
-    // (fire-and-forget, audit/observability only).
-    // AutoMem/TeamMem are intentionally excluded — they're a separate
-    // memory system, not "instructions" in the CLAUDE.md/rules sense.
-    // Gated on !forceIncludeExternal: the forceIncludeExternal=true variant
-    // is only used by getExternalClaudeMdIncludes() for approval checks, not
-    // for building context — firing the hook there would double-fire on startup.
-    // The one-shot flag is consumed on every !forceIncludeExternal cache miss
-    // (NOT gated on hasInstructionsLoadedHook) so the flag is released even
-    // when no hook is configured — otherwise a mid-session hook registration
-    // followed by a direct .cache.clear() would spuriously fire with a stale
-    // 'session_start' reason.
+    // 触发 InstructionsLoaded hook（仅 !forceIncludeExternal 时）：
+    // - forceIncludeExternal=true 仅用于 getExternalClaudeMdIncludes 的审批检查，
+    //   不是真正的上下文构建，在此触发会导致重复触发
+    // - AutoMem / TeamMem 排除在外（不属于 CLAUDE.md/rules 意义上的"指令"）
+    // - one-shot 标志即使没有 hook 也会消费，防止会话中途注册 hook 后
+    //   因直接 .cache.clear() 导致 'session_start' 原因错报
     if (!forceIncludeExternal) {
       const eagerLoadReason = consumeNextEagerLoadReason()
       if (eagerLoadReason !== undefined && hasInstructionsLoadedHook()) {
         for (const file of result) {
           if (!isInstructionsMemoryType(file.type)) continue
+          // @include 来的文件使用 'include' 原因，顶层文件使用 eagerLoadReason
           const loadReason = file.parent ? 'include' : eagerLoadReason
           void executeInstructionsLoadedHooks(
             file.path,
@@ -1108,19 +1235,33 @@ function consumeNextEagerLoadReason(): InstructionsLoadReason | undefined {
 }
 
 /**
- * Clears the getMemoryFiles memoize cache
- * without firing the InstructionsLoaded hook.
+ * 清除 `getMemoryFiles` 的 memoize 缓存，**不**触发 InstructionsLoaded hook。
  *
- * Use this for cache invalidation that is purely for correctness (e.g.
- * worktree enter/exit, settings sync, /memory dialog). For events that
- * represent instructions actually being reloaded into context (e.g.
- * compaction), use resetGetMemoryFilesCache() instead.
+ * 适用于仅需缓存失效（正确性保障）的场景，如：
+ * - worktree 进入/退出
+ * - 设置同步
+ * - /memory 对话框刷新
+ *
+ * 若需同时触发 InstructionsLoaded hook（如压缩后重载指令），
+ * 请改用 `resetGetMemoryFilesCache()`。
  */
 export function clearMemoryFileCaches(): void {
-  // ?.cache because tests spyOn this, which replaces the memoize wrapper.
+  // ?.cache：测试中可能通过 spyOn 替换 memoize wrapper，此时 .cache 可能不存在
   getMemoryFiles.cache?.clear?.()
 }
 
+/**
+ * 重置 `getMemoryFiles` 的 memoize 缓存，并**启用** InstructionsLoaded hook。
+ *
+ * 与 `clearMemoryFileCaches()` 的区别：
+ * - 设置 `nextEagerLoadReason`，下次缓存未命中时以指定原因触发 hook
+ * - 重新启用 `shouldFireHook` 标志
+ * - 然后委托给 `clearMemoryFileCaches()` 清除缓存
+ *
+ * 适用于指令实际被重新加载进上下文的场景（如压缩后，reason 为 'compact'）。
+ *
+ * @param reason 触发 InstructionsLoaded hook 时报告的原因（默认 'session_start'）
+ */
 export function resetGetMemoryFilesCache(
   reason: InstructionsLoadReason = 'session_start',
 ): void {
@@ -1129,15 +1270,27 @@ export function resetGetMemoryFilesCache(
   clearMemoryFileCaches()
 }
 
+/**
+ * 从 MemoryFileInfo 列表中筛选出超过字符数上限的大文件。
+ *
+ * 供 /memory 界面等调用方展示警告，提醒用户某些记忆文件过大。
+ *
+ * @param files getMemoryFiles() 返回的文件列表
+ * @returns 内容长度超过 MAX_MEMORY_CHARACTER_COUNT 的文件列表
+ */
 export function getLargeMemoryFiles(files: MemoryFileInfo[]): MemoryFileInfo[] {
   return files.filter(f => f.content.length > MAX_MEMORY_CHARACTER_COUNT)
 }
 
 /**
- * When tengu_moth_copse is on, the findRelevantMemories prefetch surfaces
- * memory files via attachments, so the MEMORY.md index is no longer injected
- * into the system prompt. Callsites that care about "what's actually in
- * context" (context builder, /context viz) should filter through this.
+ * 根据 `tengu_moth_copse` 功能开关过滤注入系统提示的记忆文件。
+ *
+ * 当 `tengu_moth_copse` 开启时，`findRelevantMemories` 预取机制会通过 attachment
+ * 注入记忆文件，因此 MEMORY.md 索引不再写入系统提示。关心"实际进入上下文的文件"
+ * 的调用方（上下文构建器、/context 可视化）应通过本函数过滤。
+ *
+ * @param files 完整记忆文件列表
+ * @returns 过滤后的文件列表（开关关闭时返回原列表，开启时去除 AutoMem / TeamMem）
  */
 export function filterInjectedMemoryFiles(
   files: MemoryFileInfo[],
@@ -1146,10 +1299,33 @@ export function filterInjectedMemoryFiles(
     'tengu_moth_copse',
     false,
   )
+  // 功能开关未启用时，所有文件均注入系统提示，无需过滤
   if (!skipMemoryIndex) return files
+  // 开启时，AutoMem / TeamMem 通过 attachment 注入，从系统提示中排除
   return files.filter(f => f.type !== 'AutoMem' && f.type !== 'TeamMem')
 }
 
+/**
+ * 将 MemoryFileInfo 列表格式化为注入系统提示的记忆文本。
+ *
+ * 格式为：
+ * ```
+ * <MEMORY_INSTRUCTION_PROMPT>
+ *
+ * Contents of <path> (<description>):
+ *
+ * <content>
+ *
+ * Contents of ...
+ * ```
+ * TeamMem 内容额外用 `<team-memory-content source="shared">` 包裹。
+ *
+ * `tengu_paper_halyard` 开关启用时跳过 Project / Local 类型文件。
+ *
+ * @param memoryFiles 记忆文件列表（通常来自 filterInjectedMemoryFiles 的结果）
+ * @param filter 可选类型过滤函数，返回 false 的类型跳过
+ * @returns 格式化后的系统提示字符串，无内容时返回空字符串
+ */
 export const getClaudeMds = (
   memoryFiles: MemoryFileInfo[],
   filter?: (type: MemoryType) => boolean,
@@ -1195,12 +1371,16 @@ export const getClaudeMds = (
 }
 
 /**
- * Gets managed and user conditional rules that match the target path.
- * This is the first phase of nested memory loading.
+ * 获取与目标路径匹配的 Managed 和 User 条件规则（嵌套内存加载的第一阶段）。
  *
- * @param targetPath The target file path to match against glob patterns
- * @param processedPaths Set of already processed file paths (will be mutated)
- * @returns Array of MemoryFileInfo objects for matching conditional rules
+ * 在嵌套内存加载流程中，本函数负责收集全局级别的条件规则：
+ * 1. 始终处理 Managed（管理级）的 .claude/rules/ 目录中含 frontmatter globs 的规则文件
+ * 2. 仅当 userSettings 启用时，额外处理 User（用户级）的 .claude/rules/ 条件规则
+ *    User 规则启用 includeExternal=true，允许引用 CWD 以外的文件
+ *
+ * @param targetPath 目标文件路径，用于与规则的 frontmatter glob 模式进行匹配
+ * @param processedPaths 已处理文件路径集合（会被本函数写入，防止重复加载）
+ * @returns 所有与 targetPath 匹配的条件规则 MemoryFileInfo 数组
  */
 export async function getManagedAndUserConditionalRules(
   targetPath: string,
@@ -1208,7 +1388,7 @@ export async function getManagedAndUserConditionalRules(
 ): Promise<MemoryFileInfo[]> {
   const result: MemoryFileInfo[] = []
 
-  // Process Managed conditional .claude/rules/*.md files
+  // 处理 Managed（管理员下发）级别的条件规则：.claude/rules/*.md（含 frontmatter globs）
   const managedClaudeRulesDir = getManagedClaudeRulesDir()
   result.push(
     ...(await processConditionedMdRules(
@@ -1216,12 +1396,12 @@ export async function getManagedAndUserConditionalRules(
       managedClaudeRulesDir,
       'Managed',
       processedPaths,
-      false,
+      false, // Managed 规则不允许引用外部文件
     )),
   )
 
   if (isSettingSourceEnabled('userSettings')) {
-    // Process User conditional .claude/rules/*.md files
+    // userSettings 启用时，追加用户级条件规则
     const userClaudeRulesDir = getUserClaudeRulesDir()
     result.push(
       ...(await processConditionedMdRules(
@@ -1229,7 +1409,7 @@ export async function getManagedAndUserConditionalRules(
         userClaudeRulesDir,
         'User',
         processedPaths,
-        true,
+        true, // User 规则允许 @include 引用 CWD 外部文件
       )),
     )
   }
@@ -1238,13 +1418,21 @@ export async function getManagedAndUserConditionalRules(
 }
 
 /**
- * Gets memory files for a single nested directory (between CWD and target).
- * Loads CLAUDE.md, unconditional rules, and conditional rules for that directory.
+ * 为单个嵌套目录（CWD 与目标文件之间的某一层级）加载内存文件。
  *
- * @param dir The directory to process
- * @param targetPath The target file path (for conditional rule matching)
- * @param processedPaths Set of already processed file paths (will be mutated)
- * @returns Array of MemoryFileInfo objects
+ * 对指定目录依次执行：
+ * 1. 加载 CLAUDE.md 和 .claude/CLAUDE.md（Project 类型，需 projectSettings 启用）
+ * 2. 加载 CLAUDE.local.md（Local 类型，需 localSettings 启用）
+ * 3. 加载该目录 .claude/rules/ 下的无条件规则（unconditional，conditionalRule=false）
+ *    使用独立的 unconditionalProcessedPaths 集合，避免把无条件规则路径提前写入
+ *    主集合而导致后续条件规则加载时误判为"已处理"
+ * 4. 加载该目录 .claude/rules/ 下与 targetPath 匹配的条件规则（conditionalRule=true）
+ * 5. 将独立集合中的路径合并回主 processedPaths，供后续更高层目录使用
+ *
+ * @param dir 要处理的嵌套目录路径
+ * @param targetPath 目标文件路径（用于条件规则 glob 匹配）
+ * @param processedPaths 已处理文件路径集合（会被本函数写入）
+ * @returns 该目录下所有匹配的 MemoryFileInfo 数组
  */
 export async function getMemoryFilesForNestedDirectory(
   dir: string,
@@ -1253,7 +1441,7 @@ export async function getMemoryFilesForNestedDirectory(
 ): Promise<MemoryFileInfo[]> {
   const result: MemoryFileInfo[] = []
 
-  // Process project memory files (CLAUDE.md and .claude/CLAUDE.md)
+  // 加载项目级内存文件：CLAUDE.md 和 .claude/CLAUDE.md
   if (isSettingSourceEnabled('projectSettings')) {
     const projectPath = join(dir, 'CLAUDE.md')
     result.push(
@@ -1275,7 +1463,7 @@ export async function getMemoryFilesForNestedDirectory(
     )
   }
 
-  // Process local memory file (CLAUDE.local.md)
+  // 加载本地私有内存文件：CLAUDE.local.md（不提交到版本库）
   if (isSettingSourceEnabled('localSettings')) {
     const localPath = join(dir, 'CLAUDE.local.md')
     result.push(
@@ -1285,8 +1473,9 @@ export async function getMemoryFilesForNestedDirectory(
 
   const rulesDir = join(dir, '.claude', 'rules')
 
-  // Process project unconditional .claude/rules/*.md files, which were not eagerly loaded
-  // Use a separate processedPaths set to avoid marking conditional rule files as processed
+  // 加载该目录下未经急加载的无条件规则（conditionalRule=false）
+  // 使用独立集合，避免无条件规则路径污染主 processedPaths，
+  // 导致后续条件规则（conditionalRule=true）被误认为已处理而跳过
   const unconditionalProcessedPaths = new Set(processedPaths)
   result.push(
     ...(await processMdRules({
@@ -1298,7 +1487,7 @@ export async function getMemoryFilesForNestedDirectory(
     })),
   )
 
-  // Process project conditional .claude/rules/*.md files
+  // 加载该目录下与 targetPath 匹配的条件规则（含 frontmatter globs 的规则文件）
   result.push(
     ...(await processConditionedMdRules(
       targetPath,
@@ -1309,7 +1498,7 @@ export async function getMemoryFilesForNestedDirectory(
     )),
   )
 
-  // processedPaths must be seeded with unconditional paths for subsequent directories
+  // 将无条件规则路径合并回主集合，供后续更高层级目录使用
   for (const path of unconditionalProcessedPaths) {
     processedPaths.add(path)
   }
@@ -1318,38 +1507,52 @@ export async function getMemoryFilesForNestedDirectory(
 }
 
 /**
- * Gets conditional rules for a CWD-level directory (from root up to CWD).
- * Only processes conditional rules since unconditional rules are already loaded eagerly.
+ * 获取 CWD 层级目录（从根目录到 CWD 路径上各节点）的条件规则。
  *
- * @param dir The directory to process
- * @param targetPath The target file path (for conditional rule matching)
- * @param processedPaths Set of already processed file paths (will be mutated)
- * @returns Array of MemoryFileInfo objects
+ * 与 `getMemoryFilesForNestedDirectory` 不同，此函数仅处理条件规则（conditionalRule=true），
+ * 因为 CWD 层级的无条件规则已在启动时急加载（eagerly loaded）。
+ * 直接委托给 `processConditionedMdRules`，传入该目录的 .claude/rules 路径。
+ *
+ * @param dir 要处理的目录路径（CWD 或其祖先目录之一）
+ * @param targetPath 目标文件路径（用于 frontmatter glob 匹配）
+ * @param processedPaths 已处理文件路径集合（会被本函数写入）
+ * @returns 与 targetPath 匹配的条件规则 MemoryFileInfo 数组
  */
 export async function getConditionalRulesForCwdLevelDirectory(
   dir: string,
   targetPath: string,
   processedPaths: Set<string>,
 ): Promise<MemoryFileInfo[]> {
+  // 组装该目录的 .claude/rules 路径，直接委托条件规则处理
   const rulesDir = join(dir, '.claude', 'rules')
   return processConditionedMdRules(
     targetPath,
     rulesDir,
     'Project',
     processedPaths,
-    false,
+    false, // CWD 层级 Project 规则不引用外部文件
   )
 }
 
 /**
- * Processes all .md files in the .claude/rules/ directory and its subdirectories,
- * filtering to only include files with frontmatter paths that match the target path
- * @param targetPath The file path to match against frontmatter glob patterns
- * @param rulesDir The path to the rules directory
- * @param type Type of memory file (User, Project, Local)
- * @param processedPaths Set of already processed file paths
- * @param includeExternal Whether to include external files
- * @returns Array of MemoryFileInfo objects that match the target path
+ * 扫描 .claude/rules/ 目录下所有 .md 文件，过滤出 frontmatter globs 与目标路径匹配的条件规则。
+ *
+ * 处理流程：
+ * 1. 调用 `processMdRules` 读取 rulesDir 下全部 .md 文件（conditionalRule=true，
+ *    即仅返回含 frontmatter `paths:` 字段的规则文件）
+ * 2. 对每个文件，根据 type 计算 glob 匹配的基准目录：
+ *    - Project：取 rulesDir 所属 .claude/ 的父目录（即项目根目录）
+ *    - Managed / User：取 getOriginalCwd()（启动时的工作目录）
+ * 3. 将 targetPath 转为相对于 baseDir 的路径；若路径逃逸（以 `../` 开头）
+ *    或为绝对路径（Windows 跨驱动器 relative() 可能返回绝对路径），直接排除
+ * 4. 使用 `ignore().add(file.globs).ignores(relativePath)` 执行 gitignore 风格匹配
+ *
+ * @param targetPath 目标文件路径（绝对或相对），用于与规则 frontmatter 中的 glob 模式匹配
+ * @param rulesDir .claude/rules/ 目录路径
+ * @param type 规则类型（User / Project / Managed），影响 glob 基准目录选择
+ * @param processedPaths 已处理路径集合（写入，防止重复加载）
+ * @param includeExternal 是否允许 @include 引用 CWD 外部文件
+ * @returns 与 targetPath 匹配的规则 MemoryFileInfo 数组
  */
 export async function processConditionedMdRules(
   targetPath: string,
@@ -1358,6 +1561,7 @@ export async function processConditionedMdRules(
   processedPaths: Set<string>,
   includeExternal: boolean,
 ): Promise<MemoryFileInfo[]> {
+  // 先加载所有含 frontmatter globs 的条件规则文件
   const conditionedRuleMdFiles = await processMdRules({
     rulesDir,
     type,
@@ -1366,25 +1570,26 @@ export async function processConditionedMdRules(
     conditionalRule: true,
   })
 
-  // Filter to only include files whose globs patterns match the targetPath
+  // 过滤：仅保留 globs 不为空且与 targetPath 匹配的规则文件
   return conditionedRuleMdFiles.filter(file => {
     if (!file.globs || file.globs.length === 0) {
+      // 无 globs 的条件规则文件不应出现在此，但做防御性过滤
       return false
     }
 
-    // For Project rules: glob patterns are relative to the directory containing .claude
-    // For Managed/User rules: glob patterns are relative to the original CWD
+    // Project 规则：glob 相对于 .claude 的父目录（即项目根）
+    // Managed/User 规则：glob 相对于启动时 CWD
     const baseDir =
       type === 'Project'
-        ? dirname(dirname(rulesDir)) // Parent of .claude
-        : getOriginalCwd() // Project root for managed/user rules
+        ? dirname(dirname(rulesDir)) // .claude/rules → .claude → 项目根
+        : getOriginalCwd() // 管理/用户规则统一以启动 CWD 为基准
 
+    // 将 targetPath 转为相对路径，用于 gitignore 风格 glob 匹配
     const relativePath = isAbsolute(targetPath)
       ? relative(baseDir, targetPath)
       : targetPath
-    // ignore() throws on empty strings, paths escaping the base (../),
-    // and absolute paths (Windows cross-drive relative() returns absolute).
-    // Files outside baseDir can't match baseDir-relative globs anyway.
+    // ignore() 对空字符串、逃逸路径（../）和绝对路径会抛出异常；
+    // CWD 外部路径本身也无法匹配 baseDir 相对的 glob，直接排除
     if (
       !relativePath ||
       relativePath.startsWith('..') ||
@@ -1392,6 +1597,7 @@ export async function processConditionedMdRules(
     ) {
       return false
     }
+    // 使用 ignore 库执行 gitignore 风格的 glob 匹配
     return ignore().add(file.globs).ignores(relativePath)
   })
 }
@@ -1401,11 +1607,23 @@ export type ExternalClaudeMdInclude = {
   parent: string
 }
 
+/**
+ * 收集内存文件列表中所有外部引用（@include 指向 CWD 以外的文件）。
+ *
+ * 判断条件：
+ * - 文件类型不为 'User'（User 级规则允许引用外部文件，无需警告）
+ * - 文件有 parent 字段（即通过 @include 引入，而非直接发现）
+ * - 文件路径不在当前工作目录（pathInOriginalCwd 返回 false）
+ *
+ * @param files MemoryFileInfo 数组（通常由 getMemoryFiles 返回）
+ * @returns 外部引用信息数组，每项包含 path（被引用文件）和 parent（引用方文件）
+ */
 export function getExternalClaudeMdIncludes(
   files: MemoryFileInfo[],
 ): ExternalClaudeMdInclude[] {
   const externals: ExternalClaudeMdInclude[] = []
   for (const file of files) {
+    // 非 User 类型、来自 @include、且路径在 CWD 以外 → 视为外部引用
     if (file.type !== 'User' && file.parent && !pathInOriginalCwd(file.path)) {
       externals.push({ path: file.path, parent: file.parent })
     }
@@ -1413,34 +1631,65 @@ export function getExternalClaudeMdIncludes(
   return externals
 }
 
+/**
+ * 判断内存文件列表中是否存在外部引用（CWD 以外的 @include 文件）。
+ *
+ * 是 `getExternalClaudeMdIncludes` 的布尔值包装，
+ * 供调用方快速判断是否需要显示外部引用警告，而无需处理数组细节。
+ *
+ * @param files MemoryFileInfo 数组
+ * @returns 存在外部引用时返回 true，否则返回 false
+ */
 export function hasExternalClaudeMdIncludes(files: MemoryFileInfo[]): boolean {
   return getExternalClaudeMdIncludes(files).length > 0
 }
 
+/**
+ * 判断是否需要向用户显示外部 @include 引用警告。
+ *
+ * 若满足以下任一条件则跳过警告（返回 false）：
+ * - 用户已主动批准外部引用（hasClaudeMdExternalIncludesApproved=true）
+ * - 警告在本次会话中已显示过（hasClaudeMdExternalIncludesWarningShown=true）
+ *
+ * 否则，重新加载内存文件（includeProjectFiles=true）并检查是否存在外部引用。
+ *
+ * @returns 需要显示警告时返回 true，否则返回 false
+ */
 export async function shouldShowClaudeMdExternalIncludesWarning(): Promise<boolean> {
   const config = getCurrentProjectConfig()
   if (
-    config.hasClaudeMdExternalIncludesApproved ||
-    config.hasClaudeMdExternalIncludesWarningShown
+    config.hasClaudeMdExternalIncludesApproved ||      // 用户已批准，跳过警告
+    config.hasClaudeMdExternalIncludesWarningShown     // 已显示过，避免重复提示
   ) {
     return false
   }
 
+  // 重新加载含 Project 文件的内存列表，检查是否存在外部引用
   return hasExternalClaudeMdIncludes(await getMemoryFiles(true))
 }
 
 /**
- * Check if a file path is a memory file (CLAUDE.md, CLAUDE.local.md, or .claude/rules/*.md)
+ * 判断给定文件路径是否为内存文件（CLAUDE.md、CLAUDE.local.md 或 .claude/rules/*.md）。
+ *
+ * 判断规则（两条，任一满足即返回 true）：
+ * 1. 文件名为 "CLAUDE.md" 或 "CLAUDE.local.md"（不限目录深度）
+ * 2. 文件名以 ".md" 结尾，且路径中包含 `.claude/rules/`（或 Windows 下 `.claude\rules\`）
+ *
+ * 用于在 readFileState 缓存中快速筛选内存文件路径，
+ * 以便 `getAllMemoryFilePaths` 合并子目录中的内存文件。
+ *
+ * @param filePath 待判断的文件路径（绝对或相对均可）
+ * @returns 是内存文件路径时返回 true，否则返回 false
  */
 export function isMemoryFilePath(filePath: string): boolean {
   const name = basename(filePath)
 
-  // CLAUDE.md or CLAUDE.local.md anywhere
+  // 规则 1：文件名为 CLAUDE.md 或 CLAUDE.local.md（任意目录深度）
   if (name === 'CLAUDE.md' || name === 'CLAUDE.local.md') {
     return true
   }
 
-  // .md files in .claude/rules/ directories
+  // 规则 2：.md 扩展名且路径包含 .claude/rules/ 分隔符（跨平台兼容）
   if (
     name.endsWith('.md') &&
     filePath.includes(`${sep}.claude${sep}rules${sep}`)
@@ -1452,23 +1701,33 @@ export function isMemoryFilePath(filePath: string): boolean {
 }
 
 /**
- * Get all memory file paths from both standard discovery and readFileState.
- * Combines:
- * - getMemoryFiles() paths (CWD upward to root)
- * - readFileState paths matching memory patterns (includes child directories)
+ * 获取所有内存文件路径，合并标准发现路径和 readFileState 缓存中的内存文件路径。
+ *
+ * 两个来源：
+ * 1. `getMemoryFiles()` 返回的 MemoryFileInfo 列表（CWD 向上到根目录的标准加载）
+ *    仅包含内容非空的文件路径，过滤空文件避免无意义的监视
+ * 2. readFileState 缓存键中满足 `isMemoryFilePath()` 的路径
+ *    可覆盖子目录（CWD 以下）中用户手动打开的 CLAUDE.md / rules/*.md 文件
+ *
+ * 使用 Set 自动去重后转为数组返回。
+ *
+ * @param files getMemoryFiles() 返回的 MemoryFileInfo 数组
+ * @param readFileState 当前会话的文件状态缓存
+ * @returns 去重后的内存文件绝对路径数组
  */
 export function getAllMemoryFilePaths(
   files: MemoryFileInfo[],
   readFileState: FileStateCache,
 ): string[] {
   const paths = new Set<string>()
+  // 来源 1：标准加载的内存文件，仅收录内容非空的文件
   for (const file of files) {
     if (file.content.trim().length > 0) {
       paths.add(file.path)
     }
   }
 
-  // Add memory files from readFileState (includes child directories)
+  // 来源 2：readFileState 中满足内存文件命名规则的路径（含子目录）
   for (const filePath of cacheKeys(readFileState)) {
     if (isMemoryFilePath(filePath)) {
       paths.add(filePath)

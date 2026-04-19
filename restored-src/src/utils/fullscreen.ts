@@ -1,3 +1,23 @@
+/**
+ * 终端全屏模式管理模块。
+ *
+ * 在 Claude Code 系统中，该模块检测并控制终端的全屏（交互式）模式，
+ * 用于在交互会话中正确初始化和恢复终端状态：
+ * - 检测当前是否处于交互式终端环境
+ * - 通过环境变量与 spawnSync 判断全屏模式可用性
+ * - 配合 Ink UI 框架在全屏模式下渲染终端界面
+ * - 会话结束时恢复终端原始状态，避免光标/屏幕残留
+ */
+/**
+ * 终端全屏模式管理模块。
+ *
+ * 在 Claude Code 系统中，该模块检测并控制终端的全屏（交互式）模式，
+ * 用于在交互会话中正确初始化和恢复终端状态：
+ * - 检测当前是否处于交互式终端环境
+ * - 通过环境变量与 spawnSync 判断全屏模式可用性
+ * - 配合 Ink UI 框架在全屏模式下渲染终端界面
+ * - 会话结束时恢复终端原始状态，避免光标/屏幕残留
+ */
 import { spawnSync } from 'child_process'
 import { getIsInteractive } from '../bootstrap/state.js'
 import { logForDebugging } from './debug.js'

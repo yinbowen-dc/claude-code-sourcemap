@@ -1,25 +1,25 @@
 /**
+ * 参数占位符替换工具模块。
+ *
+ * 在 Claude Code 系统中，该模块为 skill/command 提示词中的 $ARGUMENTS
+ * 占位符提供替换功能，支持以下占位符形式：
+ * - $ARGUMENTS：替换为完整参数字符串
+ * - $ARGUMENTS[0]、$ARGUMENTS[1] 等：替换为按索引取出的单个参数
+ * - $0、$1 等：$ARGUMENTS[n] 的简写形式
+ * - 命名参数（如 $foo、$bar）：通过 frontmatter 中的 arguments 字段定义
+ *
+ * 参数解析使用 shell-quote，支持带引号的参数正确处理。
+ *
  * Utility for substituting $ARGUMENTS placeholders in skill/command prompts.
- *
- * Supports:
- * - $ARGUMENTS - replaced with the full arguments string
- * - $ARGUMENTS[0], $ARGUMENTS[1], etc. - replaced with individual indexed arguments
- * - $0, $1, etc. - shorthand for $ARGUMENTS[0], $ARGUMENTS[1]
- * - Named arguments (e.g., $foo, $bar) - when argument names are defined in frontmatter
- *
- * Arguments are parsed using shell-quote for proper shell argument handling.
  */
 
 import { tryParseShellCommand } from './bash/shellQuote.js'
 
 /**
- * Parse an arguments string into an array of individual arguments.
- * Uses shell-quote for proper shell argument parsing including quoted strings.
+ * 将参数字符串解析为单个参数数组。
+ * 使用 shell-quote 正确处理带引号的参数（单引号、双引号均支持）。
  *
- * Examples:
- * - "foo bar baz" => ["foo", "bar", "baz"]
- * - 'foo "hello world" baz' => ["foo", "hello world", "baz"]
- * - "foo 'hello world' baz" => ["foo", "hello world", "baz"]
+ * Parse an arguments string into an array of individual arguments.
  */
 export function parseArguments(args: string): string[] {
   if (!args || !args.trim()) {
@@ -40,12 +40,10 @@ export function parseArguments(args: string): string[] {
 }
 
 /**
- * Parse argument names from the frontmatter 'arguments' field.
- * Accepts either a space-separated string or an array of strings.
+ * 从 frontmatter 的 arguments 字段解析参数名称列表。
+ * 接受空格分隔的字符串或字符串数组，过滤空值和纯数字名称（与 $0/$1 简写冲突）。
  *
- * Examples:
- * - "foo bar baz" => ["foo", "bar", "baz"]
- * - ["foo", "bar", "baz"] => ["foo", "bar", "baz"]
+ * Parse argument names from the frontmatter 'arguments' field.
  */
 export function parseArgumentNames(
   argumentNames: string | string[] | undefined,
@@ -68,10 +66,8 @@ export function parseArgumentNames(
 }
 
 /**
- * Generate argument hint showing remaining unfilled args.
- * @param argNames - Array of argument names from frontmatter
- * @param typedArgs - Arguments the user has typed so far
- * @returns Hint string like "[arg2] [arg3]" or undefined if all filled
+ * 生成渐进式参数提示，显示用户尚未填写的参数名称。
+ * 例如已输入 1 个参数而 argNames 有 3 个时，返回 "[arg2] [arg3]"。
  */
 export function generateProgressiveArgumentHint(
   argNames: string[],
@@ -83,13 +79,12 @@ export function generateProgressiveArgumentHint(
 }
 
 /**
- * Substitute $ARGUMENTS placeholders in content with actual argument values.
+ * 将提示词内容中的 $ARGUMENTS 占位符替换为实际参数值。
+ * 替换顺序：命名参数 → $ARGUMENTS[n] 索引 → $n 简写 → $ARGUMENTS 整体。
+ * 若未找到任何占位符且 appendIfNoPlaceholder=true，则在末尾追加 "ARGUMENTS: {args}"。
+ * args 为 undefined/null 时直接返回原内容。
  *
- * @param content - The content containing placeholders
- * @param args - The raw arguments string (may be undefined/null)
- * @param appendIfNoPlaceholder - If true and no placeholders are found, appends "ARGUMENTS: {args}" to content
- * @param argumentNames - Optional array of named arguments (e.g., ["foo", "bar"]) that map to indexed positions
- * @returns The content with placeholders substituted
+ * Substitute $ARGUMENTS placeholders in content with actual argument values.
  */
 export function substituteArguments(
   content: string,

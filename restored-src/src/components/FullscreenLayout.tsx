@@ -1,3 +1,36 @@
+/**
+ * FullscreenLayout.tsx — REPL 全屏布局与未读消息追踪模块
+ *
+ * 在 Claude Code 系统流程中的位置：
+ *   REPL 根组件 → FullscreenLayout → ScrollBox（可滚动消息区）+ bottom（固定底部）
+ *   → 全屏模式：使用备用屏幕缓冲区（AlternateScreen）+ 固定高度布局
+ *   → 非全屏模式：顺序渲染，复用终端主滚动区
+ *
+ * 主要导出：
+ *   useUnseenDivider：追踪用户向上滚动时的未读分隔线位置与计数
+ *   countUnseenAssistantTurns：计算分隔线之后未见的 Claude 回复轮次数
+ *   computeUnseenDivider：构造传给 Messages 和 pill 的 UnseenDivider 对象
+ *   FullscreenLayout：主布局组件，全屏/非全屏双模式渲染
+ *   ScrollChromeContext：Context，供 StickyTracker 写入 stickyPrompt 而不必层层传 callback
+ *
+ * 内部组件（不导出）：
+ *   NewMessagesPill：悬浮在 ScrollBox 底部的"N new messages"胶囊按钮
+ *   StickyPromptHeader：固定高度=1 的对话上下文标题栏（防止 DECSTBM 区域抖动）
+ *   SuggestionsOverlay：斜杠命令建议列表浮层（通过 PromptOverlayContext 传入）
+ *   DialogOverlay：AutoModeOptInDialog 弹出层（绕过 ScrollBox 的剪切区域）
+ *
+ * React Compiler 优化：
+ *   FullscreenLayout 使用 _c(47) 分配 47 个缓存槽，
+ *   NewMessagesPill 使用 _c(10)，StickyPromptHeader 使用 _c(8)，
+ *   SuggestionsOverlay 使用 _c(4)，DialogOverlay 使用 _c(2)
+ *
+ * 关键设计：
+ *   - pillVisible 通过 useSyncExternalStore 直接订阅 ScrollBox，
+ *     避免每帧滚动触发 REPL 重渲染
+ *   - dividerYRef 仅用 ref（不用 state）存储 y 坐标，
+ *     确保 onScrollAway 在同一批次中既可读又可写
+ *   - _temp3（useLayoutEffect 回调）在全屏模式下注册超链接点击处理器
+ */
 import { c as _c } from "react/compiler-runtime";
 import figures from 'figures';
 import React, { createContext, type ReactNode, type RefObject, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
@@ -16,7 +49,7 @@ import { isNullRenderingAttachment } from './messages/nullRenderingAttachments.j
 import PromptInputFooterSuggestions from './PromptInput/PromptInputFooterSuggestions.js';
 import type { StickyPrompt } from './VirtualMessageList.js';
 
-/** Rows of transcript context kept visible above the modal pane's ▔ divider. */
+/** 全屏模式下，modal 浮层上方保留可见的转录行数（用于提供上下文）*/
 const MODAL_TRANSCRIPT_PEEK = 2;
 
 /** Context for scroll-derived chrome (sticky header, pill). StickyTracker
@@ -83,6 +116,28 @@ type Props = {
  * `onScrollAway` must be called by every scroll-away action with the
  * handle; `onRepin` by submit/scroll-to-bottom.
  */
+/**
+ * useUnseenDivider — 追踪"N 条新消息"分隔线的位置与可见性
+ *
+ * 整体流程：
+ *   1. dividerIndex（state）：分隔线在 messages[] 中的插入位置，
+ *      null 表示当前固定在底部（sticky）；
+ *      首次向上滚动时通过 onScrollAway 快照当前 messageCount 来设置
+ *   2. dividerYRef（ref）：首次 onScrollAway 时快照的 scrollHeight，
+ *      即分隔线在内容坐标中的 y 位置，供 FullscreenLayout 的 pillVisible 订阅对比
+ *   3. onScrollAway：每次滚动动作触发；仅在首次离开底部（dividerYRef===null）时
+ *      才快照，后续调用为纯 ref 操作（不触发 REPL 重渲染）
+ *   4. onRepin：用户提交/滚回底部时调用，设置 dividerIndex=null；
+ *      dividerYRef 的清空推迟到 useEffect，防止同帧的 trackpad 滚动事件
+ *      在 null 状态下立即重新快照
+ *   5. jumpToNew：调用 scrollToBottom()（而非 scrollTo(dividerY)），
+ *      保持 stickyScroll=true 以便虚拟列表尾部挂载并固定 scrollTop
+ *   6. shiftDivider：无限历史向上加载时，同步调整 dividerIndex 和 dividerYRef
+ *
+ * 在系统中的角色：
+ *   由 REPL 调用，提供 dividerIndex（给 Messages 渲染分隔线）
+ *   和 dividerYRef（给 FullscreenLayout 驱动 pill 显隐）
+ */
 export function useUnseenDivider(messageCount: number): {
   /** Index into messages[] where the divider line renders. Cleared on
    *  sticky-resume (scroll back to bottom) so the "N new" line doesn't
@@ -101,70 +156,58 @@ export function useUnseenDivider(messageCount: number): {
    *  heightDelta = content height growth in rows. */
   shiftDivider: (indexDelta: number, heightDelta: number) => void;
 } {
+  // dividerIndex：null = 固定在底部（sticky）；数字 = 分隔线插入位置
   const [dividerIndex, setDividerIndex] = useState<number | null>(null);
-  // Ref holds the current count for onScrollAway to snapshot. Written in
-  // the render body (not useEffect) so wheel events arriving between a
-  // message-append render and its effect flush don't capture a stale
-  // count (off-by-one in the baseline). React Compiler bails out here —
-  // acceptable for a hook instantiated once in REPL.
+  // countRef：在渲染体中同步更新（非 useEffect），确保 onScrollAway 中
+  // 的快照不会因批量更新延迟而捕获到旧的消息计数（差一问题）
   const countRef = useRef(messageCount);
   countRef.current = messageCount;
-  // scrollHeight snapshot — the divider's y in content coords. Ref-only:
-  // read synchronously in onScrollAway (setState is batched, can't
-  // read-then-write in the same callback) AND by FullscreenLayout's
-  // pillVisible subscription. null = pinned to bottom.
+  // dividerYRef：内容坐标系中分隔线的 y 位置（scrollHeight 快照）
+  // 设计为 ref：onScrollAway 需要在同一回调中既读取又写入（setState 是批量的，
+  // 无法读后立即写）；且 FullscreenLayout 的 pillVisible 订阅也读取此 ref
   const dividerYRef = useRef<number | null>(null);
   const onRepin = useCallback(() => {
-    // Don't clear dividerYRef here — a trackpad momentum wheel event
-    // racing in the same stdin batch would see null and re-snapshot,
-    // overriding the setDividerIndex(null) below. The useEffect below
-    // clears the ref after React commits the null dividerIndex, so the
-    // ref stays non-null until the state settles.
+    // 注意：此处不清空 dividerYRef——trackpad 动量滚动事件可能在同一批次中到来，
+    // 若 ref 已清空，onScrollAway 会看到 null 并立即重新快照，覆盖掉下方的 setDividerIndex(null)。
+    // ref 的清空推迟到下方 useEffect 中（React commit 后执行），确保状态稳定后才解锁快照。
     setDividerIndex(null);
   }, []);
   const onScrollAway = useCallback((handle: ScrollBoxHandle) => {
-    // Nothing below the viewport → nothing to jump to. Covers both:
-    // • empty/short session: scrollUp calls scrollTo(0) which breaks sticky
-    //   even at scrollTop=0 (wheel-up on fresh session showed the pill)
-    // • click-to-select at bottom: useDragToScroll.check() calls
-    //   scrollTo(current) to break sticky so streaming content doesn't shift
-    //   under the selection, then onScroll(false, …) — but scrollTop is still
-    //   at max (Sarah Deaton, #claude-code-feedback 2026-03-15)
-    // pendingDelta: scrollBy accumulates without updating scrollTop. Without
-    // it, wheeling up from max would see scrollTop==max and suppress the pill.
+    // 若视口下方没有隐藏内容，不显示 pill（避免以下误触发场景）：
+    // • 空会话/短会话：scrollUp 调用 scrollTo(0)，即使 scrollTop=0 也会打破 sticky
+    // • 底部点击选中：useDragToScroll 调用 scrollTo(current) 以防止流式内容位移，
+    //   此时 scrollTop 仍在最大值，不应触发 pill
+    // pendingDelta：scrollBy 不立即更新 scrollTop；不计入则首次上滚时 scrollTop==max 会误抑制 pill
     const max = Math.max(0, handle.getScrollHeight() - handle.getViewportHeight());
     if (handle.getScrollTop() + handle.getPendingDelta() >= max) return;
-    // Snapshot only on the FIRST scroll-away. onScrollAway fires on EVERY
-    // scroll action (not just the initial break from sticky) — this guard
-    // preserves the original baseline so the count doesn't reset on the
-    // second PageUp. Subsequent calls are ref-only no-ops (no REPL re-render).
+    // 仅在首次离开底部时快照（dividerYRef===null 才执行）：
+    // onScrollAway 每次滚动都会触发，但只有第一次需要记录基准，
+    // 后续 PageUp 不应重置计数，保证 pill 显示的是最初的未读消息数
     if (dividerYRef.current === null) {
       dividerYRef.current = handle.getScrollHeight();
-      // New scroll-away session → move the divider here (replaces old one)
+      // 开始新一轮"向上滚动会话"，将分隔线设置为当前消息位置
       setDividerIndex(countRef.current);
     }
   }, []);
   const jumpToNew = useCallback((handle_0: ScrollBoxHandle | null) => {
     if (!handle_0) return;
-    // scrollToBottom (not scrollTo(dividerY)): sets stickyScroll=true so
-    // useVirtualScroll mounts the tail and render-node-to-output pins
-    // scrollTop=maxScroll. scrollTo sets stickyScroll=false → the clamp
-    // (still at top-range bounds before React re-renders) pins scrollTop
-    // back, stopping short. The divider stays rendered (dividerIndex
-    // unchanged) so users see where new messages started; the clear on
-    // next submit/explicit scroll-to-bottom handles cleanup.
+    // 使用 scrollToBottom（而非 scrollTo(dividerY)）：
+    // scrollToBottom 会将 stickyScroll 设为 true，使虚拟列表挂载尾部内容并固定 scrollTop。
+    // 若用 scrollTo(dividerY)，stickyScroll 会被设为 false，
+    // 导致 clamp 在 React 重渲染前将 scrollTop 夹回边界，无法到达目标位置。
+    // 分隔线保持渲染（dividerIndex 不变），用户仍能看到新消息起始位置；
+    // 下次提交或显式滚回底部时会清除分隔线。
     handle_0.scrollToBottom();
   }, []);
 
-  // Sync dividerYRef with dividerIndex. When onRepin fires (submit,
-  // scroll-to-bottom), it sets dividerIndex=null but leaves the ref
-  // non-null — a wheel event racing in the same stdin batch would
-  // otherwise see null and re-snapshot. Deferring the ref clear to
-  // useEffect guarantees the ref stays non-null until React has committed
-  // the null dividerIndex, blocking the if-null guard in onScrollAway.
+  // 同步 dividerYRef 与 dividerIndex：
+  // onRepin 设置 dividerIndex=null 但不清空 ref；
+  // 若在 onRepin 后立即清空 ref，同一批次中的 trackpad 滚动事件会在 null 状态下重新快照。
+  // 推迟到 useEffect 确保 React commit null dividerIndex 后才解锁，
+  // 从而阻塞 onScrollAway 中的 if-null 快照守卫。
   //
-  // Also handles /clear, rewind, teammate-view swap — if the count drops
-  // below the divider index, the divider would point at nothing.
+  // 同时处理 /clear、rewind、teammate-view 切换等情况：
+  // 若消息数量下降到低于分隔线索引，分隔线将指向不存在的消息，需清除。
   useEffect(() => {
     if (dividerIndex === null) {
       dividerYRef.current = null;
@@ -190,25 +233,31 @@ export function useUnseenDivider(messageCount: number): {
 }
 
 /**
- * Counts assistant turns in messages[dividerIndex..end). A "turn" is what
- * users think of as "a new message from Claude" — not raw assistant entries
- * (one turn yields multiple entries: tool_use blocks + text blocks). We count
- * non-assistant→assistant transitions, but only for entries that actually
- * carry text — tool-use-only entries are skipped (like progress messages)
- * so "⏺ Searched for 13 patterns, read 6 files" doesn't tick the pill.
+ * countUnseenAssistantTurns — 统计分隔线之后用户未见的 Claude 回复轮次数
+ *
+ * 整体流程：
+ *   遍历 messages[dividerIndex..end)，计算"非 assistant → assistant"的转换次数，
+ *   但跳过以下条目（避免误计）：
+ *   - type === 'progress'：进度消息（工具调用进度）
+ *   - type === 'assistant' 且无可见文本（仅含 tool_use 块）：
+ *     如"⏺ Searched for 13 patterns, read 6 files"不应触发轮次计数
+ *
+ * 在系统中的角色：
+ *   为 computeUnseenDivider 提供轮次计数，最终显示在 pill 上（"N new messages"）。
  */
 export function countUnseenAssistantTurns(messages: readonly Message[], dividerIndex: number): number {
   let count = 0;
   let prevWasAssistant = false;
   for (let i = dividerIndex; i < messages.length; i++) {
     const m = messages[i]!;
+    // 跳过进度消息
     if (m.type === 'progress') continue;
-    // Tool-use-only assistant entries aren't "new messages" to the user —
-    // skip them the same way we skip progress. prevWasAssistant is NOT
-    // updated, so a text block immediately following still counts as the
-    // same turn (tool_use + text from one API response = 1).
+    // 仅含 tool_use 块的 assistant 条目不算作"新消息"——
+    // 与跳过 progress 逻辑相同；prevWasAssistant 不更新，
+    // 使其后紧跟的文本块仍算作同一轮次（tool_use + text = 1 轮）
     if (m.type === 'assistant' && !assistantHasVisibleText(m)) continue;
     const isAssistant = m.type === 'assistant';
+    // 仅在"非 assistant → assistant"的转换时递增计数（一轮次 = 一次转换）
     if (isAssistant && !prevWasAssistant) count++;
     prevWasAssistant = isAssistant;
   }
@@ -227,21 +276,25 @@ export type UnseenDivider = {
 };
 
 /**
- * Builds the unseenDivider object REPL passes to Messages + the pill.
- * Returns undefined only when no content has arrived past the divider
- * yet (messages[dividerIndex] doesn't exist). Once ANY message arrives
- * — including tool_use-only assistant entries and tool_result user entries
- * that countUnseenAssistantTurns skips — count floors at 1 so the pill
- * flips from "Jump to bottom" to "1 new message". Without the floor,
- * the pill stays "Jump to bottom" through an entire tool-call sequence
- * until Claude's text response lands.
+ * computeUnseenDivider — 构造传给 Messages 和 pill 的 UnseenDivider 对象
+ *
+ * 整体流程：
+ *   1. dividerIndex===null → 固定在底部，返回 undefined
+ *   2. 从 dividerIndex 向后跳过 progress 和 nullRenderingAttachment 条目，
+ *      找到第一个可渲染消息作为 anchor（Messages.tsx 中 dividerBeforeIndex 搜索的锚点）
+ *   3. 若 anchor 不存在（消息尚未到达），返回 undefined
+ *   4. 通过 countUnseenAssistantTurns 计算轮次数，下限 floor 为 1：
+ *      确保 pill 在有任何未见条目时（即使都是 tool_use / tool_result）
+ *      就从"Jump to bottom"切换到"1 new message"，而不等待 Claude 文本回复
+ *
+ * 在系统中的角色：
+ *   是 REPL 的纯函数，每次渲染调用一次，结果传给 Messages 和 NewMessagesPill。
  */
 export function computeUnseenDivider(messages: readonly Message[], dividerIndex: number | null): UnseenDivider | undefined {
   if (dividerIndex === null) return undefined;
-  // Skip progress and null-rendering attachments when picking the divider
-  // anchor — Messages.tsx filters these out of renderableMessages before the
-  // dividerBeforeIndex search, so their UUID wouldn't be found (CC-724).
-  // Hook attachments use randomUUID() so nothing shares their 24-char prefix.
+  // 跳过 progress 和 nullRenderingAttachments，找到第一个真实可渲染消息的 UUID
+  // （Messages.tsx 通过 renderableMessages 列表查找，这些条目不在其中，CC-724）
+  // Hook attachments 使用 randomUUID() 生成 UUID，不会与其他条目冲突
   let anchorIdx = dividerIndex;
   while (anchorIdx < messages.length && (messages[anchorIdx]?.type === 'progress' || isNullRenderingAttachment(messages[anchorIdx]!))) {
     anchorIdx++;
@@ -256,18 +309,28 @@ export function computeUnseenDivider(messages: readonly Message[], dividerIndex:
 }
 
 /**
- * Layout wrapper for the REPL. In fullscreen mode, puts scrollable
- * content in a sticky-scroll box and pins bottom content via flexbox.
- * Outside fullscreen mode, renders content sequentially so the existing
- * main-screen scrollback rendering works unchanged.
+ * FullscreenLayout — REPL 主布局组件（全屏/非全屏双模式）
  *
- * Fullscreen mode defaults on for ants (CLAUDE_CODE_NO_FLICKER=0 to opt out)
- * and off for external users (CLAUDE_CODE_NO_FLICKER=1 to opt in).
- * The <AlternateScreen> wrapper
- * (alt buffer + mouse tracking + height constraint) lives at REPL's root
- * so nothing can accidentally render outside it.
+ * 整体流程：
+ *   全屏模式（isFullscreenEnvEnabled() = true）：
+ *     1. 构建 stickyPrompt 标题栏（StickyPromptHeader）：
+ *        overlay 存在或 sticky==="clicked" 时隐藏；padCollapsed 控制 ScrollBox 顶部缩进
+ *     2. ScrollBox（flexGrow=1）包裹 scrollable 内容 + overlay，
+ *        内容区通过 ScrollChromeContext 注入 stickyPrompt 写入能力
+ *     3. NewMessagesPill：未读消息胶囊（通过 useSyncExternalStore 订阅 ScrollBox）
+ *     4. bottomFloat：绝对定位于 ScrollBox 区域右下角的浮层（如语音气泡）
+ *     5. bottom（输入框/权限请求等）：固定在页面底部，maxHeight="50%"
+ *     6. modal（斜杠命令对话框）：绝对定位覆盖 ScrollBox 和 bottom 区域
+ *     7. 全部包裹在 PromptOverlayProvider 中，供 SuggestionsOverlay/DialogOverlay 使用
+ *
+ *   非全屏模式：
+ *     直接顺序渲染 {scrollable}{bottom}{overlay}{modal}，利用终端主滚动区
+ *
+ * 在系统中的角色：
+ *   是 REPL 唯一的布局层，通过 props 接收各内容槽，实现滚动/固定底部/浮层的分离。
  */
 export function FullscreenLayout(t0) {
+  // React Compiler 分配 47 个缓存槽，对所有 JSX 节点和计算值进行细粒度记忆化
   const $ = _c(47);
   const {
     scrollable,

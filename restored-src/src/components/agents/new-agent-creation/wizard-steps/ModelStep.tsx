@@ -1,3 +1,19 @@
+/**
+ * ModelStep.tsx — Agent 创建向导：选择 AI 模型步骤
+ *
+ * 在 Claude Code 系统流程中的位置：
+ *   AgentTool → new-agent-creation/AgentWizard → wizard-steps/ModelStep（当前文件）
+ *
+ * 主要功能：
+ *   - 向用户呈现可用的 AI 模型列表（通过 ModelSelector 组件）
+ *   - 允许用户从向导共享数据中已有的 selectedModel 继续（编辑模式）
+ *   - 确认选择后将 selectedModel 写入 wizardData 并调用 goNext() 进入下一步
+ *
+ * 依赖：
+ *   - react/compiler-runtime (_c)：React 编译器自动生成的记忆化缓存机制
+ *   - useWizard：wizard 上下文钩子
+ *   - ModelSelector：封装了模型列表展示与选择逻辑的组件
+ */
 import { c as _c } from "react/compiler-runtime";
 import React, { type ReactNode } from 'react';
 import { ConfigurableShortcutHint } from '../../../ConfigurableShortcutHint.js';
@@ -7,45 +23,71 @@ import { useWizard } from '../../../wizard/index.js';
 import { WizardDialogLayout } from '../../../wizard/WizardDialogLayout.js';
 import { ModelSelector } from '../../ModelSelector.js';
 import type { AgentWizardData } from '../types.js';
+
+/**
+ * ModelStep — 向导模型选择步骤。
+ *
+ * 整体流程：
+ *   1. 从 useWizard 获取 goNext / goBack / updateWizardData / wizardData
+ *   2. 构建 handleComplete 回调：保存所选模型并前进到下一步
+ *   3. 构建静态底部快捷键提示 JSX（React 编译器确保只创建一次）
+ *   4. 将上述内容组装为 WizardDialogLayout + ModelSelector 返回
+ *
+ * 注意：wizardData.selectedModel 可能为 undefined（表示使用默认模型）。
+ */
 export function ModelStep() {
+  // React 编译器生成的记忆化缓存，共 8 个槽位
   const $ = _c(8);
+
+  // 从向导上下文获取导航方法和共享数据
   const {
     goNext,
     goBack,
     updateWizardData,
     wizardData
   } = useWizard();
+
+  // ── 槽位 $[0-2]：handleComplete 回调（依赖 goNext / updateWizardData）─────
   let t0;
   if ($[0] !== goNext || $[1] !== updateWizardData) {
+    // 任意依赖变化时，重新创建回调
     t0 = model => {
+      // 将用户选择的模型（可选）写入 wizard 共享数据
       updateWizardData({
         selectedModel: model
       });
+      // 前进到下一个向导步骤
       goNext();
     };
     $[0] = goNext;
     $[1] = updateWizardData;
-    $[2] = t0;
+    $[2] = t0; // 缓存新回调
   } else {
-    t0 = $[2];
+    t0 = $[2]; // 依赖未变，复用已缓存的回调
   }
   const handleComplete = t0;
+
+  // ── 槽位 $[3]：静态底部快捷键提示 JSX（仅首次渲染时创建）────────────────
   let t1;
   if ($[3] === Symbol.for("react.memo_cache_sentinel")) {
+    // 哨兵值说明该槽未初始化，创建快捷键提示：↑↓ 导航、Enter 选择、Esc 返回
     t1 = <Byline><KeyboardShortcutHint shortcut={"\u2191\u2193"} action="navigate" /><KeyboardShortcutHint shortcut="Enter" action="select" /><ConfigurableShortcutHint action="confirm:no" context="Confirmation" fallback="Esc" description="go back" /></Byline>;
-    $[3] = t1;
+    $[3] = t1; // 写入缓存
   } else {
-    t1 = $[3];
+    t1 = $[3]; // 从缓存读取，跳过重复创建
   }
+
+  // ── 槽位 $[4-7]：最终渲染的 JSX（依赖 goBack / handleComplete / selectedModel）
   let t2;
   if ($[4] !== goBack || $[5] !== handleComplete || $[6] !== wizardData.selectedModel) {
+    // 任意依赖变化时，重建整个对话框 JSX
     t2 = <WizardDialogLayout subtitle="Select model" footerText={t1}><ModelSelector initialModel={wizardData.selectedModel} onComplete={handleComplete} onCancel={goBack} /></WizardDialogLayout>;
     $[4] = goBack;
     $[5] = handleComplete;
-    $[6] = wizardData.selectedModel;
+    $[6] = wizardData.selectedModel; // 追踪当前已选模型，用于初始化 ModelSelector
     $[7] = t2;
   } else {
-    t2 = $[7];
+    t2 = $[7]; // 结构未变，复用缓存的 JSX
   }
   return t2;
 }

@@ -1,24 +1,70 @@
+/**
+ * AgentNavigationFooter.tsx
+ *
+ * 【在 Claude Code 系统流程中的位置】
+ * 本文件是 Agent 管理界面（AgentsMenu/AgentsList）底部的导航提示组件，
+ * 位于 src/components/agents/ 目录下。
+ * 它在 AgentsList 和 AgentsMenu 的各个视图底部被渲染，为用户提供
+ * 当前界面可用的键盘操作提示（↑↓ 导航、Enter 选择、Esc 返回）。
+ *
+ * 【主要功能】
+ * - 默认显示键盘导航提示：「Press ↑↓ to navigate · Enter to select · Esc to go back」
+ * - 支持通过 instructions prop 自定义提示文本
+ * - 接入 useExitOnCtrlCDWithKeybindings 钩子：
+ *     当用户按下 Ctrl+C 或 Ctrl+D 时，若退出确认处于 pending 状态，
+ *     则覆盖提示文本为「Press [key] again to exit」
+ * - 使用 React Compiler 的 _c(2) 缓存机制，仅在显示文本变化时重新渲染
+ */
 import { c as _c } from "react/compiler-runtime";
 import * as React from 'react';
 import { useExitOnCtrlCDWithKeybindings } from '../../hooks/useExitOnCtrlCDWithKeybindings.js';
 import { Box, Text } from '../../ink.js';
+
+// 组件 Props 类型：instructions 为可选的自定义提示文本
 type Props = {
   instructions?: string;
 };
+
+/**
+ * AgentNavigationFooter 组件
+ *
+ * 渲染底部导航提示栏，仅包含一行灰色小字提示：
+ * - 正常状态：显示 instructions（自定义）或默认键盘快捷键说明
+ * - Ctrl+C/D 等待确认状态：覆盖显示「Press [key] again to exit」
+ *
+ * 使用 React Compiler 的 _c(2) 分配2个缓存槽，
+ * 当且仅当最终显示文本（t2）变化时才重建 JSX 节点。
+ */
 export function AgentNavigationFooter(t0) {
+  // React Compiler 分配 2 个缓存槽
   const $ = _c(2);
+
+  // 从 props 中解构 instructions，可能为 undefined
   const {
     instructions: t1
   } = t0;
+
+  // 若未传入 instructions，使用默认导航提示文本
+  // 默认值：「Press ↑↓ to navigate · Enter to select · Esc to go back」
   const instructions = t1 === undefined ? "Press \u2191\u2193 to navigate \xB7 Enter to select \xB7 Esc to go back" : t1;
+
+  // 订阅 Ctrl+C/D 退出确认状态
   const exitState = useExitOnCtrlCDWithKeybindings();
+
+  // 计算最终显示文本：
+  // - 若 exitState.pending=true（用户第一次按下退出键），显示「Press [key] again to exit」
+  // - 否则显示 instructions（自定义文本或默认导航提示）
   const t2 = exitState.pending ? `Press ${exitState.keyName} again to exit` : instructions;
+
+  // 缓存渲染结果：仅当 t2（显示文本）变化时重新渲染 Box/Text 节点
   let t3;
   if ($[0] !== t2) {
+    // 以 marginLeft=2 的缩进，灰色（dimColor）渲染提示文本
     t3 = <Box marginLeft={2}><Text dimColor={true}>{t2}</Text></Box>;
     $[0] = t2;
     $[1] = t3;
   } else {
+    // 显示文本未变化，复用缓存的 JSX 节点
     t3 = $[1];
   }
   return t3;

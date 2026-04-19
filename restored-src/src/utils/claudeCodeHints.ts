@@ -1,18 +1,23 @@
 /**
- * Claude Code hints protocol.
+ * Claude Code hints 协议模块。
  *
+ * 在 Claude Code 系统中，运行于 Claude Code 下的 CLI 和 SDK 可在 stderr 输出
+ * 自闭合 `<claude-code-hint />` 标签（由 shell 工具合并到 stdout）。
+ * 该模块负责扫描工具输出、解析 hint 标签并从模型可见的输出中剥离它们，
+ * 同时向用户展示安装提示——不触发推理，不主动执行：
+ * - extractClaudeCodeHints()：扫描输出中的 hint 标签，返回解析结果与剥离后内容
+ * - setPendingHint() / clearPendingHint()：写入/清除单槽 pending hint
+ * - markShownThisSession()：标记本会话已展示过提示（每会话最多一次）
+ * - subscribeToPendingHint / getPendingHintSnapshot()：供 React useSyncExternalStore 使用
+ * - hasShownHintThisSession() / _resetClaudeCodeHintStore()：状态查询与测试重置
+ *
+ * 单槽设计：后写覆盖前写；会话标志一旦置位，setPendingHint 变为 no-op。
+ * 支持版本：v=1；支持类型：plugin。
+ *
+ * Claude Code hints protocol.
  * CLIs and SDKs running under Claude Code can emit a self-closing
  * `<claude-code-hint />` tag to stderr (merged into stdout by the shell
- * tools). The harness scans tool output for these tags, strips them before
- * the output reaches the model, and surfaces an install prompt to the
- * user — no inference, no proactive execution.
- *
- * This file provides both the parser and a small module-level store for
- * the pending hint. The store is a single slot (not a queue) — we surface
- * at most one prompt per session, so there's no reason to accumulate.
- * React subscribes via useSyncExternalStore.
- *
- * See docs/claude-code-hints.md for the vendor-facing spec.
+ * tools). See docs/claude-code-hints.md for the vendor-facing spec.
  */
 
 import { logForDebugging } from './debug.js'

@@ -1,3 +1,23 @@
+/**
+ * 上下文窗口用量分析模块。
+ *
+ * 在 Claude Code 系统中，该模块负责统计并可视化当前对话消耗的上下文 token 分布，
+ * 为用户提供"/context"命令所展示的上下文占用概览。
+ *
+ * 主要职责：
+ * 1. 并发调用多个计数函数（系统提示词、内存文件、内置工具、MCP 工具、
+ *    自定义 Agent、斜杠命令、消息历史），汇总各类别的 token 数量
+ * 2. 根据模型上下文窗口大小生成可视化网格（GridSquare[][]），
+ *    支持窄屏（< 80 列）和宽屏两种布局
+ * 3. 区分"延迟加载"工具（如 Tool Search 启用后的 MCP 工具）与常驻工具，
+ *    分别计入实际用量或展示为"deferred"
+ * 4. 对 autocompact/manual compact 缓冲区保留 token 进行可视化
+ * 5. 导出 ContextData 数据结构供 UI 层渲染
+ *
+ * 关键常量：
+ * - TOOL_TOKEN_COUNT_OVERHEAD：API 每次计数调用附加的工具序言开销（约 500 token）
+ * - RESERVED_CATEGORY_NAME / MANUAL_COMPACT_BUFFER_NAME：缓冲区类别名称
+ */
 import { feature } from 'bun:bundle'
 import type { Anthropic } from '@anthropic-ai/sdk'
 import {
@@ -66,14 +86,19 @@ const RESERVED_CATEGORY_NAME = 'Autocompact buffer'
 const MANUAL_COMPACT_BUFFER_NAME = 'Compact buffer'
 
 /**
+ * API 计数调用时工具序言附加的固定 token 开销（约 500 token）。
+ * 单独对每个工具调用计数时，每次调用都会包含一次序言开销，
+ * 导致 N 个工具的累加结果比实际多出 (N-1) × overhead。
+ * 减去此开销后可得到准确的工具内容大小。
+ *
  * Fixed token overhead added by the API when tools are present.
- * The API adds a tool prompt preamble (~500 tokens) once per API call when tools are present.
- * When we count tools individually via the token counting API, each call includes this overhead,
- * leading to N × overhead instead of 1 × overhead for N tools.
- * We subtract this overhead from per-tool counts to show accurate tool content sizes.
  */
 export const TOOL_TOKEN_COUNT_OVERHEAD = 500
 
+/**
+ * 带回退机制的 token 计数函数。
+ * 首先调用 API 精确计数，失败时降级到 Haiku 模型估算；两者均失败时返回 null。
+ */
 async function countTokensWithFallback(
   messages: Anthropic.Beta.Messages.BetaMessageParam[],
   tools: Anthropic.Beta.Messages.BetaToolUnion[],
@@ -257,7 +282,7 @@ export async function countToolDefinitionTokens(
   return result ?? 0
 }
 
-/** Extract a human-readable name from a system prompt section's content */
+/** 从系统提示词章节内容中提取人可读的章节名称（取首个 Markdown 标题或首行截断） */
 function extractSectionName(content: string): string {
   // Try to find first markdown heading
   const headingMatch = content.match(/^#+\s+(.+)$/m)
@@ -269,6 +294,11 @@ function extractSectionName(content: string): string {
   return firstLine.length > 40 ? firstLine.slice(0, 40) + '…' : firstLine
 }
 
+/**
+ * 统计系统提示词各章节的 token 数量。
+ * 将 effectiveSystemPrompt 各段落及系统上下文（gitStatus 等）分别计数，
+ * 返回汇总 token 数及逐章节明细。
+ */
 async function countSystemTokens(
   effectiveSystemPrompt: readonly string[],
 ): Promise<{
@@ -317,6 +347,10 @@ async function countSystemTokens(
   return { systemPromptTokens, systemPromptSections }
 }
 
+/**
+ * 统计内存文件（CLAUDE.md 等）的 token 数量。
+ * CLAUDE_CODE_SIMPLE 模式下不加载内存文件，直接返回零。
+ */
 async function countMemoryFileTokens(): Promise<{
   memoryFileDetails: MemoryFile[]
   claudeMdTokens: number
@@ -360,6 +394,11 @@ async function countMemoryFileTokens(): Promise<{
   return { claudeMdTokens, memoryFileDetails }
 }
 
+/**
+ * 统计内置工具的 token 数量，区分常驻工具与延迟加载工具（Tool Search 启用时）。
+ * 内部用户（ant）额外返回逐工具明细（systemToolDetails），
+ * 延迟工具仅在被消息历史中调用过时才计入实际用量。
+ */
 async function countBuiltInToolTokens(
   tools: Tools,
   getToolPermissionContext: () => Promise<ToolPermissionContext>,
@@ -514,10 +553,14 @@ async function countBuiltInToolTokens(
   }
 }
 
+/** 在工具列表中查找 SkillTool（用于斜杠命令 token 计数） */
 function findSkillTool(tools: Tools): Tool | undefined {
   return findToolByName(tools, SKILL_TOOL_NAME)
 }
 
+/**
+ * 统计斜杠命令（SkillTool）消耗的 token 数量及命令总数/已包含数。
+ */
 async function countSlashCommandTokens(
   tools: Tools,
   getToolPermissionContext: () => Promise<ToolPermissionContext>,
@@ -551,6 +594,10 @@ async function countSlashCommandTokens(
   }
 }
 
+/**
+ * 统计 Skills（技能）的 token 用量及逐技能 frontmatter 估算明细。
+ * 注意：Skills 使用与斜杠命令相同的 SkillTool，token 数不应重复累加。
+ */
 async function countSkillTokens(
   tools: Tools,
   getToolPermissionContext: () => Promise<ToolPermissionContext>,
@@ -613,6 +660,11 @@ async function countSkillTokens(
   }
 }
 
+/**
+ * 统计 MCP 工具的 token 用量。
+ * 使用批量 API 调用获取总 token 数，再按本地估算比例分摊到各工具。
+ * Tool Search 启用时，区分已加载（被消息历史调用过）和延迟加载的 MCP 工具。
+ */
 export async function countMcpToolTokens(
   tools: Tools,
   getToolPermissionContext: () => Promise<ToolPermissionContext>,
@@ -729,6 +781,9 @@ export async function countMcpToolTokens(
   }
 }
 
+/**
+ * 统计用户自定义 Agent 的 token 数量（排除内置 Agent）。
+ */
 async function countCustomAgentTokens(agentDefinitions: {
   activeAgents: AgentDefinition[]
 }): Promise<{
@@ -779,6 +834,16 @@ type MessageBreakdown = {
   attachmentsByType: Map<string, number>
 }
 
+/**
+ * 处理单条 Assistant 消息，将各内容块的 token 估算值分类累加到 breakdown。
+ * tool_use 块计入工具调用 token，其余文本块计入助手消息 token。
+ * 工具调用按工具名称分组，方便后续按工具统计。
+ */
+/**
+ * 处理单条 Assistant 消息，将各内容块的 token 估算值分类累加到 breakdown。
+ * tool_use 块计入工具调用 token，其余文本块计入助手消息 token。
+ * 工具调用按工具名称分组，方便后续按工具统计。
+ */
 function processAssistantMessage(
   msg: AssistantMessage | NormalizedAssistantMessage,
   breakdown: MessageBreakdown,
@@ -802,6 +867,16 @@ function processAssistantMessage(
   }
 }
 
+/**
+ * 处理单条 User 消息，将各内容块的 token 估算值分类累加到 breakdown。
+ * tool_result 块通过 toolUseIdToName 映射到工具名称后计入工具结果 token；
+ * 其余文本块计入用户消息 token。字符串内容直接统计，不再按块拆分。
+ */
+/**
+ * 处理单条 User 消息，将各内容块的 token 估算值分类累加到 breakdown。
+ * tool_result 块通过 toolUseIdToName 映射到工具名称后计入工具结果 token；
+ * 其余文本块计入用户消息 token。字符串内容直接统计，不再按块拆分。
+ */
 function processUserMessage(
   msg: UserMessage | NormalizedUserMessage,
   breakdown: MessageBreakdown,
@@ -836,6 +911,14 @@ function processUserMessage(
   }
 }
 
+/**
+ * 处理单条 Attachment 消息，将附件的 token 估算值按附件类型分类累加到 breakdown。
+ * 用于在消息 breakdown 中展示图片、文件、诊断等各类附件的 token 占用。
+ */
+/**
+ * 处理单条 Attachment 消息，将附件的 token 估算值按附件类型分类累加到 breakdown。
+ * 用于在消息 breakdown 中展示图片、文件、诊断等各类附件的 token 占用。
+ */
 function processAttachment(
   msg: AttachmentMessage,
   breakdown: MessageBreakdown,
@@ -850,6 +933,12 @@ function processAttachment(
   )
 }
 
+/**
+ * 对消息历史按内容块类型进行 token 估算分解。
+ * 先通过 microcompactMessages 压缩消息，再逐块分类统计：
+ * 工具调用、工具结果、附件、助手文本、用户文本。
+ * 总 token 数通过 API 精确计数（带回退）获得。
+ */
 async function approximateMessageTokens(
   messages: Message[],
 ): Promise<MessageBreakdown> {
@@ -915,6 +1004,19 @@ async function approximateMessageTokens(
   return breakdown
 }
 
+/**
+ * 核心分析函数：并发统计所有上下文类别的 token 用量，生成 ContextData。
+ *
+ * 主要流程：
+ * 1. 并发执行系统提示词、内存文件、内置工具、MCP 工具、
+ *    自定义 Agent、斜杠命令、消息历史的 token 计数
+ * 2. 单独执行 Skill token 计数（错误隔离）
+ * 3. 构建上下文类别列表（cats），包含 autocompact/manual compact 缓冲区
+ * 4. 计算网格可视化数据（GridSquare[][]），支持窄屏/宽屏/百万 token 模型
+ * 5. 优先使用 API 实际 usage 数据作为 totalTokens，降级到本地估算
+ *
+ * @param originalMessages - 压缩前的原始消息（用于提取 API usage）
+ */
 export async function analyzeContextUsage(
   messages: Message[],
   model: string,

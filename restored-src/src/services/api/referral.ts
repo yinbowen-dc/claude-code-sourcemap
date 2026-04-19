@@ -1,3 +1,28 @@
+/**
+ * 推荐资格与 Guest Pass（访客通行证）缓存模块
+ *
+ * 在 Claude Code 系统流程中的位置：
+ *   用户订阅 Max 计划后 → 系统检查是否具备推荐 Guest Pass 的资格
+ *   → 命令行展示 /passes 命令（仅满足条件时可见）
+ *
+ * 主要功能：
+ *  - fetchReferralEligibility         — 拉取当前组织的推荐资格信息
+ *  - fetchReferralRedemptions         — 拉取推荐兑换记录
+ *  - checkCachedPassesEligibility     — 同步读取 Pass 资格缓存状态
+ *  - formatCreditAmount               — 将货币 minor_units 格式化为可读字符串
+ *  - getCachedReferrerReward          — 读取缓存中的推荐奖励信息
+ *  - getCachedRemainingPasses         — 读取缓存中的剩余 Pass 数量
+ *  - fetchAndStorePassesEligibility   — 拉取并缓存 Pass 资格（含请求去重）
+ *  - getCachedOrFetchPassesEligibility — 主入口：缓存优先，过期则后台刷新
+ *  - prefetchPassesEligibility        — 启动时预取（非阻塞）
+ *
+ * 缓存设计：
+ *  - 缓存 TTL：24 小时（CACHE_EXPIRATION_MS），资格变更仅在订阅/实验变更时发生
+ *  - 按组织 UUID（orgId）分隔缓存条目
+ *  - fetchInProgress：模块级 Promise，防止并发调用重复发起 API 请求
+ *  - stale-while-revalidate：缓存过期时先返回旧值，后台异步刷新
+ */
+
 import axios from 'axios'
 import { getOauthConfig } from '../../constants/oauth.js'
 import {
@@ -17,33 +42,53 @@ import type {
   ReferrerRewardInfo,
 } from '../oauth/types.js'
 
-// Cache expiration time: 24 hours (eligibility changes only on subscription/experiment changes)
+// 缓存有效期：24 小时（资格变更仅在订阅/实验变更时发生）
 const CACHE_EXPIRATION_MS = 24 * 60 * 60 * 1000
 
-// Track in-flight fetch to prevent duplicate API calls
+// 模块级 in-flight Promise，防止并发请求重复调用 API
 let fetchInProgress: Promise<ReferralEligibilityResponse | null> | null = null
 
+/**
+ * 拉取当前组织的推荐资格信息。
+ *
+ * 流程：
+ *  1. 准备 OAuth 认证信息（accessToken + orgUUID）
+ *  2. 调用 GET /api/oauth/organizations/{orgUUID}/referral/eligibility
+ *  3. 返回 ReferralEligibilityResponse 原始数据
+ *
+ * @param campaign - 推荐活动标识，默认为 'claude_code_guest_pass'
+ */
 export async function fetchReferralEligibility(
   campaign: ReferralCampaign = 'claude_code_guest_pass',
 ): Promise<ReferralEligibilityResponse> {
+  // 准备 OAuth 认证头和组织 UUID
   const { accessToken, orgUUID } = await prepareApiRequest()
 
   const headers = {
     ...getOAuthHeaders(accessToken),
-    'x-organization-uuid': orgUUID,
+    'x-organization-uuid': orgUUID, // 标识当前组织
   }
 
   const url = `${getOauthConfig().BASE_API_URL}/api/oauth/organizations/${orgUUID}/referral/eligibility`
 
   const response = await axios.get(url, {
     headers,
-    params: { campaign },
-    timeout: 5000, // 5 second timeout for background fetch
+    params: { campaign }, // 通过 query param 传递活动标识
+    timeout: 5000, // 5 秒超时，用于后台拉取
   })
 
   return response.data
 }
 
+/**
+ * 拉取当前组织的推荐兑换记录。
+ *
+ * 流程：
+ *  1. 准备 OAuth 认证信息
+ *  2. 调用 GET /api/oauth/organizations/{orgUUID}/referral/redemptions
+ *
+ * @param campaign - 推荐活动标识，默认为 'claude_code_guest_pass'
+ */
 export async function fetchReferralRedemptions(
   campaign: string = 'claude_code_guest_pass',
 ): Promise<ReferralRedemptionsResponse> {
@@ -59,32 +104,42 @@ export async function fetchReferralRedemptions(
   const response = await axios.get<ReferralRedemptionsResponse>(url, {
     headers,
     params: { campaign },
-    timeout: 10000, // 10 second timeout
+    timeout: 10000, // 10 秒超时
   })
 
   return response.data
 }
 
 /**
- * Prechecks for if user can access guest passes feature
+ * 前置条件检查：用户是否具备访问 Guest Pass 功能的资格。
+ *
+ * 必须同时满足：
+ *  - 有有效的组织 UUID
+ *  - 是 Claude.ai 订阅用户
+ *  - 订阅类型为 max（高级套餐）
  */
 function shouldCheckForPasses(): boolean {
   return !!(
     getOauthAccountInfo()?.organizationUuid &&
     isClaudeAISubscriber() &&
-    getSubscriptionType() === 'max'
+    getSubscriptionType() === 'max' // 只有 max 套餐用户才有 Guest Pass 功能
   )
 }
 
 /**
- * Check cached passes eligibility from GlobalConfig
- * Returns current cached state and cache status
+ * 从全局配置读取 Guest Pass 资格缓存状态。
+ *
+ * 返回：
+ *  - eligible：当前缓存的资格状态
+ *  - needsRefresh：缓存是否过期或不存在（需要刷新）
+ *  - hasCache：是否存在缓存条目
  */
 export function checkCachedPassesEligibility(): {
   eligible: boolean
   needsRefresh: boolean
   hasCache: boolean
 } {
+  // 前置条件不满足时直接返回不可用状态
   if (!shouldCheckForPasses()) {
     return {
       eligible: false,
@@ -106,7 +161,7 @@ export function checkCachedPassesEligibility(): {
   const cachedEntry = config.passesEligibilityCache?.[orgId]
 
   if (!cachedEntry) {
-    // No cached entry, needs fetch
+    // 无缓存条目，需要发起请求
     return {
       eligible: false,
       needsRefresh: true,
@@ -116,6 +171,7 @@ export function checkCachedPassesEligibility(): {
 
   const { eligible, timestamp } = cachedEntry
   const now = Date.now()
+  // 判断缓存是否已超过 24 小时
   const needsRefresh = now - timestamp > CACHE_EXPIRATION_MS
 
   return {
@@ -125,6 +181,7 @@ export function checkCachedPassesEligibility(): {
   }
 }
 
+/** 各货币的符号映射表 */
 const CURRENCY_SYMBOLS: Record<string, string> = {
   USD: '$',
   EUR: '€',
@@ -136,28 +193,40 @@ const CURRENCY_SYMBOLS: Record<string, string> = {
   SGD: 'S$',
 }
 
+/**
+ * 将推荐奖励金额格式化为可读字符串（如 "$5" 或 "€5.50"）。
+ *
+ * @param reward - 推荐奖励信息（含 amount_minor_units 和 currency）
+ * @returns 格式化后的金额字符串
+ */
 export function formatCreditAmount(reward: ReferrerRewardInfo): string {
+  // 未知货币时使用 "CURRENCY " 前缀
   const symbol = CURRENCY_SYMBOLS[reward.currency] ?? `${reward.currency} `
-  const amount = reward.amount_minor_units / 100
+  const amount = reward.amount_minor_units / 100 // 最小货币单位（如美分）转主单位（如美元）
+  // 整数金额不显示小数（如 $5），非整数保留两位（如 $5.50）
   const formatted = amount % 1 === 0 ? amount.toString() : amount.toFixed(2)
   return `${symbol}${formatted}`
 }
 
 /**
- * Get cached referrer reward info from eligibility cache
- * Returns the reward info if the user is in a v1 campaign, null otherwise
+ * 从资格缓存中读取推荐人奖励信息。
+ *
+ * 适用于 v1 活动（带推荐人奖励），v2 活动不包含此字段。
+ *
+ * @returns 缓存中的奖励信息，无缓存或字段缺失时返回 null
  */
 export function getCachedReferrerReward(): ReferrerRewardInfo | null {
   const orgId = getOauthAccountInfo()?.organizationUuid
   if (!orgId) return null
   const config = getGlobalConfig()
   const cachedEntry = config.passesEligibilityCache?.[orgId]
-  return cachedEntry?.referrer_reward ?? null
+  return cachedEntry?.referrer_reward ?? null // referrer_reward 字段可能不存在
 }
 
 /**
- * Get the cached remaining passes count from eligibility cache
- * Returns the number of remaining passes, or null if not available
+ * 从资格缓存中读取剩余 Pass 数量。
+ *
+ * @returns 剩余 Pass 数量，无缓存或字段缺失时返回 null
  */
 export function getCachedRemainingPasses(): number | null {
   const orgId = getOauthAccountInfo()?.organizationUuid
@@ -168,11 +237,16 @@ export function getCachedRemainingPasses(): number | null {
 }
 
 /**
- * Fetch passes eligibility and store in GlobalConfig
- * Returns the fetched response or null on error
+ * 拉取 Guest Pass 资格并存入全局配置缓存。
+ *
+ * 并发去重策略：
+ *  - 若已有 in-flight 请求（fetchInProgress 非 null），直接复用同一个 Promise
+ *  - fetch 完成后（无论成功/失败）清空 fetchInProgress，允许下次重新发起
+ *
+ * @returns 拉取到的资格响应，失败时返回 null
  */
 export async function fetchAndStorePassesEligibility(): Promise<ReferralEligibilityResponse | null> {
-  // Return existing promise if fetch is already in progress
+  // 已有进行中的请求时，直接返回同一个 Promise（防止重复请求）
   if (fetchInProgress) {
     logForDebugging('Passes: Reusing in-flight eligibility fetch')
     return fetchInProgress
@@ -181,19 +255,21 @@ export async function fetchAndStorePassesEligibility(): Promise<ReferralEligibil
   const orgId = getOauthAccountInfo()?.organizationUuid
 
   if (!orgId) {
-    return null
+    return null // 未登录或无组织信息，直接返回
   }
 
-  // Store the promise to share with concurrent calls
+  // 将 Promise 赋给模块级变量，供并发调用者复用
   fetchInProgress = (async () => {
     try {
       const response = await fetchReferralEligibility()
 
+      // 构造缓存条目（在响应数据基础上追加时间戳）
       const cacheEntry = {
         ...response,
         timestamp: Date.now(),
       }
 
+      // 持久化到全局配置（仅更新当前组织的缓存条目）
       saveGlobalConfig(current => ({
         ...current,
         passesEligibilityCache: {
@@ -212,7 +288,7 @@ export async function fetchAndStorePassesEligibility(): Promise<ReferralEligibil
       logError(error as Error)
       return null
     } finally {
-      // Clear the promise when done
+      // 无论成功/失败，清空 in-flight 标志，允许下次重新发起
       fetchInProgress = null
     }
   })()
@@ -221,14 +297,19 @@ export async function fetchAndStorePassesEligibility(): Promise<ReferralEligibil
 }
 
 /**
- * Get cached passes eligibility data or fetch if needed
- * Main entry point for all eligibility checks
+ * 获取 Guest Pass 资格数据（主入口，缓存优先）。
  *
- * This function never blocks on network - it returns cached data immediately
- * and fetches in the background if needed. On cold start (no cache), it returns
- * null and the passes command won't be available until the next session.
+ * 完全非阻塞策略：
+ *  - 无缓存 → 触发后台拉取，本次返回 null（本会话内 /passes 命令不可用）
+ *  - 缓存过期 → 返回旧值，同时后台刷新（stale-while-revalidate）
+ *  - 缓存新鲜 → 直接返回缓存值
+ *
+ * 冷启动（首次无缓存）：本会话内 /passes 不可用，下次启动时可用。
+ *
+ * @returns 资格响应或 null（前置条件不满足/无缓存时）
  */
 export async function getCachedOrFetchPassesEligibility(): Promise<ReferralEligibilityResponse | null> {
+  // 前置条件不满足（非 max 订阅、无组织信息等）
   if (!shouldCheckForPasses()) {
     return null
   }
@@ -242,40 +323,44 @@ export async function getCachedOrFetchPassesEligibility(): Promise<ReferralEligi
   const cachedEntry = config.passesEligibilityCache?.[orgId]
   const now = Date.now()
 
-  // No cache - trigger background fetch and return null (non-blocking)
-  // The passes command won't be available this session, but will be next time
+  // 无缓存：触发后台拉取，本次返回 null（非阻塞）
+  // 本会话内 /passes 命令不可用，下次启动时将有缓存
   if (!cachedEntry) {
     logForDebugging(
       'Passes: No cache, fetching eligibility in background (command unavailable this session)',
     )
-    void fetchAndStorePassesEligibility()
+    void fetchAndStorePassesEligibility() // fire-and-forget
     return null
   }
 
-  // Cache exists but is stale - return stale cache and trigger background refresh
+  // 缓存过期：返回旧值，同时后台刷新（stale-while-revalidate 模式）
   if (now - cachedEntry.timestamp > CACHE_EXPIRATION_MS) {
     logForDebugging(
       'Passes: Cache stale, returning cached data and refreshing in background',
     )
-    void fetchAndStorePassesEligibility() // Background refresh
+    void fetchAndStorePassesEligibility() // 后台异步刷新
     const { timestamp, ...response } = cachedEntry
     return response as ReferralEligibilityResponse
   }
 
-  // Cache is fresh - return it immediately
+  // 缓存新鲜：直接返回
   logForDebugging('Passes: Using fresh cached eligibility data')
   const { timestamp, ...response } = cachedEntry
   return response as ReferralEligibilityResponse
 }
 
 /**
- * Prefetch passes eligibility on startup
+ * 在应用启动时预取 Guest Pass 资格（非阻塞）。
+ *
+ * 目的：为下一次打开 /passes 命令预热缓存，避免首次使用时等待。
+ * 若处于仅基础流量模式（essential-traffic-only）则跳过。
  */
 export async function prefetchPassesEligibility(): Promise<void> {
-  // Skip network requests if nonessential traffic is disabled
+  // 仅基础流量模式下不发起非必要 API 请求
   if (isEssentialTrafficOnly()) {
     return
   }
 
+  // 非阻塞地触发资格检查（缓存新鲜时立即返回，不发请求）
   void getCachedOrFetchPassesEligibility()
 }

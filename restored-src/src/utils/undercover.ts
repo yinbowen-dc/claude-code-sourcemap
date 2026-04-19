@@ -1,41 +1,63 @@
 /**
- * Undercover mode — safety utilities for contributing to public/open-source repos.
+ * 隐身模式（Undercover Mode）安全工具模块。
  *
- * When active, Claude Code adds safety instructions to commit/PR prompts and
- * strips all attribution to avoid leaking internal model codenames, project
- * names, or other Anthropic-internal information. The model is not told what
- * model it is.
+ * 在 Claude Code 系统流程中的位置：
+ * 此模块是提交/PR 安全层，在 commit 和 PR 创建流程中被调用，
+ * 用于检测是否需要隐藏 Anthropic 内部信息，防止向公共仓库泄漏
+ * 内部模型代号、项目名称等敏感信息。
  *
- * Activation:
- *   - CLAUDE_CODE_UNDERCOVER=1 — force ON (even in internal repos)
- *   - Otherwise AUTO: active UNLESS the repo remote matches the internal
- *     allowlist (INTERNAL_MODEL_REPOS in commitAttribution.ts). Safe default
- *     is ON — Claude may push to public remotes from a CWD that isn't itself
- *     a git checkout (e.g. /tmp crash repro).
- *   - There is NO force-OFF. This guards against model codename leaks — if
- *     we're not confident we're in an internal repo, we stay undercover.
+ * 主要功能：
+ * - isUndercover：判断当前是否处于隐身模式
+ * - getUndercoverInstructions：返回提示模型保持隐身的指令文本
+ * - shouldShowUndercoverAutoNotice：判断是否显示一次性自动隐身说明弹窗
  *
- * All code paths are gated on process.env.USER_TYPE === 'ant'. Since USER_TYPE is
- * a build-time --define, the bundler constant-folds these checks and dead-code-
- * eliminates the ant-only branches from external builds. In external builds every
- * function in this file reduces to a trivial return.
+ * 激活方式：
+ * - CLAUDE_CODE_UNDERCOVER=1：强制开启（即使在内部仓库）
+ * - 自动检测（AUTO）：除非仓库远端匹配内部白名单，否则默认开启
+ * - 无强制关闭选项：若不确定是否在内部仓库，始终保持隐身状态
+ *
+ * 构建时优化：
+ * - 所有代码路径均通过 process.env.USER_TYPE === 'ant' 进行门控
+ * - USER_TYPE 是构建时 --define 常量，打包工具会将其常量折叠
+ * - 对于外部构建，此文件中的所有函数都会被死代码消除，返回平凡值
  */
 
 import { getRepoClassCached } from './commitAttribution.js'
 import { getGlobalConfig } from './config.js'
 import { isEnvTruthy } from './envUtils.js'
 
+/**
+ * 判断当前是否处于隐身模式。
+ *
+ * 流程（仅对 ant 用户执行，外部用户直接返回 false）：
+ * 1. 检查 CLAUDE_CODE_UNDERCOVER 环境变量，若为真值则强制开启
+ * 2. 自动检测：仓库类型非 'internal' 时开启
+ *    （'external'、'none' 和 null 均解析为开启）
+ * 3. 外部构建：打包器将此函数常量折叠为 return false
+ *
+ * @returns ant 用户且满足激活条件时返回 true，否则返回 false
+ */
 export function isUndercover(): boolean {
   if (process.env.USER_TYPE === 'ant') {
+    // 环境变量强制开启
     if (isEnvTruthy(process.env.CLAUDE_CODE_UNDERCOVER)) return true
-    // Auto: active unless we've positively confirmed we're in an allowlisted
-    // internal repo. 'external', 'none', and null (check not yet run) all
-    // resolve to ON. The check is primed in setup.ts; only 'internal' → OFF.
+    // 自动检测：仅当确认为内部仓库时关闭，其他情况保持隐身
+    // getRepoClassCached() 在 setup.ts 中预热；null 表示检查尚未运行
     return getRepoClassCached() !== 'internal'
   }
+  // 外部用户：隐身模式无意义，直接返回 false
   return false
 }
 
+/**
+ * 获取隐身模式下提示模型保持隐身的指令文本。
+ *
+ * 流程：
+ * 1. 仅对 ant 用户返回指令（外部用户返回空字符串）
+ * 2. 指令明确禁止在提交信息和 PR 描述中包含任何 Anthropic 内部信息
+ *
+ * @returns 隐身指令文本（ant 用户）或空字符串（外部用户）
+ */
 export function getUndercoverInstructions(): string {
   if (process.env.USER_TYPE === 'ant') {
     return `## UNDERCOVER MODE — CRITICAL
@@ -68,22 +90,33 @@ BAD (never write these):
 - "Co-Authored-By: Claude Opus 4.6 <…>"
 `
   }
+  // 外部构建：返回空字符串（打包器会对此进行死代码消除）
   return ''
 }
 
 /**
- * Check whether to show the one-time explainer dialog for auto-undercover.
- * True when: undercover is active via auto-detection (not forced via env),
- * and the user hasn't seen the notice before. Pure — the component marks the
- * flag on mount.
+ * 判断是否应显示一次性的自动隐身说明弹窗。
+ *
+ * 条件（全部满足时返回 true）：
+ * - ant 用户
+ * - 隐身模式由自动检测触发（非环境变量强制开启）
+ * - 当前确实处于隐身状态
+ * - 用户尚未看过该说明（hasSeenUndercoverAutoNotice 为 false）
+ *
+ * 注意：此函数为纯函数，UI 组件在挂载时负责设置已读标志。
+ *
+ * @returns 需要显示说明弹窗时返回 true
  */
 export function shouldShowUndercoverAutoNotice(): boolean {
   if (process.env.USER_TYPE === 'ant') {
-    // If forced via env, user already knows; don't nag.
+    // 若通过环境变量强制开启，用户已知晓，不需要提示
     if (isEnvTruthy(process.env.CLAUDE_CODE_UNDERCOVER)) return false
+    // 若当前不在隐身模式，无需提示
     if (!isUndercover()) return false
+    // 若用户已看过说明，不再重复显示
     if (getGlobalConfig().hasSeenUndercoverAutoNotice) return false
     return true
   }
+  // 外部用户：始终返回 false
   return false
 }

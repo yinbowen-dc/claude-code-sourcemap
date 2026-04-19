@@ -1,3 +1,10 @@
+/**
+ * Cron 调度抖动配置模块（GrowthBook）。
+ *
+ * 在 Claude Code 系统中，该模块通过 GrowthBook 动态配置获取 cron 调度的抖动参数，
+ * 与 cronScheduler.ts 分离以避免在 Agent SDK 公共构建中引入大型依赖：
+ * - getCronJitterConfig()：返回 GrowthBook 配置的抖动范围（ms）
+ */
 // GrowthBook-backed cron jitter configuration.
 //
 // Separated from cronScheduler.ts so the scheduler can be bundled in the

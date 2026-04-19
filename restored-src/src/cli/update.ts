@@ -1,3 +1,17 @@
+/**
+ * 自更新命令 — 实现 `claude update` 命令，负责将 Claude Code 更新到最新版本。
+ *
+ * 在整个 Claude Code 系统中的位置：
+ * 本文件是 CLI 层的自更新入口，支持四种安装类型的更新路径：
+ *   - native       — 使用原生安装器（nativeInstaller）更新预编译二进制
+ *   - npm-local    — 使用本地 npm 安装器（localInstaller）更新本地 node_modules
+ *   - npm-global   — 使用全局 npm 安装器（autoUpdater）更新全局包
+ *   - package-manager — Homebrew/winget/apk 等系统包管理器，提示用户手动更新
+ *   - development  — 开发构建，禁止自动更新
+ *
+ * 更新前会运行诊断（getDoctorDiagnostic）检测安装类型、多重安装、配置不一致等问题，
+ * 并在更新成功后重新生成 shell 补全缓存。
+ */
 import chalk from 'chalk'
 import { logEvent } from 'src/services/analytics/index.js'
 import {
@@ -27,16 +41,37 @@ import { writeToStdout } from 'src/utils/process.js'
 import { gte } from 'src/utils/semver.js'
 import { getInitialSettings } from 'src/utils/settings/settings.js'
 
+/**
+ * `claude update` 命令的主处理函数。
+ *
+ * 流程：
+ * 1. 上报分析事件，打印当前版本和目标 channel（latest/stable）。
+ * 2. 运行 getDoctorDiagnostic 获取安装类型、配置方法、多重安装和告警信息。
+ * 3. 如有多重安装，打印告警列表（注明哪个是当前运行的）。
+ * 4. 如有诊断告警，打印 Warning 和 Fix 提示（PATH 相关告警始终显示）。
+ * 5. 若 config.installMethod 未设置且非 package-manager，自动检测并写入配置。
+ * 6. 开发构建：打印警告并以退出码 1 终止。
+ * 7. 包管理器安装（homebrew/winget/apk/其他）：检查是否有新版本，打印对应更新命令，退出 0。
+ * 8. 检查 config/reality 不一致：若当前运行类型与配置不符，更新配置以匹配实际。
+ * 9. native 安装：调用 installLatestNative，处理锁竞争、版本检查、成功提示，退出 0/1。
+ * 10. JS/npm 安装（npm-local/npm-global）：
+ *     - 移除可能残留的 native symlink。
+ *     - 从 npm registry 获取最新版本号。
+ *     - 若已是最新版本则退出 0。
+ *     - 否则根据安装类型调用对应的 install 函数，处理各种 InstallStatus 后退出。
+ */
 export async function update() {
+  // 上报更新检查事件，用于统计用户更新行为
   logEvent('tengu_update_check', {})
   writeToStdout(`Current version: ${MACRO.VERSION}\n`)
 
+  // 读取 channel 配置（latest 或 stable），默认为 latest
   const channel = getInitialSettings()?.autoUpdatesChannel ?? 'latest'
   writeToStdout(`Checking for updates to ${channel} version...\n`)
 
   logForDebugging('update: Starting update check')
 
-  // Run diagnostic to detect potential issues
+  // 运行诊断以检测潜在问题：安装类型、配置方法、多重安装、PATH 告警等
   logForDebugging('update: Running diagnostic')
   const diagnostic = await getDoctorDiagnostic()
   logForDebugging(`update: Installation type: ${diagnostic.installationType}`)
@@ -44,7 +79,7 @@ export async function update() {
     `update: Config install method: ${diagnostic.configInstallMethod}`,
   )
 
-  // Check for multiple installations
+  // 检测到多重安装时，列出所有安装路径并标注当前正在运行的那个
   if (diagnostic.multipleInstallations.length > 1) {
     writeToStdout('\n')
     writeToStdout(chalk.yellow('Warning: Multiple installations found') + '\n')
@@ -57,14 +92,13 @@ export async function update() {
     }
   }
 
-  // Display warnings if any exist
+  // 输出所有诊断告警；PATH 告警始终显示（告知用户 `which claude` 指向其他位置）
   if (diagnostic.warnings.length > 0) {
     writeToStdout('\n')
     for (const warning of diagnostic.warnings) {
       logForDebugging(`update: Warning detected: ${warning.issue}`)
 
-      // Don't skip PATH warnings - they're always relevant
-      // The user needs to know that 'which claude' points elsewhere
+      // 不跳过 PATH 告警 — 用户需要知道 'which claude' 指向别处
       logForDebugging(`update: Showing warning: ${warning.issue}`)
 
       writeToStdout(chalk.yellow(`Warning: ${warning.issue}\n`))
@@ -73,7 +107,7 @@ export async function update() {
     }
   }
 
-  // Update config if installMethod is not set (but skip for package managers)
+  // 若 installMethod 未设置且不是包管理器安装，自动检测并写入全局配置
   const config = getGlobalConfig()
   if (
     !config.installMethod &&
@@ -83,7 +117,7 @@ export async function update() {
     writeToStdout('Updating configuration to track installation method...\n')
     let detectedMethod: 'local' | 'native' | 'global' | 'unknown' = 'unknown'
 
-    // Map diagnostic installation type to config install method
+    // 将诊断安装类型映射到配置中使用的安装方法标识
     switch (diagnostic.installationType) {
       case 'npm-local':
         detectedMethod = 'local'
@@ -98,6 +132,7 @@ export async function update() {
         detectedMethod = 'unknown'
     }
 
+    // 将检测到的安装方法持久化到全局配置
     saveGlobalConfig(current => ({
       ...current,
       installMethod: detectedMethod,
@@ -105,7 +140,7 @@ export async function update() {
     writeToStdout(`Installation method set to: ${detectedMethod}\n`)
   }
 
-  // Check if running from development build
+  // 开发构建不支持自动更新，直接报错退出
   if (diagnostic.installationType === 'development') {
     writeToStdout('\n')
     writeToStdout(
@@ -114,7 +149,7 @@ export async function update() {
     await gracefulShutdown(1)
   }
 
-  // Check if running from a package manager
+  // 系统包管理器安装：根据包管理器类型给出对应的手动更新命令
   if (diagnostic.installationType === 'package-manager') {
     const packageManager = await getPackageManager()
     writeToStdout('\n')
@@ -126,6 +161,7 @@ export async function update() {
         writeToStdout(`Update available: ${MACRO.VERSION} → ${latest}\n`)
         writeToStdout('\n')
         writeToStdout('To update, run:\n')
+        // 给出 Homebrew 更新命令
         writeToStdout(chalk.bold('  brew upgrade claude-code') + '\n')
       } else {
         writeToStdout('Claude is up to date!\n')
@@ -137,6 +173,7 @@ export async function update() {
         writeToStdout(`Update available: ${MACRO.VERSION} → ${latest}\n`)
         writeToStdout('\n')
         writeToStdout('To update, run:\n')
+        // 给出 winget 更新命令
         writeToStdout(
           chalk.bold('  winget upgrade Anthropic.ClaudeCode') + '\n',
         )
@@ -150,14 +187,14 @@ export async function update() {
         writeToStdout(`Update available: ${MACRO.VERSION} → ${latest}\n`)
         writeToStdout('\n')
         writeToStdout('To update, run:\n')
+        // 给出 apk 更新命令
         writeToStdout(chalk.bold('  apk upgrade claude-code') + '\n')
       } else {
         writeToStdout('Claude is up to date!\n')
       }
     } else {
-      // pacman, deb, and rpm don't get specific commands because they each have
-      // multiple frontends (pacman: yay/paru/makepkg, deb: apt/apt-get/aptitude/nala,
-      // rpm: dnf/yum/zypper)
+      // pacman、deb、rpm 等包管理器各有多个前端（yay/paru、apt/apt-get、dnf/yum 等），
+      // 无法给出统一命令，只提示用户使用自己的包管理器更新
       writeToStdout('Claude is managed by a package manager.\n')
       writeToStdout('Please use your package manager to update.\n')
     }
@@ -165,7 +202,7 @@ export async function update() {
     await gracefulShutdown(0)
   }
 
-  // Check for config/reality mismatch (skip for package-manager installs)
+  // 检查配置与实际安装类型是否一致（跳过包管理器安装）
   if (
     config.installMethod &&
     diagnostic.configInstallMethod !== 'not set' &&
@@ -174,7 +211,7 @@ export async function update() {
     const runningType = diagnostic.installationType
     const configExpects = diagnostic.configInstallMethod
 
-    // Map installation types for comparison
+    // 将诊断安装类型规范化为配置中使用的短名称，便于比较
     const typeMapping: Record<string, string> = {
       'npm-local': 'local',
       'npm-global': 'global',
@@ -187,7 +224,7 @@ export async function update() {
 
     if (
       normalizedRunningType !== configExpects &&
-      configExpects !== 'unknown'
+      configExpects !== 'unknown'  // unknown 不做不一致处理，避免误报
     ) {
       writeToStdout('\n')
       writeToStdout(chalk.yellow('Warning: Configuration mismatch') + '\n')
@@ -199,7 +236,7 @@ export async function update() {
         ) + '\n',
       )
 
-      // Update config to match reality
+      // 将配置更新为与实际运行类型一致，避免后续更新走错路径
       saveGlobalConfig(current => ({
         ...current,
         installMethod: normalizedRunningType as InstallMethod,
@@ -210,15 +247,16 @@ export async function update() {
     }
   }
 
-  // Handle native installation updates first
+  // native 安装：优先使用原生更新器（绕过 npm）
   if (diagnostic.installationType === 'native') {
     logForDebugging(
       'update: Detected native installation, using native updater',
     )
     try {
+      // 发起原生更新，传入 channel 和 verbose=true
       const result = await installLatestNative(channel, true)
 
-      // Handle lock contention gracefully
+      // 处理锁竞争：另一个 Claude 进程正在更新时，优雅地等待
       if (result.lockFailed) {
         const pidInfo = result.lockHolderPid
           ? ` (PID ${result.lockHolderPid})`
@@ -231,16 +269,19 @@ export async function update() {
         await gracefulShutdown(0)
       }
 
+      // 获取最新版本失败则报错退出
       if (!result.latestVersion) {
         process.stderr.write('Failed to check for updates\n')
         await gracefulShutdown(1)
       }
 
       if (result.latestVersion === MACRO.VERSION) {
+        // 已是最新版本
         writeToStdout(
           chalk.green(`Claude Code is up to date (${MACRO.VERSION})`) + '\n',
         )
       } else {
+        // 更新成功，打印版本变更信息并重新生成补全缓存
         writeToStdout(
           chalk.green(
             `Successfully updated from ${MACRO.VERSION} to version ${result.latestVersion}`,
@@ -257,24 +298,26 @@ export async function update() {
     }
   }
 
-  // Fallback to existing JS/npm-based update logic
-  // Remove native installer symlink since we're not using native installation
-  // But only if user hasn't migrated to native installation
+  // 回退到 JS/npm 更新逻辑
+  // 若当前不是 native 安装，移除可能残留的 native 安装符号链接
   if (config.installMethod !== 'native') {
     await removeInstalledSymlink()
   }
 
   logForDebugging('update: Checking npm registry for latest version')
   logForDebugging(`update: Package URL: ${MACRO.PACKAGE_URL}`)
+  // stable channel 使用 npm tag "stable"，其他使用 "latest"
   const npmTag = channel === 'stable' ? 'stable' : 'latest'
   const npmCommand = `npm view ${MACRO.PACKAGE_URL}@${npmTag} version`
   logForDebugging(`update: Running: ${npmCommand}`)
+  // 从 npm registry 获取最新版本号
   const latestVersion = await getLatestVersion(channel)
   logForDebugging(
     `update: Latest version from npm: ${latestVersion || 'FAILED'}`,
   )
 
   if (!latestVersion) {
+    // 无法从 npm registry 获取版本时，给出详细的排查提示
     logForDebugging('update: Failed to get latest version from npm registry')
     process.stderr.write(chalk.red('Failed to check for updates') + '\n')
     process.stderr.write('Unable to fetch latest version from npm registry\n')
@@ -305,7 +348,7 @@ export async function update() {
     await gracefulShutdown(1)
   }
 
-  // Check if versions match exactly, including any build metadata (like SHA)
+  // 版本完全匹配（含构建元数据如 SHA）时视为已是最新版本
   if (latestVersion === MACRO.VERSION) {
     writeToStdout(
       chalk.green(`Claude Code is up to date (${MACRO.VERSION})`) + '\n',
@@ -318,21 +361,23 @@ export async function update() {
   )
   writeToStdout('Installing update...\n')
 
-  // Determine update method based on what's actually running
+  // 根据当前实际运行的安装类型决定更新方式
   let useLocalUpdate = false
   let updateMethodName = ''
 
   switch (diagnostic.installationType) {
     case 'npm-local':
+      // 本地安装：使用 installOrUpdateClaudePackage 更新 ~/.claude/local 下的包
       useLocalUpdate = true
       updateMethodName = 'local'
       break
     case 'npm-global':
+      // 全局安装：使用 installGlobalPackage 更新全局 npm 包
       useLocalUpdate = false
       updateMethodName = 'global'
       break
     case 'unknown': {
-      // Fallback to detection if we can't determine installation type
+      // 无法确定安装类型时，回退到文件系统探测
       const isLocal = await localInstallationExists()
       useLocalUpdate = isLocal
       updateMethodName = isLocal ? 'local' : 'global'
@@ -345,6 +390,7 @@ export async function update() {
       break
     }
     default:
+      // 其他类型（如 native、development）不走 npm 更新路径，报错退出
       process.stderr.write(
         `Error: Cannot update ${diagnostic.installationType} installation\n`,
       )
@@ -362,16 +408,20 @@ export async function update() {
     logForDebugging(
       'update: Calling installOrUpdateClaudePackage() for local update',
     )
+    // 本地安装更新：在 ~/.claude/local 目录执行 npm install
     status = await installOrUpdateClaudePackage(channel)
   } else {
     logForDebugging('update: Calling installGlobalPackage() for global update')
+    // 全局安装更新：执行 npm install -g
     status = await installGlobalPackage()
   }
 
   logForDebugging(`update: Installation status: ${status}`)
 
+  // 根据安装状态输出对应的成功/失败信息
   switch (status) {
     case 'success':
+      // 更新成功：打印版本变更信息，重新生成 shell 补全缓存
       writeToStdout(
         chalk.green(
           `Successfully updated from ${MACRO.VERSION} to version ${latestVersion}`,
@@ -380,6 +430,7 @@ export async function update() {
       await regenerateCompletionCache()
       break
     case 'no_permissions':
+      // 权限不足：给出手动更新命令
       process.stderr.write(
         'Error: Insufficient permissions to install update\n',
       )
@@ -397,6 +448,7 @@ export async function update() {
       await gracefulShutdown(1)
       break
     case 'install_failed':
+      // 安装失败：给出手动更新命令或替代方案
       process.stderr.write('Error: Failed to install update\n')
       if (useLocalUpdate) {
         process.stderr.write('Try manually updating with:\n')
@@ -411,6 +463,7 @@ export async function update() {
       await gracefulShutdown(1)
       break
     case 'in_progress':
+      // 另一个实例正在执行更新，等待后重试
       process.stderr.write(
         'Error: Another instance is currently performing an update\n',
       )

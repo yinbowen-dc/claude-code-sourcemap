@@ -1,3 +1,21 @@
+/**
+ * EnterPlanModePermissionRequest.tsx
+ *
+ * 【在 Claude Code 权限系统中的位置】
+ * 本文件负责渲染"进入计划模式"的权限确认对话框。当 Claude 想要切换到 Plan Mode
+ * 进行深度探索与方案设计时，系统会弹出本对话框请求用户授权。用户可以选择进入计划
+ * 模式（Yes）或直接开始实现（No）。
+ *
+ * 【主要功能】
+ * - 渲染"Enter plan mode?"确认对话框（使用 planMode 主题色）
+ * - 展示计划模式的说明文字：Claude 将探索代码库、识别现有模式、设计实现策略并呈现方案
+ * - 强调"在用户批准计划前不会进行任何代码修改"的承诺
+ * - 处理用户选择：
+ *   - Yes → 记录 Analytics 事件，调用 handlePlanModeTransition 切换模式，通知 onDone，传递 setMode 规则
+ *   - No → 直接关闭对话框并通知拒绝
+ * - 使用 React Compiler 运行时（_c(18)）对渲染结果进行细粒度缓存
+ */
+
 import { c as _c } from "react/compiler-runtime";
 import React from 'react';
 import { handlePlanModeTransition } from '../../../bootstrap/state.js';
@@ -8,36 +26,63 @@ import { isPlanModeInterviewPhaseEnabled } from '../../../utils/planModeV2.js';
 import { Select } from '../../CustomSelect/index.js';
 import { PermissionDialog } from '../PermissionDialog.js';
 import type { PermissionRequestProps } from '../PermissionRequest.js';
+
+/**
+ * EnterPlanModePermissionRequest — 进入计划模式的权限请求组件
+ *
+ * 【渲染流程】
+ * 1. 从全局 AppState 中读取当前 toolPermissionContext.mode（用于后续模式切换）
+ * 2. 构建 handleResponse 回调，处理 'yes'/'no' 两种用户选择：
+ *    - 'yes'：上报 tengu_plan_enter 事件 → 调用 handlePlanModeTransition 切换至 plan 模式
+ *            → 通知 onDone → 传递 setMode 权限更新规则（目标为 session）
+ *    - 'no'：依次调用 onDone、onReject、toolUseConfirm.onReject
+ * 3. 渲染静态说明文本（React Compiler 静态缓存，仅构建一次）
+ * 4. 渲染静态选项列表（Yes/No）
+ * 5. 将 handleResponse('no') 绑定为 onCancel（Esc 键取消时等同于"否"）
+ * 6. 最终包裹在 PermissionDialog color="planMode" 中渲染
+ */
 export function EnterPlanModePermissionRequest(t0) {
+  // React Compiler 缓存槽，共 18 个槽位，用于细粒度 memoization
   const $ = _c(18);
   const {
-    toolUseConfirm,
-    onDone,
-    onReject,
-    workerBadge
+    toolUseConfirm,    // 工具使用确认上下文（含工具信息、回调等）
+    onDone,            // 对话框关闭后的通知回调
+    onReject,          // 用户拒绝时的通知回调
+    workerBadge        // 可选的 Worker 标识徽章
   } = t0;
+
+  // 从全局状态中获取当前权限上下文模式（如 'default'/'plan'/'autoEdit' 等）
+  // 用于 handlePlanModeTransition 执行正确的模式转换逻辑
   const toolPermissionContextMode = useAppState(_temp);
+
+  // ── handleResponse：处理用户选择（'yes' 进入计划模式 / 'no' 拒绝） ──────────
   let t1;
   if ($[0] !== onDone || $[1] !== onReject || $[2] !== toolPermissionContextMode || $[3] !== toolUseConfirm) {
     t1 = function handleResponse(value) {
       if (value === "yes") {
+        // 用户选择进入计划模式：先上报 Analytics 事件，记录进入方式和面试阶段状态
         logEvent("tengu_plan_enter", {
-          interviewPhaseEnabled: isPlanModeInterviewPhaseEnabled(),
-          entryMethod: "tool" as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS
+          interviewPhaseEnabled: isPlanModeInterviewPhaseEnabled(),  // 是否开启面试阶段（PlanModeV2 特性）
+          entryMethod: "tool" as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS  // 进入方式：通过工具调用触发
         });
+        // 执行计划模式切换（更新全局状态和 UI 表现）
         handlePlanModeTransition(toolPermissionContextMode, "plan");
+        // 通知父组件对话框已完成（关闭弹窗）
         onDone();
+        // 传递 setMode 权限规则，将会话模式设置为 'plan'，生效范围为当前 session
         toolUseConfirm.onAllow({}, [{
-          type: "setMode",
-          mode: "plan",
-          destination: "session"
+          type: "setMode",      // 规则类型：设置模式
+          mode: "plan",         // 目标模式：计划模式
+          destination: "session"  // 生效范围：仅当前会话（不持久化到 localSettings）
         }]);
       } else {
+        // 用户选择不进入计划模式：依次关闭对话框、通知拒绝、告知工具被拒
         onDone();
         onReject();
         toolUseConfirm.onReject();
       }
     };
+    // 当任意依赖项变化时，重新构建 handleResponse 并更新缓存
     $[0] = onDone;
     $[1] = onReject;
     $[2] = toolPermissionContextMode;
@@ -47,6 +92,10 @@ export function EnterPlanModePermissionRequest(t0) {
     t1 = $[4];
   }
   const handleResponse = t1;
+
+  // ── 静态文本节点（React Compiler 标记为常量，仅在首次渲染时构建） ──────────
+
+  // 主说明文字：告知用户 Claude 想要进入计划模式进行方案设计
   let t2;
   if ($[5] === Symbol.for("react.memo_cache_sentinel")) {
     t2 = <Text>Claude wants to enter plan mode to explore and design an implementation approach.</Text>;
@@ -54,13 +103,23 @@ export function EnterPlanModePermissionRequest(t0) {
   } else {
     t2 = $[5];
   }
+
+  // 计划模式行为说明列表（用 · 符号列出 4 项行为说明）
   let t3;
   if ($[6] === Symbol.for("react.memo_cache_sentinel")) {
-    t3 = <Box marginTop={1} flexDirection="column"><Text dimColor={true}>In plan mode, Claude will:</Text><Text dimColor={true}> · Explore the codebase thoroughly</Text><Text dimColor={true}> · Identify existing patterns</Text><Text dimColor={true}> · Design an implementation strategy</Text><Text dimColor={true}> · Present a plan for your approval</Text></Box>;
+    t3 = <Box marginTop={1} flexDirection="column">
+      <Text dimColor={true}>In plan mode, Claude will:</Text>
+      <Text dimColor={true}> · Explore the codebase thoroughly</Text>      {/* 彻底探索代码库 */}
+      <Text dimColor={true}> · Identify existing patterns</Text>           {/* 识别已有模式 */}
+      <Text dimColor={true}> · Design an implementation strategy</Text>    {/* 设计实现策略 */}
+      <Text dimColor={true}> · Present a plan for your approval</Text>     {/* 呈现方案供批准 */}
+    </Box>;
     $[6] = t3;
   } else {
     t3 = $[6];
   }
+
+  // 关键承诺说明：在用户批准计划前不会进行任何代码修改
   let t4;
   if ($[7] === Symbol.for("react.memo_cache_sentinel")) {
     t4 = <Box marginTop={1}><Text dimColor={true}>No code changes will be made until you approve the plan.</Text></Box>;
@@ -68,45 +127,68 @@ export function EnterPlanModePermissionRequest(t0) {
   } else {
     t4 = $[7];
   }
+
+  // ── 静态选项：Yes（进入计划模式） ────────────────────────────────────────
   let t5;
   if ($[8] === Symbol.for("react.memo_cache_sentinel")) {
     t5 = {
       label: "Yes, enter plan mode",
-      value: "yes" as const
+      value: "yes" as const  // TypeScript 字面量类型
     };
     $[8] = t5;
   } else {
     t5 = $[8];
   }
+
+  // ── 静态选项数组：[Yes, No]（两个选项均为静态常量，仅构建一次） ──────────
   let t6;
   if ($[9] === Symbol.for("react.memo_cache_sentinel")) {
     t6 = [t5, {
-      label: "No, start implementing now",
+      label: "No, start implementing now",  // 否：直接开始实现
       value: "no" as const
     }];
     $[9] = t6;
   } else {
     t6 = $[9];
   }
+
+  // ── onCancel 回调：Esc 取消时等同于选择 'no' ──────────────────────────────
   let t7;
   if ($[10] !== handleResponse) {
+    // 将 handleResponse('no') 绑定为取消处理函数
     t7 = () => handleResponse("no");
     $[10] = handleResponse;
     $[11] = t7;
   } else {
     t7 = $[11];
   }
+
+  // ── 完整内容区域：说明文字 + 选项列表 ────────────────────────────────────
   let t8;
   if ($[12] !== handleResponse || $[13] !== t7) {
-    t8 = <Box flexDirection="column" marginTop={1} paddingX={1}>{t2}{t3}{t4}<Box marginTop={1}><Select options={t6} onChange={handleResponse} onCancel={t7} /></Box></Box>;
+    t8 = <Box flexDirection="column" marginTop={1} paddingX={1}>
+      {t2}   {/* 主说明文字 */}
+      {t3}   {/* 计划模式行为说明列表 */}
+      {t4}   {/* 无代码修改承诺 */}
+      <Box marginTop={1}>
+        <Select
+          options={t6}           // 静态选项列表 [Yes, No]
+          onChange={handleResponse}  // 用户确认时触发
+          onCancel={t7}          // Esc 取消时触发（等同于 No）
+        />
+      </Box>
+    </Box>;
     $[12] = handleResponse;
     $[13] = t7;
     $[14] = t8;
   } else {
     t8 = $[14];
   }
+
+  // ── 最终渲染：使用 planMode 主题色的 PermissionDialog 包裹内容 ────────────
   let t9;
   if ($[15] !== t8 || $[16] !== workerBadge) {
+    // color="planMode" 使对话框使用计划模式专属主题色渲染
     t9 = <PermissionDialog color="planMode" title="Enter plan mode?" workerBadge={workerBadge}>{t8}</PermissionDialog>;
     $[15] = t8;
     $[16] = workerBadge;
@@ -116,7 +198,14 @@ export function EnterPlanModePermissionRequest(t0) {
   }
   return t9;
 }
+
+/**
+ * _temp — AppState 选择器函数
+ *
+ * 从全局 AppState 中提取 toolPermissionContext.mode 字段。
+ * 作为独立函数定义（而非内联箭头函数），可避免每次渲染时创建新的函数引用，
+ * 防止 useAppState 订阅因引用变化而不必要地重新触发。
+ */
 function _temp(s) {
   return s.toolPermissionContext.mode;
 }
-//# sourceMappingURL=data:application/json;charset=utf-8;base64,eyJ2ZXJzaW9uIjozLCJuYW1lcyI6WyJSZWFjdCIsImhhbmRsZVBsYW5Nb2RlVHJhbnNpdGlvbiIsIkJveCIsIlRleHQiLCJBbmFseXRpY3NNZXRhZGF0YV9JX1ZFUklGSUVEX1RISVNfSVNfTk9UX0NPREVfT1JfRklMRVBBVEhTIiwibG9nRXZlbnQiLCJ1c2VBcHBTdGF0ZSIsImlzUGxhbk1vZGVJbnRlcnZpZXdQaGFzZUVuYWJsZWQiLCJTZWxlY3QiLCJQZXJtaXNzaW9uRGlhbG9nIiwiUGVybWlzc2lvblJlcXVlc3RQcm9wcyIsIkVudGVyUGxhbk1vZGVQZXJtaXNzaW9uUmVxdWVzdCIsInQwIiwiJCIsIl9jIiwidG9vbFVzZUNvbmZpcm0iLCJvbkRvbmUiLCJvblJlamVjdCIsIndvcmtlckJhZGdlIiwidG9vbFBlcm1pc3Npb25Db250ZXh0TW9kZSIsIl90ZW1wIiwidDEiLCJoYW5kbGVSZXNwb25zZSIsInZhbHVlIiwiaW50ZXJ2aWV3UGhhc2VFbmFibGVkIiwiZW50cnlNZXRob2QiLCJvbkFsbG93IiwidHlwZSIsIm1vZGUiLCJkZXN0aW5hdGlvbiIsInQyIiwiU3ltYm9sIiwiZm9yIiwidDMiLCJ0NCIsInQ1IiwibGFiZWwiLCJjb25zdCIsInQ2IiwidDciLCJ0OCIsInQ5IiwicyIsInRvb2xQZXJtaXNzaW9uQ29udGV4dCJdLCJzb3VyY2VzIjpbIkVudGVyUGxhbk1vZGVQZXJtaXNzaW9uUmVxdWVzdC50c3giXSwic291cmNlc0NvbnRlbnQiOlsiaW1wb3J0IFJlYWN0IGZyb20gJ3JlYWN0J1xuaW1wb3J0IHsgaGFuZGxlUGxhbk1vZGVUcmFuc2l0aW9uIH0gZnJvbSAnLi4vLi4vLi4vYm9vdHN0cmFwL3N0YXRlLmpzJ1xuaW1wb3J0IHsgQm94LCBUZXh0IH0gZnJvbSAnLi4vLi4vLi4vaW5rLmpzJ1xuaW1wb3J0IHtcbiAgdHlwZSBBbmFseXRpY3NNZXRhZGF0YV9JX1ZFUklGSUVEX1RISVNfSVNfTk9UX0NPREVfT1JfRklMRVBBVEhTLFxuICBsb2dFdmVudCxcbn0gZnJvbSAnLi4vLi4vLi4vc2VydmljZXMvYW5hbHl0aWNzL2luZGV4LmpzJ1xuaW1wb3J0IHsgdXNlQXBwU3RhdGUgfSBmcm9tICcuLi8uLi8uLi9zdGF0ZS9BcHBTdGF0ZS5qcydcbmltcG9ydCB7IGlzUGxhbk1vZGVJbnRlcnZpZXdQaGFzZUVuYWJsZWQgfSBmcm9tICcuLi8uLi8uLi91dGlscy9wbGFuTW9kZVYyLmpzJ1xuaW1wb3J0IHsgU2VsZWN0IH0gZnJvbSAnLi4vLi4vQ3VzdG9tU2VsZWN0L2luZGV4LmpzJ1xuaW1wb3J0IHsgUGVybWlzc2lvbkRpYWxvZyB9IGZyb20gJy4uL1Blcm1pc3Npb25EaWFsb2cuanMnXG5pbXBvcnQgdHlwZSB7IFBlcm1pc3Npb25SZXF1ZXN0UHJvcHMgfSBmcm9tICcuLi9QZXJtaXNzaW9uUmVxdWVzdC5qcydcblxuZXhwb3J0IGZ1bmN0aW9uIEVudGVyUGxhbk1vZGVQZXJtaXNzaW9uUmVxdWVzdCh7XG4gIHRvb2xVc2VDb25maXJtLFxuICBvbkRvbmUsXG4gIG9uUmVqZWN0LFxuICB3b3JrZXJCYWRnZSxcbn06IFBlcm1pc3Npb25SZXF1ZXN0UHJvcHMpOiBSZWFjdC5SZWFjdE5vZGUge1xuICBjb25zdCB0b29sUGVybWlzc2lvbkNvbnRleHRNb2RlID0gdXNlQXBwU3RhdGUoXG4gICAgcyA9PiBzLnRvb2xQZXJtaXNzaW9uQ29udGV4dC5tb2RlLFxuICApXG5cbiAgZnVuY3Rpb24gaGFuZGxlUmVzcG9uc2UodmFsdWU6ICd5ZXMnIHwgJ25vJyk6IHZvaWQge1xuICAgIGlmICh2YWx1ZSA9PT0gJ3llcycpIHtcbiAgICAgIGxvZ0V2ZW50KCd0ZW5ndV9wbGFuX2VudGVyJywge1xuICAgICAgICBpbnRlcnZpZXdQaGFzZUVuYWJsZWQ6IGlzUGxhbk1vZGVJbnRlcnZpZXdQaGFzZUVuYWJsZWQoKSxcbiAgICAgICAgZW50cnlNZXRob2Q6XG4gICAgICAgICAgJ3Rvb2wnIGFzIEFuYWx5dGljc01ldGFkYXRhX0lfVkVSSUZJRURfVEhJU19JU19OT1RfQ09ERV9PUl9GSUxFUEFUSFMsXG4gICAgICB9KVxuICAgICAgaGFuZGxlUGxhbk1vZGVUcmFuc2l0aW9uKHRvb2xQZXJtaXNzaW9uQ29udGV4dE1vZGUsICdwbGFuJylcbiAgICAgIG9uRG9uZSgpXG4gICAgICB0b29sVXNlQ29uZmlybS5vbkFsbG93KHt9LCBbXG4gICAgICAgIHsgdHlwZTogJ3NldE1vZGUnLCBtb2RlOiAncGxhbicsIGRlc3RpbmF0aW9uOiAnc2Vzc2lvbicgfSxcbiAgICAgIF0pXG4gICAgfSBlbHNlIHtcbiAgICAgIG9uRG9uZSgpXG4gICAgICBvblJlamVjdCgpXG4gICAgICB0b29sVXNlQ29uZmlybS5vblJlamVjdCgpXG4gICAgfVxuICB9XG5cbiAgcmV0dXJuIChcbiAgICA8UGVybWlzc2lvbkRpYWxvZ1xuICAgICAgY29sb3I9XCJwbGFuTW9kZVwiXG4gICAgICB0aXRsZT1cIkVudGVyIHBsYW4gbW9kZT9cIlxuICAgICAgd29ya2VyQmFkZ2U9e3dvcmtlckJhZGdlfVxuICAgID5cbiAgICAgIDxCb3ggZmxleERpcmVjdGlvbj1cImNvbHVtblwiIG1hcmdpblRvcD17MX0gcGFkZGluZ1g9ezF9PlxuICAgICAgICA8VGV4dD5cbiAgICAgICAgICBDbGF1ZGUgd2FudHMgdG8gZW50ZXIgcGxhbiBtb2RlIHRvIGV4cGxvcmUgYW5kIGRlc2lnbiBhblxuICAgICAgICAgIGltcGxlbWVudGF0aW9uIGFwcHJvYWNoLlxuICAgICAgICA8L1RleHQ+XG5cbiAgICAgICAgPEJveCBtYXJnaW5Ub3A9ezF9IGZsZXhEaXJlY3Rpb249XCJjb2x1bW5cIj5cbiAgICAgICAgICA8VGV4dCBkaW1Db2xvcj5JbiBwbGFuIG1vZGUsIENsYXVkZSB3aWxsOjwvVGV4dD5cbiAgICAgICAgICA8VGV4dCBkaW1Db2xvcj4gwrcgRXhwbG9yZSB0aGUgY29kZWJhc2UgdGhvcm91Z2hseTwvVGV4dD5cbiAgICAgICAgICA8VGV4dCBkaW1Db2xvcj4gwrcgSWRlbnRpZnkgZXhpc3RpbmcgcGF0dGVybnM8L1RleHQ+XG4gICAgICAgICAgPFRleHQgZGltQ29sb3I+IMK3IERlc2lnbiBhbiBpbXBsZW1lbnRhdGlvbiBzdHJhdGVneTwvVGV4dD5cbiAgICAgICAgICA8VGV4dCBkaW1Db2xvcj4gwrcgUHJlc2VudCBhIHBsYW4gZm9yIHlvdXIgYXBwcm92YWw8L1RleHQ+XG4gICAgICAgIDwvQm94PlxuXG4gICAgICAgIDxCb3ggbWFyZ2luVG9wPXsxfT5cbiAgICAgICAgICA8VGV4dCBkaW1Db2xvcj5cbiAgICAgICAgICAgIE5vIGNvZGUgY2hhbmdlcyB3aWxsIGJlIG1hZGUgdW50aWwgeW91IGFwcHJvdmUgdGhlIHBsYW4uXG4gICAgICAgICAgPC9UZXh0PlxuICAgICAgICA8L0JveD5cblxuICAgICAgICA8Qm94IG1hcmdpblRvcD17MX0+XG4gICAgICAgICAgPFNlbGVjdFxuICAgICAgICAgICAgb3B0aW9ucz17W1xuICAgICAgICAgICAgICB7IGxhYmVsOiAnWWVzLCBlbnRlciBwbGFuIG1vZGUnLCB2YWx1ZTogJ3llcycgYXMgY29uc3QgfSxcbiAgICAgICAgICAgICAgeyBsYWJlbDogJ05vLCBzdGFydCBpbXBsZW1lbnRpbmcgbm93JywgdmFsdWU6ICdubycgYXMgY29uc3QgfSxcbiAgICAgICAgICAgIF19XG4gICAgICAgICAgICBvbkNoYW5nZT17aGFuZGxlUmVzcG9uc2V9XG4gICAgICAgICAgICBvbkNhbmNlbD17KCkgPT4gaGFuZGxlUmVzcG9uc2UoJ25vJyl9XG4gICAgICAgICAgLz5cbiAgICAgICAgPC9Cb3g+XG4gICAgICA8L0JveD5cbiAgICA8L1Blcm1pc3Npb25EaWFsb2c+XG4gIClcbn1cbiJdLCJtYXBwaW5ncyI6IjtBQUFBLE9BQU9BLEtBQUssTUFBTSxPQUFPO0FBQ3pCLFNBQVNDLHdCQUF3QixRQUFRLDZCQUE2QjtBQUN0RSxTQUFTQyxHQUFHLEVBQUVDLElBQUksUUFBUSxpQkFBaUI7QUFDM0MsU0FDRSxLQUFLQywwREFBMEQsRUFDL0RDLFFBQVEsUUFDSCxzQ0FBc0M7QUFDN0MsU0FBU0MsV0FBVyxRQUFR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

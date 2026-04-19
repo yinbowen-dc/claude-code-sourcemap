@@ -1,3 +1,17 @@
+/**
+ * Desktop Deep Link 集成模块。
+ *
+ * 在 Claude Code 系统中，该模块检测当前版本是否支持桌面 deep link 功能，
+ * 并提供生成和处理 claude-cli:// 链接的工具函数，
+ * 供桌面端（macOS App）与 CLI 之间的会话互调使用。
+ */
+/**
+ * Desktop Deep Link 集成模块。
+ *
+ * 在 Claude Code 系统中，该模块检测当前版本是否支持桌面 deep link 功能，
+ * 并提供生成和处理 claude-cli:// 链接的工具函数，
+ * 供桌面端（macOS App）与 CLI 之间的会话互调使用。
+ */
 import { readdir } from 'fs/promises'
 import { join } from 'path'
 import { coerce as semverCoerce } from 'semver'

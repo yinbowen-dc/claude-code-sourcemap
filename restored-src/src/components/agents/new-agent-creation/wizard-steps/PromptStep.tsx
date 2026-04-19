@@ -1,3 +1,25 @@
+/**
+ * PromptStep.tsx — Agent 创建向导：输入系统提示词步骤
+ *
+ * 在 Claude Code 系统流程中的位置：
+ *   AgentTool → new-agent-creation/AgentWizard → wizard-steps/PromptStep（当前文件）
+ *
+ * 主要功能：
+ *   - 提供文本输入框，让用户输入 Agent 的系统提示词（system prompt）
+ *   - 支持通过外部编辑器（$EDITOR / ctrl+g）编辑长文本提示词
+ *   - 提交前验证提示词非空（trim 后判断）
+ *   - 将验证通过的提示词写入 wizardData.systemPrompt 并前进到下一步
+ *
+ * 键盘绑定策略：
+ *   - ESC（confirm:no）绑定在 "Settings" 上下文，避免与输入框中的 'n' 键冲突
+ *   - 外部编辑器快捷键（chat:externalEditor）绑定在 "Chat" 上下文
+ *
+ * 依赖：
+ *   - react/compiler-runtime (_c)：React 编译器自动生成的记忆化缓存（20 个槽位）
+ *   - useKeybinding：注册上下文感知的键盘快捷键
+ *   - editPromptInEditor：调用系统编辑器编辑文本并返回结果
+ *   - TextInput：支持光标偏移管理的终端文本输入组件（Ink）
+ */
 import { c as _c } from "react/compiler-runtime";
 import React, { type ReactNode, useCallback, useState } from 'react';
 import { Box, Text } from '../../../../ink.js';
@@ -10,63 +32,101 @@ import TextInput from '../../../TextInput.js';
 import { useWizard } from '../../../wizard/index.js';
 import { WizardDialogLayout } from '../../../wizard/WizardDialogLayout.js';
 import type { AgentWizardData } from '../types.js';
+
+/**
+ * PromptStep — 向导系统提示词输入步骤。
+ *
+ * 整体流程：
+ *   1. 从 useWizard 获取 goNext / goBack / updateWizardData / wizardData
+ *   2. 初始化本地状态：systemPrompt（预填 wizardData 中已有值）、cursorOffset、error
+ *   3. 注册 ESC 键绑定（Settings 上下文），避免 'n' 字符触发取消
+ *   4. 构建 handleExternalEditor：调用外部编辑器，若有内容则更新 systemPrompt 和 cursorOffset
+ *   5. 注册外部编辑器快捷键（Chat 上下文）
+ *   6. 构建 handleSubmit：trim 后验证非空，再写入 wizardData 并调用 goNext()
+ *   7. 构建静态 JSX 片段（React 编译器保证同等输入下复用）
+ *   8. 组装最终布局并返回
+ */
 export function PromptStep() {
+  // React 编译器生成的记忆化缓存，共 20 个槽位
   const $ = _c(20);
+
+  // 从向导上下文获取导航和数据更新方法
   const {
     goNext,
     goBack,
     updateWizardData,
     wizardData
   } = useWizard();
+
+  // 本地状态：当前系统提示词文本（优先使用已有向导数据）
   const [systemPrompt, setSystemPrompt] = useState(wizardData.systemPrompt || "");
+  // 本地状态：光标在文本中的偏移量（用于 TextInput 光标定位）
   const [cursorOffset, setCursorOffset] = useState(systemPrompt.length);
+  // 本地状态：验证错误消息（null 表示无错误）
   const [error, setError] = useState(null);
+
+  // ── 槽位 $[0]：静态 Settings 上下文对象（仅创建一次）─────────────────────
   let t0;
   if ($[0] === Symbol.for("react.memo_cache_sentinel")) {
     t0 = {
-      context: "Settings"
+      context: "Settings" // 使用 Settings 上下文，避免 'n' 键被截获为确认否
     };
     $[0] = t0;
   } else {
     t0 = $[0];
   }
+  // 注册 ESC 键绑定：按 ESC 返回上一步（Settings 上下文）
   useKeybinding("confirm:no", goBack, t0);
+
+  // ── 槽位 $[1-2]：handleExternalEditor 回调（依赖 systemPrompt）────────────
   let t1;
   if ($[1] !== systemPrompt) {
+    // systemPrompt 变化时，重新创建回调（闭包需要最新值）
     t1 = async () => {
+      // 调用外部编辑器（$EDITOR 环境变量指定的编辑器）
       const result = await editPromptInEditor(systemPrompt);
       if (result.content !== null) {
+        // 编辑器有返回内容时，同步更新状态和光标位置
         setSystemPrompt(result.content);
-        setCursorOffset(result.content.length);
+        setCursorOffset(result.content.length); // 光标移到文本末尾
       }
     };
     $[1] = systemPrompt;
     $[2] = t1;
   } else {
-    t1 = $[2];
+    t1 = $[2]; // 依赖未变，复用已缓存的回调
   }
   const handleExternalEditor = t1;
+
+  // ── 槽位 $[3]：静态 Chat 上下文对象（仅创建一次）────────────────────────
   let t2;
   if ($[3] === Symbol.for("react.memo_cache_sentinel")) {
     t2 = {
-      context: "Chat"
+      context: "Chat" // 在 Chat 上下文注册外部编辑器快捷键
     };
     $[3] = t2;
   } else {
     t2 = $[3];
   }
+  // 注册外部编辑器快捷键（Chat 上下文，默认 ctrl+g）
   useKeybinding("chat:externalEditor", handleExternalEditor, t2);
+
+  // ── 槽位 $[4-7]：handleSubmit 回调（依赖 goNext / systemPrompt / updateWizardData）
   let t3;
   if ($[4] !== goNext || $[5] !== systemPrompt || $[6] !== updateWizardData) {
+    // 任意依赖变化时，重新创建提交回调
     t3 = () => {
+      // 去除首尾空白后进行非空验证
       const trimmedPrompt = systemPrompt.trim();
       if (!trimmedPrompt) {
+        // 提示词为空时设置错误消息并阻止前进
         setError("System prompt is required");
         return;
       }
+      // 验证通过：清除错误、写入 wizard 数据、进入下一步
       setError(null);
       updateWizardData({
-        systemPrompt: trimmedPrompt
+        systemPrompt: trimmedPrompt // 保存去空白后的提示词
       });
       goNext();
     };
@@ -75,29 +135,37 @@ export function PromptStep() {
     $[6] = updateWizardData;
     $[7] = t3;
   } else {
-    t3 = $[7];
+    t3 = $[7]; // 依赖未变，复用已缓存的回调
   }
   const handleSubmit = t3;
+
+  // ── 槽位 $[8]：静态底部快捷键提示 JSX（仅首次渲染时创建）────────────────
   let t4;
   if ($[8] === Symbol.for("react.memo_cache_sentinel")) {
+    // 显示四个操作提示：输入文字、Enter 继续、ctrl+g 打开编辑器、Esc 返回
     t4 = <Byline><KeyboardShortcutHint shortcut="Type" action="enter text" /><KeyboardShortcutHint shortcut="Enter" action="continue" /><ConfigurableShortcutHint action="chat:externalEditor" context="Chat" fallback="ctrl+g" description="open in editor" /><ConfigurableShortcutHint action="confirm:no" context="Settings" fallback="Esc" description="go back" /></Byline>;
     $[8] = t4;
   } else {
     t4 = $[8];
   }
+
+  // ── 槽位 $[9-10]：静态说明文字 JSX（仅首次渲染时创建）──────────────────
   let t5;
   let t6;
   if ($[9] === Symbol.for("react.memo_cache_sentinel")) {
-    t5 = <Text>Enter the system prompt for your agent:</Text>;
-    t6 = <Text dimColor={true}>Be comprehensive for best results</Text>;
+    t5 = <Text>Enter the system prompt for your agent:</Text>; // 主提示文字
+    t6 = <Text dimColor={true}>Be comprehensive for best results</Text>; // 辅助提示（暗色）
     $[9] = t5;
     $[10] = t6;
   } else {
     t5 = $[9];
     t6 = $[10];
   }
+
+  // ── 槽位 $[11-14]：文本输入框 JSX（依赖 cursorOffset / handleSubmit / systemPrompt）
   let t7;
   if ($[11] !== cursorOffset || $[12] !== handleSubmit || $[13] !== systemPrompt) {
+    // 任意输入相关状态变化时，重建 TextInput JSX
     t7 = <Box marginTop={1}><TextInput value={systemPrompt} onChange={setSystemPrompt} onSubmit={handleSubmit} placeholder="You are a helpful code reviewer who..." columns={80} cursorOffset={cursorOffset} onChangeCursorOffset={setCursorOffset} focus={true} showCursor={true} /></Box>;
     $[11] = cursorOffset;
     $[12] = handleSubmit;
@@ -106,22 +174,28 @@ export function PromptStep() {
   } else {
     t7 = $[14];
   }
+
+  // ── 槽位 $[15-16]：错误提示 JSX（依赖 error）──────────────────────────
   let t8;
   if ($[15] !== error) {
+    // error 变化时重建（error 为 null 时不渲染任何内容）
     t8 = error && <Box marginTop={1}><Text color="error">{error}</Text></Box>;
     $[15] = error;
     $[16] = t8;
   } else {
     t8 = $[16];
   }
+
+  // ── 槽位 $[17-19]：最终完整布局（依赖 t7 文本框 / t8 错误提示）──────────
   let t9;
   if ($[17] !== t7 || $[18] !== t8) {
+    // 输入框或错误提示变化时，重建整个对话框
     t9 = <WizardDialogLayout subtitle="System prompt" footerText={t4}><Box flexDirection="column">{t5}{t6}{t7}{t8}</Box></WizardDialogLayout>;
     $[17] = t7;
     $[18] = t8;
     $[19] = t9;
   } else {
-    t9 = $[19];
+    t9 = $[19]; // 两者均未变化，复用缓存的完整 JSX
   }
   return t9;
 }

@@ -1,3 +1,10 @@
+/**
+ * 环境变量工具函数模块。
+ *
+ * 在 Claude Code 系统中，该模块提供常用的环境变量辅助函数：
+ * - getClaudeConfigHomeDir()：返回 Claude 配置目录（CLAUDE_CONFIG_DIR 或 ~/.claude）
+ * - isEnvTruthy()：判断环境变量值是否为真值（'1'/'true'/'yes'）
+ */
 import memoize from 'lodash-es/memoize.js'
 import { homedir } from 'os'
 import { join } from 'path'

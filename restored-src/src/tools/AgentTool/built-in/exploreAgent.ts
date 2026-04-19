@@ -1,3 +1,25 @@
+/**
+ * Explore 内置 Agent 定义模块
+ *
+ * 在 Claude Code AgentTool 层中，该模块定义了内置的 Explore Agent——
+ * 一个专门用于快速探索代码库的只读搜索 Agent。
+ *
+ * 核心特性：
+ * 1. 只读模式：严格禁止任何文件创建、修改、删除操作
+ * 2. 工具集：仅保留搜索和读取类工具（通过 disallowedTools 排除编辑工具）
+ * 3. 模型选择：
+ *    - Ant 内部用户：使用 inherit（继承父 Agent 模型），可通过
+ *      tengu_explore_agent GrowthBook 特性标志在运行时覆盖
+ *    - 外部用户：使用 haiku（速度快，适合搜索任务）
+ * 4. omitClaudeMd: true — 不在上下文中注入 CLAUDE.md，
+ *    搜索任务不需要提交/PR/Lint 规则，节省 token
+ *
+ * 调用者应通过 prompt 指定所需的搜索深度：
+ * - "quick"       — 基础搜索
+ * - "medium"      — 中等深度探索
+ * - "very thorough" — 全面深度分析
+ */
+
 import { BASH_TOOL_NAME } from 'src/tools/BashTool/toolName.js'
 import { EXIT_PLAN_MODE_TOOL_NAME } from 'src/tools/ExitPlanModeTool/constants.js'
 import { FILE_EDIT_TOOL_NAME } from 'src/tools/FileEditTool/constants.js'
@@ -10,13 +32,25 @@ import { hasEmbeddedSearchTools } from 'src/utils/embeddedTools.js'
 import { AGENT_TOOL_NAME } from '../constants.js'
 import type { BuiltInAgentDefinition } from '../loadAgentsDir.js'
 
+/**
+ * 生成 Explore Agent 的系统提示。
+ *
+ * 根据当前构建环境（是否使用内嵌搜索工具）动态调整文件搜索指引：
+ * - 内嵌构建：通过 Bash 使用 find/grep 命令
+ * - 标准构建：使用 Glob 和 Grep 专用工具
+ *
+ * @returns Explore Agent 的系统提示字符串
+ */
 function getExploreSystemPrompt(): string {
   // Ant-native builds alias find/grep to embedded bfs/ugrep and remove the
   // dedicated Glob/Grep tools, so point at find/grep via Bash instead.
+  // Ant 原生构建使用内嵌 bfs/ugrep 替代专用工具
   const embedded = hasEmbeddedSearchTools()
+  // 文件模式匹配工具提示（根据构建环境选择）
   const globGuidance = embedded
     ? `- Use \`find\` via ${BASH_TOOL_NAME} for broad file pattern matching`
     : `- Use ${GLOB_TOOL_NAME} for broad file pattern matching`
+  // 内容正则搜索工具提示（根据构建环境选择）
   const grepGuidance = embedded
     ? `- Use \`grep\` via ${BASH_TOOL_NAME} for searching file contents with regex`
     : `- Use ${GREP_TOOL_NAME} for searching file contents with regex`
@@ -56,28 +90,40 @@ NOTE: You are meant to be a fast agent that returns output as quickly as possibl
 Complete the user's search request efficiently and report your findings clearly.`
 }
 
+// Explore Agent 在触发搜索前的最少查询次数（确保搜索深度）
 export const EXPLORE_AGENT_MIN_QUERIES = 3
 
+// Explore Agent 的 whenToUse 描述，供父 Agent 决策是否调用
 const EXPLORE_WHEN_TO_USE =
   'Fast agent specialized for exploring codebases. Use this when you need to quickly find files by patterns (eg. "src/components/**/*.tsx"), search code for keywords (eg. "API endpoints"), or answer questions about the codebase (eg. "how do API endpoints work?"). When calling this agent, specify the desired thoroughness level: "quick" for basic searches, "medium" for moderate exploration, or "very thorough" for comprehensive analysis across multiple locations and naming conventions.'
 
+/**
+ * Explore 内置 Agent 定义。
+ *
+ * 专门用于代码库快速探索，只读模式，支持文件查找、内容搜索和代码分析。
+ * 通过 disallowedTools 排除所有编辑类工具，确保只读约束。
+ */
 export const EXPLORE_AGENT: BuiltInAgentDefinition = {
   agentType: 'Explore',
   whenToUse: EXPLORE_WHEN_TO_USE,
+  // 禁用所有可能修改文件的工具，强制只读模式
   disallowedTools: [
-    AGENT_TOOL_NAME,
-    EXIT_PLAN_MODE_TOOL_NAME,
-    FILE_EDIT_TOOL_NAME,
-    FILE_WRITE_TOOL_NAME,
-    NOTEBOOK_EDIT_TOOL_NAME,
+    AGENT_TOOL_NAME,           // 禁止启动子 Agent
+    EXIT_PLAN_MODE_TOOL_NAME,  // 禁止退出计划模式
+    FILE_EDIT_TOOL_NAME,       // 禁止文件编辑
+    FILE_WRITE_TOOL_NAME,      // 禁止文件写入
+    NOTEBOOK_EDIT_TOOL_NAME,   // 禁止 Notebook 编辑
   ],
   source: 'built-in',
   baseDir: 'built-in',
   // Ants get inherit to use the main agent's model; external users get haiku for speed
   // Note: For ants, getAgentModel() checks tengu_explore_agent GrowthBook flag at runtime
+  // Ant 内部用户：继承父 Agent 模型（可通过 GrowthBook 标志在运行时覆盖）
+  // 外部用户：使用 haiku 模型以保证搜索速度
   model: process.env.USER_TYPE === 'ant' ? 'inherit' : 'haiku',
   // Explore is a fast read-only search agent — it doesn't need commit/PR/lint
   // rules from CLAUDE.md. The main agent has full context and interprets results.
+  // 搜索 Agent 不需要 CLAUDE.md 中的提交/PR/Lint 规则，省略以节省 token
   omitClaudeMd: true,
   getSystemPrompt: () => getExploreSystemPrompt(),
 }

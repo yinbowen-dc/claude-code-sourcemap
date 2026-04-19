@@ -1,3 +1,31 @@
+/**
+ * AppState 类型定义与默认值工厂模块
+ *
+ * 在 Claude Code 的状态管理体系中，本文件处于类型定义层：
+ * - 上层：AppState.tsx 的 createStore<AppState>(...) 以本文件的类型和工厂函数为基础，
+ *         创建应用全局状态存储
+ * - 本层：定义 AppState 类型（100+ 字段，覆盖整个应用所有领域状态），
+ *         以及 getDefaultAppState() 初始状态工厂函数
+ * - 依赖层：众多子系统类型（MCP、Tool、Task、Plugin、Permission 等）
+ *           通过 import type 引入，AppState 是它们的聚合根
+ *
+ * AppState 的领域分区（按字段功能分组）：
+ * - 基础设置：settings / verbose / mainLoopModel
+ * - UI 状态：expandedView / footerSelection / viewSelectionMode
+ * - 权限：toolPermissionContext
+ * - 远程会话：remoteSessionUrl / remoteConnectionStatus / remoteBackgroundTaskCount
+ * - REPL 桥接：replBridge* 系列字段（always-on bridge 与 claude.ai 的通信）
+ * - 任务系统：tasks / agentNameRegistry / foregroundedTaskId / viewingAgentTaskId
+ * - MCP：mcp.{clients, tools, commands, resources}
+ * - 插件：plugins.{enabled, disabled, commands, errors}
+ * - 推测执行：speculation / speculationSessionTimeSavedMs
+ * - 通知/提示：notifications / elicitation / promptSuggestion
+ * - tmux/bagel 集成：tungsten*/bagel* 系列字段
+ * - computer use MCP：computerUseMcpState
+ * - 团队协作：teamContext / standaloneAgentContext / inbox
+ * - ultraplan：ultraplan* 系列字段
+ */
+
 import type { Notification } from 'src/context/notifications.js'
 import type { TodoList } from 'src/utils/todo/types.js'
 import type { BridgePermissionCallbacks } from '../bridge/bridgePermissionCallbacks.js'
@@ -38,6 +66,15 @@ import type { SettingsJson } from '../utils/settings/types.js'
 import { shouldEnableThinkingByDefault } from '../utils/thinking.js'
 import type { Store } from './store.js'
 
+/**
+ * 推测执行（Speculation）的完成边界类型。
+ *
+ * 描述推测执行在哪个操作处"截止"，用于后续合并或丢弃推测结果：
+ * - complete：模型输出完整（含 token 计数）
+ * - bash：遇到 bash 命令调用
+ * - edit：遇到文件编辑操作
+ * - denied_tool：遇到被拒绝的工具调用
+ */
 export type CompletionBoundary =
   | { type: 'complete'; completedAt: number; outputTokens: number }
   | { type: 'bash'; command: string; completedAt: number }
@@ -49,12 +86,28 @@ export type CompletionBoundary =
       completedAt: number
     }
 
+/**
+ * 推测执行的结果快照。
+ *
+ * 包含推测生成的消息序列、完成边界信息、以及因预取节省的时间（毫秒）。
+ */
 export type SpeculationResult = {
   messages: Message[]
   boundary: CompletionBoundary | null
   timeSavedMs: number
 }
 
+/**
+ * 推测执行状态机。
+ *
+ * - idle：无推测执行进行中
+ * - active：推测执行运行中，包含：
+ *   - id / abort：用于取消当前推测
+ *   - messagesRef：可变引用，避免每条消息都扩展数组
+ *   - writtenPathsRef：已写入 overlay 的相对路径集合
+ *   - boundary：当前触发截止的边界（null = 尚未遇到）
+ *   - pipelinedSuggestion：流水线模式的提示建议
+ */
 export type SpeculationState =
   | { status: 'idle' }
   | {
@@ -76,8 +129,15 @@ export type SpeculationState =
       } | null
     }
 
+/** 推测执行的 idle 初始状态常量（避免每次创建新对象） */
 export const IDLE_SPECULATION_STATE: SpeculationState = { status: 'idle' }
 
+/**
+ * 页脚导航项类型。
+ *
+ * footerSelection 字段使用此类型，标识当前聚焦的页脚 pill
+ * （arrow-key 导航，共 6 个 pill）。
+ */
 export type FooterItem =
   | 'tasks'
   | 'tmux'
@@ -86,28 +146,39 @@ export type FooterItem =
   | 'bridge'
   | 'companion'
 
+/**
+ * Claude Code 应用全局状态类型。
+ *
+ * 整体分为两部分：
+ * 1. DeepImmutable<{...}>：包含基础标量字段，通过 DeepImmutable 保证深度不可变，
+ *    防止直接修改嵌套对象（需通过 setState 更新）
+ * 2. & { tasks, mcp, plugins, ... }：包含含函数类型或 Map/Set 的字段，
+ *    排除在 DeepImmutable 之外，直接以原始类型存储
+ *
+ * 字段较多（100+），详见各字段注释。
+ */
 export type AppState = DeepImmutable<{
-  settings: SettingsJson
-  verbose: boolean
-  mainLoopModel: ModelSetting
-  mainLoopModelForSession: ModelSetting
-  statusLineText: string | undefined
-  expandedView: 'none' | 'tasks' | 'teammates'
-  isBriefOnly: boolean
+  settings: SettingsJson           // 用户设置（从 ~/.claude/settings.json 加载）
+  verbose: boolean                 // 详细输出模式（--verbose 标志）
+  mainLoopModel: ModelSetting      // 主循环模型（null = 使用默认模型）
+  mainLoopModelForSession: ModelSetting // 本次会话的主循环模型（不跨会话持久化）
+  statusLineText: string | undefined   // 状态栏自定义文字
+  expandedView: 'none' | 'tasks' | 'teammates' // 展开视图模式
+  isBriefOnly: boolean             // 仅显示简要视图（隐藏详情）
   // Optional - only present when ENABLE_AGENT_SWARMS is true (for dead code elimination)
   showTeammateMessagePreview?: boolean
-  selectedIPAgentIndex: number
+  selectedIPAgentIndex: number     // 当前选中的 in-process Agent 索引
   // CoordinatorTaskPanel selection: -1 = pill, 0 = main, 1..N = agent rows.
   // AppState (not local) so the panel can read it directly without prop-drilling
   // through PromptInput → PromptInputFooter.
   coordinatorTaskIndex: number
-  viewSelectionMode: 'none' | 'selecting-agent' | 'viewing-agent'
+  viewSelectionMode: 'none' | 'selecting-agent' | 'viewing-agent' // 视图选择模式
   // Which footer pill is focused (arrow-key navigation below the prompt).
   // Lives in AppState so pill components rendered outside PromptInput
   // (CompanionSprite in REPL.tsx) can read their own focused state.
   footerSelection: FooterItem | null
-  toolPermissionContext: ToolPermissionContext
-  spinnerTip?: string
+  toolPermissionContext: ToolPermissionContext // 工具权限上下文（当前权限模式 + bypass 状态）
+  spinnerTip?: string              // 加载中提示文字
   // Agent name from --agent CLI flag or settings (for logo display)
   agent: string | undefined
   // Assistant mode fully enabled (settings + GrowthBook gate + trust).
@@ -171,10 +242,10 @@ export type AppState = DeepImmutable<{
   companionPetAt?: number
   // TODO (ashwin): see if we can use utility-types DeepReadonly for this
   mcp: {
-    clients: MCPServerConnection[]
-    tools: Tool[]
-    commands: Command[]
-    resources: Record<string, ServerResource[]>
+    clients: MCPServerConnection[]  // 已连接的 MCP 服务器列表
+    tools: Tool[]                   // MCP 工具列表
+    commands: Command[]             // MCP 命令列表
+    resources: Record<string, ServerResource[]> // MCP 资源（按服务器分组）
     /**
      * Incremented by /reload-plugins to trigger MCP effects to re-run
      * and pick up newly-enabled plugin MCP servers. Effects read this
@@ -183,9 +254,9 @@ export type AppState = DeepImmutable<{
     pluginReconnectKey: number
   }
   plugins: {
-    enabled: LoadedPlugin[]
-    disabled: LoadedPlugin[]
-    commands: Command[]
+    enabled: LoadedPlugin[]         // 已启用的插件列表
+    disabled: LoadedPlugin[]        // 已禁用的插件列表
+    commands: Command[]             // 插件提供的命令列表
     /**
      * Plugin system errors collected during loading and initialization.
      * See {@link PluginError} type documentation for complete details on error
@@ -214,21 +285,21 @@ export type AppState = DeepImmutable<{
      */
     needsRefresh: boolean
   }
-  agentDefinitions: AgentDefinitionsResult
-  fileHistory: FileHistoryState
-  attribution: AttributionState
-  todos: { [agentId: string]: TodoList }
-  remoteAgentTaskSuggestions: { summary: string; task: string }[]
+  agentDefinitions: AgentDefinitionsResult   // 从 agents 目录加载的 Agent 定义列表
+  fileHistory: FileHistoryState              // 文件历史快照（用于 rewind 功能）
+  attribution: AttributionState             // 代码归因状态（commit attribution）
+  todos: { [agentId: string]: TodoList }    // 各 Agent 的待办事项列表
+  remoteAgentTaskSuggestions: { summary: string; task: string }[] // 远程 Agent 任务建议
   notifications: {
-    current: Notification | null
-    queue: Notification[]
+    current: Notification | null   // 当前显示的通知
+    queue: Notification[]          // 待显示的通知队列
   }
   elicitation: {
-    queue: ElicitationRequestEvent[]
+    queue: ElicitationRequestEvent[] // 待处理的 MCP Elicitation 请求队列
   }
-  thinkingEnabled: boolean | undefined
-  promptSuggestionEnabled: boolean
-  sessionHooks: SessionHooksState
+  thinkingEnabled: boolean | undefined      // 是否启用 extended thinking（undefined = 未初始化）
+  promptSuggestionEnabled: boolean          // 是否启用提示建议功能
+  sessionHooks: SessionHooksState          // 会话钩子状态（postSampling 等）
   tungstenActiveSession?: {
     sessionName: string
     socketName: string
@@ -383,14 +454,14 @@ export type AppState = DeepImmutable<{
     host: string
   } | null
   promptSuggestion: {
-    text: string | null
+    text: string | null                              // 提示建议文字（null = 无建议）
     promptId: 'user_intent' | 'stated_intent' | null
-    shownAt: number
-    acceptedAt: number
+    shownAt: number                                  // 建议显示时间戳
+    acceptedAt: number                               // 建议被接受时间戳
     generationRequestId: string | null
   }
-  speculation: SpeculationState
-  speculationSessionTimeSavedMs: number
+  speculation: SpeculationState                      // 推测执行状态
+  speculationSessionTimeSavedMs: number              // 本次会话累计节省时间（毫秒）
   skillImprovement: {
     suggestion: {
       skillName: string
@@ -451,8 +522,22 @@ export type AppState = DeepImmutable<{
   channelPermissionCallbacks?: ChannelPermissionCallbacks
 }
 
+/** AppStateStore 类型别名：Store<AppState> 的具名类型，方便在各模块中传递 */
 export type AppStateStore = Store<AppState>
 
+/**
+ * 创建应用初始状态。
+ *
+ * 流程：
+ * 1. 通过懒加载 require 避免与 teammate.ts 的循环依赖
+ * 2. 检测当前进程是否为 teammate 且需要 plan 模式，确定初始权限模式
+ * 3. 组装包含所有字段默认值的完整 AppState 对象
+ *
+ * 注意：tasks、agentNameRegistry 等含引用类型的字段每次调用都创建新实例，
+ * 不共享引用，确保多个 store 实例（测试场景）相互隔离。
+ *
+ * @returns 完整的 AppState 初始值
+ */
 export function getDefaultAppState(): AppState {
   // Determine initial permission mode for teammates spawned with plan_mode_required
   // Use lazy require to avoid circular dependency with teammate.ts
@@ -460,15 +545,16 @@ export function getDefaultAppState(): AppState {
   const teammateUtils =
     require('../utils/teammate.js') as typeof import('../utils/teammate.js')
   /* eslint-enable @typescript-eslint/no-require-imports */
+  // teammate + plan_mode_required → 以 plan 模式启动；否则以 default 模式启动
   const initialMode: PermissionMode =
     teammateUtils.isTeammate() && teammateUtils.isPlanModeRequired()
       ? 'plan'
       : 'default'
 
   return {
-    settings: getInitialSettings(),
-    tasks: {},
-    agentNameRegistry: new Map(),
+    settings: getInitialSettings(),       // 从配置文件加载初始设置
+    tasks: {},                            // 任务表初始为空
+    agentNameRegistry: new Map(),         // Agent 名称注册表初始为空
     verbose: false,
     mainLoopModel: null, // alias, full name (as with --model or env var), or null (default)
     mainLoopModelForSession: null,
@@ -498,8 +584,8 @@ export function getDefaultAppState(): AppState {
     replBridgeInitialName: undefined,
     showRemoteCallout: false,
     toolPermissionContext: {
-      ...getEmptyToolPermissionContext(),
-      mode: initialMode,
+      ...getEmptyToolPermissionContext(),  // 从空权限上下文扩展
+      mode: initialMode,                  // 覆盖权限模式（default 或 plan）
     },
     agent: undefined,
     agentDefinitions: { activeAgents: [], allAgents: [] },
@@ -536,7 +622,7 @@ export function getDefaultAppState(): AppState {
     elicitation: {
       queue: [],
     },
-    thinkingEnabled: shouldEnableThinkingByDefault(),
+    thinkingEnabled: shouldEnableThinkingByDefault(), // 按默认规则初始化 extended thinking
     promptSuggestionEnabled: shouldEnablePromptSuggestion(),
     sessionHooks: new Map(),
     inbox: {
@@ -555,7 +641,7 @@ export function getDefaultAppState(): AppState {
       acceptedAt: 0,
       generationRequestId: null,
     },
-    speculation: IDLE_SPECULATION_STATE,
+    speculation: IDLE_SPECULATION_STATE,  // 推测执行初始为 idle 状态
     speculationSessionTimeSavedMs: 0,
     skillImprovement: {
       suggestion: null,

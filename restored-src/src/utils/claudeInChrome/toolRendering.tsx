@@ -1,3 +1,13 @@
+/**
+ * Claude in Chrome 工具渲染模块。
+ *
+ * 在 Claude Code 系统中，该模块负责将 Chrome 浏览器自动化工具（mcp__claude-in-chrome__*）
+ * 的调用输入和输出渲染为 Ink UI 组件，供终端界面展示：
+ * - ChromeToolName 类型：所有已知 Chrome 工具名称的联合类型
+ * - renderChromeToolUseMessage()（内部）：渲染工具调用输入（显示 URL、选择器、脚本等摘要）
+ * - renderChromeToolResultMessage()：渲染工具调用结果（截图、错误等）
+ * - 追踪当前活跃的 Chrome 标签页 ID（trackClaudeInChromeTabId）
+ */
 import * as React from 'react';
 import { MessageResponse } from '../../components/MessageResponse.js';
 import { supportsHyperlinks } from '../../ink/supports-hyperlinks.js';

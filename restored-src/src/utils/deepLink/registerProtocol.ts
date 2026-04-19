@@ -1,16 +1,13 @@
 /**
- * Protocol Handler Registration
+ * Deep Link 协议注册模块。
  *
- * Registers the `claude-cli://` custom URI scheme with the OS,
- * so that clicking a `claude-cli://` link in a browser (or any app) will
- * invoke `claude --handle-uri <url>`.
+ * 在 Claude Code 系统中，该模块向 OS 注册 `claude-cli://` 自定义 URI Scheme，
+ * 使浏览器（或任意应用）中点击 `claude-cli://` 链接时调用 `claude --handle-uri <url>`。
  *
- * Platform details:
- *   macOS  — Creates a minimal .app trampoline in ~/Applications with
- *            CFBundleURLTypes in its Info.plist
- *   Linux  — Creates a .desktop file in $XDG_DATA_HOME/applications
- *            (default ~/.local/share/applications) and registers it with xdg-mime
- *   Windows — Writes registry keys under HKEY_CURRENT_USER\Software\Classes
+ * 平台实现：
+ * - macOS：在 ~/Applications 创建最小 .app 跳板程序，Info.plist 含 CFBundleURLTypes
+ * - Linux：在 $XDG_DATA_HOME/applications 创建 .desktop 文件并通过 xdg-mime 注册
+ * - Windows：在 HKEY_CURRENT_USER\Software\Classes 写入注册表项
  */
 
 import { promises as fs } from 'fs'

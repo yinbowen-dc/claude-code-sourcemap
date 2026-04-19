@@ -1,8 +1,22 @@
+/**
+ * FeedbackSurveyView.tsx — 反馈调查选项视图
+ *
+ * 在 Claude Code 系统流程中的位置：
+ *   助手回复后 → 调查弹出层 → FeedbackSurvey（state='open'） → FeedbackSurveyView
+ *
+ * 主要功能：
+ *   1. FeedbackSurveyView：渲染调查问题和四个选项（0=Dismiss/1=Bad/2=Fine/3=Good），
+ *      通过 useDebouncedDigitInput 监听防抖数字键输入，
+ *      按键后将数字映射为 FeedbackSurveyResponse 类型并回调 onSelect。
+ *   2. isValidResponseInput：导出的类型守卫，判断输入字符串是否为合法调查选项（0/1/2/3）。
+ *
+ * 输入映射：
+ *   '0' → 'dismissed'（关闭调查）
+ *   '1' → 'bad'（差评）
+ *   '2' → 'fine'（一般）
+ *   '3' → 'good'（好评）
+ */
 import { c as _c } from "react/compiler-runtime";
-import React from 'react';
-import { Box, Text } from '../../ink.js';
-import { useDebouncedDigitInput } from './useDebouncedDigitInput.js';
-import type { FeedbackSurveyResponse } from './utils.js';
 type Props = {
   onSelect: (option: FeedbackSurveyResponse) => void;
   inputValue: string;
@@ -19,6 +33,19 @@ const inputToResponse: Record<ResponseInput, FeedbackSurveyResponse> = {
 } as const;
 export const isValidResponseInput = (input: string): input is ResponseInput => (RESPONSE_INPUTS as readonly string[]).includes(input);
 const DEFAULT_MESSAGE = 'How is Claude doing this session? (optional)';
+/**
+ * FeedbackSurveyView 组件
+ *
+ * 整体流程：
+ *   1. 使用 useDebouncedDigitInput 注册键盘监听，防止快速连按误触发；
+ *      当用户输入有效数字（0/1/2/3）时，通过 inputToResponse 映射后调用 onSelect。
+ *   2. 渲染调查问题文本（加粗，带青色圆点前缀）
+ *   3. 渲染四个选项行（1: Bad / 2: Fine / 3: Good / 0: Dismiss），
+ *      选项数字使用青色高亮；选项行为纯静态，使用 sentinel 缓存避免重渲染。
+ *
+ * 在系统中的角色：
+ *   作为调查的主界面，用户通过数字键快速表达对当前会话的满意度。
+ */
 export function FeedbackSurveyView(t0) {
   const $ = _c(15);
   const {

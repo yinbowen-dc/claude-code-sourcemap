@@ -1,3 +1,20 @@
+/**
+ * 命令注册与管理中心 - Claude Code 所有斜杠命令（/command）的统一入口
+ *
+ * 在整个系统流程中的位置：
+ * - 位于 REPL 层与具体命令实现之间的"命令路由层"
+ * - main.tsx 和 REPL 组件通过 getCommands() 获取可用命令列表，再按名称匹配用户输入
+ * - 每个命令实现位于 ./commands/<name>/ 子目录，此文件仅负责导入、注册和过滤
+ *
+ * 主要职责：
+ * 1. 静态导入所有内置命令模块（顶部大量 import）
+ * 2. 条件导入特性门控（feature flag）保护的命令（BRIDGE_MODE、VOICE_MODE 等）
+ * 3. 通过 COMMANDS() 惰性初始化命令列表（memoize，避免模块初始化时读取 config）
+ * 4. 通过 loadAllCommands() 合并 skills、plugins、workflows 等动态来源
+ * 5. 提供 getCommands() 作为外部统一接口，附带可用性（availability）和 isEnabled 过滤
+ * 6. 提供 findCommand / hasCommand / getCommand 等查找工具函数
+ * 7. 区分 REMOTE_SAFE_COMMANDS（远程模式可用）和 BRIDGE_SAFE_COMMANDS（Bridge 模式可用）
+ */
 // biome-ignore-all assist/source/organizeImports: ANT-ONLY import markers must not be reordered
 import addDir from './commands/add-dir/index.js'
 import autofixPr from './commands/autofix-pr/index.js'
@@ -221,6 +238,10 @@ export type {
 } from './types/command.js'
 export { getCommandName, isCommandEnabled } from './types/command.js'
 
+/**
+ * 内部命令集合（仅 Anthropic 员工可见）
+ * 这些命令在外部构建版本中会被剔除，避免暴露内部工具
+ */
 // Commands that get eliminated from the external build
 export const INTERNAL_ONLY_COMMANDS = [
   backfillSessions,
@@ -345,6 +366,14 @@ const COMMANDS = memoize((): Command[] => [
     : []),
 ])
 
+/**
+ * 获取 builtin 命令名称集合（memoized）
+ * 用于快速判断某个名称是否属于内置命令（排重动态 skills 时使用）
+ */
+/**
+ * 获取 builtin 命令名称集合（memoized）
+ * 用于快速判断某个名称是否属于内置命令（排重动态 skills 时使用）
+ */
 export const builtInCommandNames = memoize(
   (): Set<string> =>
     new Set(COMMANDS().flatMap(_ => [_.name, ...(_.aliases ?? [])])),
@@ -443,8 +472,9 @@ export function meetsAvailabilityRequirement(cmd: Command): boolean {
 }
 
 /**
- * Loads all command sources (skills, plugins, workflows). Memoized by cwd
- * because loading is expensive (disk I/O, dynamic imports).
+ * 加载所有命令来源（skills 目录、plugins、workflows）
+ * 使用 memoize 按 cwd 缓存结果，因为磁盘 I/O 和动态 import 代价较高
+ * 返回合并后的完整命令列表（动态 + 内置）
  */
 const loadAllCommands = memoize(async (cwd: string): Promise<Command[]> => {
   const [
@@ -469,9 +499,10 @@ const loadAllCommands = memoize(async (cwd: string): Promise<Command[]> => {
 })
 
 /**
- * Returns commands available to the current user. The expensive loading is
- * memoized, but availability and isEnabled checks run fresh every call so
- * auth changes (e.g. /login) take effect immediately.
+ * 返回当前用户可用的命令列表
+ * 昂贵的加载操作已 memoize，但 availability 和 isEnabled 检查每次都重新执行，
+ * 以确保 /login 等操作后认证状态变化能立即生效
+ * 同时合并运行时动态发现的 skills（如文件操作期间发现的新技能）
  */
 export async function getCommands(cwd: string): Promise<Command[]> {
   const allCommands = await loadAllCommands(cwd)
@@ -517,8 +548,8 @@ export async function getCommands(cwd: string): Promise<Command[]> {
 }
 
 /**
- * Clears only the memoization caches for commands, WITHOUT clearing skill caches.
- * Use this when dynamic skills are added to invalidate cached command lists.
+ * 仅清除命令 memoization 缓存（不清除 skill 缓存）
+ * 当动态 skills 被添加时用于使已缓存的命令列表失效
  */
 export function clearCommandMemoizationCaches(): void {
   loadAllCommands.cache?.clear?.()
@@ -531,6 +562,10 @@ export function clearCommandMemoizationCaches(): void {
   clearSkillIndexCache?.()
 }
 
+/**
+ * 完整清除所有命令相关缓存（包括 plugin 和 skill 缓存）
+ * 在需要完全重置命令系统时使用，如插件安装/卸载后
+ */
 export function clearCommandsCache(): void {
   clearCommandMemoizationCaches()
   clearPluginCommandCache()
@@ -539,10 +574,9 @@ export function clearCommandsCache(): void {
 }
 
 /**
- * Filter AppState.mcp.commands to MCP-provided skills (prompt-type,
- * model-invocable, loaded from MCP). These live outside getCommands() so
- * callers that need MCP skills in their skill index thread them through
- * separately.
+ * 从 MCP 命令中筛选出可作为 skills 使用的命令
+ * MCP skills 是 prompt 类型、可被模型调用、且来源为 mcp 的命令
+ * 它们游离于 getCommands() 之外，需要调用方单独传入和处理
  */
 export function getMcpSkillCommands(
   mcpCommands: readonly Command[],
@@ -558,6 +592,12 @@ export function getMcpSkillCommands(
   return []
 }
 
+/**
+ * 获取模型可调用的所有 prompt 类命令（SkillTool 使用）
+ * 包含 skills/ 目录、bundled skills 和旧版 commands/ 目录中的 prompt 命令
+ * plugin/MCP 命令需要有明确 description 才会出现
+ * 按 cwd memoize，同一工作目录下只加载一次
+ */
 // SkillTool shows ALL prompt-based commands that the model can invoke
 // This includes both skills (from /skills/) and commands (from /commands/)
 export const getSkillToolCommands = memoize(
@@ -580,6 +620,11 @@ export const getSkillToolCommands = memoize(
   },
 )
 
+/**
+ * 获取斜杠命令工具可用的 skills 列表
+ * 仅包含来自 skills/、plugin、bundled 目录且有明确描述的 prompt 命令
+ * 加载失败时返回空数组，避免 skills 加载错误影响整体系统
+ */
 // Filters commands to include only skills. Skills are commands that provide
 // specialized capabilities for the model to use. They are identified by
 // loadedFrom being 'skills', 'plugin', or 'bundled', or having disableModelInvocation set.
@@ -685,6 +730,14 @@ export function filterCommandsForRemoteMode(commands: Command[]): Command[] {
   return commands.filter(cmd => REMOTE_SAFE_COMMANDS.has(cmd))
 }
 
+/**
+ * 根据命令名称查找命令（支持别名匹配）
+ * 返回第一个名称或别名匹配的命令，未找到则返回 undefined
+ */
+/**
+ * 根据命令名称查找命令（支持别名匹配）
+ * 返回第一个名称或别名匹配的命令，未找到则返回 undefined
+ */
 export function findCommand(
   commandName: string,
   commands: Command[],
@@ -697,10 +750,16 @@ export function findCommand(
   )
 }
 
+/** 检查命令是否存在（根据名称或别名） */
+/** 检查命令是否存在（根据名称或别名） */
 export function hasCommand(commandName: string, commands: Command[]): boolean {
   return findCommand(commandName, commands) !== undefined
 }
 
+/**
+ * 获取命令，未找到时抛出 ReferenceError（附带可用命令列表）
+ * 用于需要确保命令存在的场景，避免静默失败
+ */
 export function getCommand(commandName: string, commands: Command[]): Command {
   const command = findCommand(commandName, commands)
   if (!command) {

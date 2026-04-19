@@ -1,3 +1,19 @@
+/**
+ * 调试日志模块。
+ *
+ * 在 Claude Code 系统中，该模块提供会话级调试日志写入功能，
+ * 将调试信息追加到 ~/.claude/logs/<session-id>.log 文件，
+ * 并维护 ~/.claude/logs/latest.log 软链接指向最新会话日志：
+ * - logForDebugging()：写入调试消息（仅在 CLAUDE_CODE_ENABLE_TELEMETRY 或 DEBUG 环境下激活）
+ */
+/**
+ * 调试日志模块。
+ *
+ * 在 Claude Code 系统中，该模块提供会话级调试日志写入功能，
+ * 将调试信息追加到 ~/.claude/logs/<session-id>.log 文件，
+ * 并维护 ~/.claude/logs/latest.log 软链接指向最新会话日志：
+ * - logForDebugging()：写入调试消息（仅在 CLAUDE_CODE_ENABLE_TELEMETRY 或 DEBUG 环境下激活）
+ */
 import { appendFile, mkdir, symlink, unlink } from 'fs/promises'
 import memoize from 'lodash-es/memoize.js'
 import { dirname, join } from 'path'

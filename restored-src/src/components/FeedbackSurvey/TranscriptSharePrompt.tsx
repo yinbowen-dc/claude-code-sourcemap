@@ -1,3 +1,24 @@
+/**
+ * TranscriptSharePrompt.tsx — 会话转录共享询问提示组件
+ *
+ * 在 Claude Code 系统流程中的位置：
+ *   反馈调查 → thanks 状态之后 → transcript_prompt 状态 → TranscriptSharePrompt
+ *
+ * 主要功能：
+ *   TranscriptSharePrompt：向用户询问是否允许 Anthropic 查看当前会话转录，
+ *   展示三个选项（1=Yes / 2=No / 3=Don't ask again），
+ *   通过 useDebouncedDigitInput 处理防抖数字键输入，
+ *   将数字映射为 TranscriptShareResponse 后回调 onSelect。
+ *
+ * 选项映射：
+ *   '1' → 'yes'（同意共享）
+ *   '2' → 'no'（本次拒绝）
+ *   '3' → 'dont_ask_again'（永久关闭询问）
+ *
+ * 整体设计：
+ *   所有渲染内容为静态，因此全部使用 sentinel 缓存，只有 onSelect/inputValue/setInputValue
+ *   变化时才重新构造回调，避免不必要的重渲染。
+ */
 import { c as _c } from "react/compiler-runtime";
 import React from 'react';
 import { BLACK_CIRCLE } from '../../constants/figures.js';
@@ -17,27 +38,52 @@ const inputToResponse: Record<ResponseInput, TranscriptShareResponse> = {
   '3': 'dont_ask_again'
 } as const;
 const isValidResponseInput = (input: string): input is ResponseInput => (RESPONSE_INPUTS as readonly string[]).includes(input);
+/**
+ * TranscriptSharePrompt
+ *
+ * 整体流程：
+ *   1. 解构 Props：onSelect（回调）、inputValue（当前输入字符串）、setInputValue（更新输入）
+ *   2. 构造 onDigit 回调（$[0] 缓存 onSelect 引用）：
+ *      digit => onSelect(inputToResponse[digit])
+ *      将防抖后的数字字符映射为 TranscriptShareResponse 枚举值后触发回调
+ *   3. 组装 useDebouncedDigitInput 配置对象（$[2]~$[5] 联合缓存）：
+ *      inputValue、setInputValue、isValidDigit=isValidResponseInput、onDigit=t1
+ *   4. 调用 useDebouncedDigitInput，监听键盘输入并在 400ms 防抖后调用 onDigit
+ *   5. 渲染静态 JSX（$[6]~$[10] 均使用 sentinel 缓存，首次初始化后永不更新）：
+ *      $[6]  — 问题行：BLACK_CIRCLE 图标 + 加粗提问文本
+ *      $[7]  — 说明行：dimColor 展示文档 URL
+ *      $[8]  — 选项 1（Yes）行，宽度 10 对齐
+ *      $[9]  — 选项 2（No）行，宽度 10 对齐
+ *      $[10] — 整体 column 容器，含问题、说明、选项三行
+ *   6. 返回顶层 Box（t7）
+ *
+ * 在系统中的角色：
+ *   是 FeedbackSurvey 中 transcript_prompt 状态的唯一渲染组件，
+ *   负责将用户意图（数字键）转换为 TranscriptShareResponse 并向上传递。
+ */
 export function TranscriptSharePrompt(t0) {
-  const $ = _c(11);
+  const $ = _c(11); // 11 个缓存槽：1 个 onSelect、4 个 useDebouncedDigitInput 配置、6 个静态 JSX
   const {
     onSelect,
     inputValue,
     setInputValue
   } = t0;
   let t1;
+  // $[0] 缓存 onSelect 引用，仅在 onSelect 变化时重建 onDigit 回调
   if ($[0] !== onSelect) {
-    t1 = digit => onSelect(inputToResponse[digit]);
+    t1 = digit => onSelect(inputToResponse[digit]); // 将数字字符映射为 TranscriptShareResponse
     $[0] = onSelect;
     $[1] = t1;
   } else {
     t1 = $[1];
   }
   let t2;
+  // $[2]~$[5] 联合缓存：inputValue/setInputValue/onDigit 三者任一变化则重建配置对象
   if ($[2] !== inputValue || $[3] !== setInputValue || $[4] !== t1) {
     t2 = {
       inputValue,
       setInputValue,
-      isValidDigit: isValidResponseInput,
+      isValidDigit: isValidResponseInput, // 只允许 '1'/'2'/'3' 通过
       onDigit: t1
     };
     $[2] = inputValue;
@@ -47,8 +93,10 @@ export function TranscriptSharePrompt(t0) {
   } else {
     t2 = $[5];
   }
+  // 注册防抖数字输入 hook，400ms 内重复按键只触发一次 onDigit
   useDebouncedDigitInput(t2);
   let t3;
+  // $[6]：问题行，sentinel 保护，首次渲染后永远复用
   if ($[6] === Symbol.for("react.memo_cache_sentinel")) {
     t3 = <Box><Text color="ansi:cyan">{BLACK_CIRCLE} </Text><Text bold={true}>Can Anthropic look at your session transcript to help us improve Claude Code?</Text></Box>;
     $[6] = t3;
@@ -56,6 +104,7 @@ export function TranscriptSharePrompt(t0) {
     t3 = $[6];
   }
   let t4;
+  // $[7]：数据使用文档说明行，dimColor 降低视觉优先级
   if ($[7] === Symbol.for("react.memo_cache_sentinel")) {
     t4 = <Box marginLeft={2}><Text dimColor={true}>Learn more: https://code.claude.com/docs/en/data-usage#session-quality-surveys</Text></Box>;
     $[7] = t4;
@@ -63,6 +112,7 @@ export function TranscriptSharePrompt(t0) {
     t4 = $[7];
   }
   let t5;
+  // $[8]：选项 1（Yes），宽度 10 以对齐其他选项
   if ($[8] === Symbol.for("react.memo_cache_sentinel")) {
     t5 = <Box width={10}><Text><Text color="ansi:cyan">1</Text>: Yes</Text></Box>;
     $[8] = t5;
@@ -70,6 +120,7 @@ export function TranscriptSharePrompt(t0) {
     t5 = $[8];
   }
   let t6;
+  // $[9]：选项 2（No），宽度 10 以对齐其他选项
   if ($[9] === Symbol.for("react.memo_cache_sentinel")) {
     t6 = <Box width={10}><Text><Text color="ansi:cyan">2</Text>: No</Text></Box>;
     $[9] = t6;
@@ -77,6 +128,7 @@ export function TranscriptSharePrompt(t0) {
     t6 = $[9];
   }
   let t7;
+  // $[10]：顶层容器，column 布局，含问题行、说明行、三个选项行（包含内联的"3: Don't ask again"）
   if ($[10] === Symbol.for("react.memo_cache_sentinel")) {
     t7 = <Box flexDirection="column" marginTop={1}>{t3}{t4}<Box marginLeft={2}>{t5}{t6}<Box><Text><Text color="ansi:cyan">3</Text>: Don't ask again</Text></Box></Box></Box>;
     $[10] = t7;

@@ -1,14 +1,17 @@
 /**
- * Pure-TypeScript bash parser producing tree-sitter-bash-compatible ASTs.
+ * 纯 TypeScript Bash 解析器，生成与 tree-sitter-bash 兼容的 AST。
  *
- * Downstream code in parser.ts, ast.ts, prefix.ts, ParsedCommand.ts walks this
- * by field name. startIndex/endIndex are UTF-8 BYTE offsets (not JS string
- * indices).
- *
- * Grammar reference: tree-sitter-bash. Validated against a 3449-input golden
- * corpus generated from the WASM parser.
+ * 在 Claude Code 系统中，该模块为 parser.ts / ast.ts / prefix.ts /
+ * ParsedCommand.ts 等下游模块提供 Bash 语法树；下游代码按字段名遍历节点。
+ * startIndex / endIndex 为 UTF-8 字节偏移量（非 JS 字符串索引）。
+ * 语法参考：tree-sitter-bash；已通过对 WASM 解析器生成的 3449 条黄金语料库验证。
  */
 
+/**
+ * AST 节点类型，与 tree-sitter 节点结构兼容。
+ * startIndex / endIndex 均为 UTF-8 字节偏移（非 JS 字符串下标）。
+ * children 保存子节点列表；叶子节点的 children 为空数组。
+ */
 export type TsNode = {
   type: string
   text: string
@@ -17,37 +20,43 @@ export type TsNode = {
   children: TsNode[]
 }
 
+/** 解析器模块接口，parse() 返回根节点或在超时/异常时返回 null。 */
 type ParserModule = {
   parse: (source: string, timeoutMs?: number) => TsNode | null
 }
 
 /**
- * 50ms wall-clock cap — bails out on pathological/adversarial input.
- * Pass `Infinity` via `parse(src, Infinity)` to disable (e.g. correctness
- * tests, where CI jitter would otherwise cause spurious null returns).
+ * 50ms 墙钟超时上限 —— 对病态/对抗性输入触发中止。
+ * 可通过 `parse(src, Infinity)` 禁用（用于正确性测试，避免 CI 抖动导致误报 null）。
  */
 const PARSE_TIMEOUT_MS = 50
 
-/** Node budget cap — bails out before OOM on deeply nested input. */
+/** 节点数量上限 —— 在深度嵌套输入造成 OOM 之前中止解析。 */
 const MAX_NODES = 50_000
 
 const MODULE: ParserModule = { parse: parseSource }
 
 const READY = Promise.resolve()
 
-/** No-op: pure-TS parser needs no async init. Kept for API compatibility. */
+/** 无操作：纯 TS 解析器无需异步初始化，保留此函数以维持 API 兼容性。 */
 export function ensureParserInitialized(): Promise<void> {
   return READY
 }
 
-/** Always succeeds — pure-TS needs no init. */
+/** 始终返回解析器模块（纯 TS 实现，无需初始化）。 */
 export function getParserModule(): ParserModule | null {
   return MODULE
 }
 
 // ───────────────────────────── Tokenizer ─────────────────────────────
 
-type TokenType =
+/**
+ * 词法单元类型枚举。
+ * WORD：普通单词；NUMBER：纯数字字面量；OP：操作符/标点；
+ * NEWLINE：换行符；COMMENT：注释；DQUOTE/SQUOTE/ANSI_C：各类引号；
+ * DOLLAR/DOLLAR_PAREN/DOLLAR_BRACE/DOLLAR_DPAREN：$、$(、${、$(( 前缀；
+ * BACKTICK：反引号；LT_PAREN/GT_PAREN：<( / >(（进程替换）；EOF：文件末。
+ */
   | 'WORD'
   | 'NUMBER'
   | 'OP'
@@ -65,17 +74,19 @@ type TokenType =
   | 'GT_PAREN'
   | 'EOF'
 
+/** 词法单元，携带类型、文本值和 UTF-8 字节偏移范围。 */
 type Token = {
   type: TokenType
   value: string
-  /** UTF-8 byte offset of first char */
+  /** 首个字符的 UTF-8 字节偏移 */
   start: number
-  /** UTF-8 byte offset one past last char */
+  /** 末尾字符下一位的 UTF-8 字节偏移 */
   end: number
 }
 
-const SPECIAL_VARS = new Set(['?', '$', '@', '*', '#', '-', '!', '_'])
+/** Bash 特殊变量字符集，用于 $? $$ $@ $* $# $- $! $_ 的快速识别。 */
 
+/** 声明类关键字集合，命令以这些关键字开头时路由到 parseDeclaration。 */
 const DECL_KEYWORDS = new Set([
   'export',
   'declare',
@@ -84,6 +95,10 @@ const DECL_KEYWORDS = new Set([
   'local',
 ])
 
+/**
+ * Shell 控制流关键字集合，导出供 ast.ts 用于拒绝不可能作为 argv[0] 的值。
+ * 包含 if/for/while/case/function 等所有 Bash 复合命令关键字。
+ */
 export const SHELL_KEYWORDS = new Set([
   'if',
   'then',
@@ -103,34 +118,39 @@ export const SHELL_KEYWORDS = new Set([
 ])
 
 /**
- * Lexer state. Tracks both JS-string index (for charAt) and UTF-8 byte offset
- * (for TsNode positions). ASCII fast path: byte == char index. Non-ASCII
- * advances byte count per-codepoint.
+ * 词法分析器状态。
+ * 同时追踪 JS 字符串下标（用于 charAt）和 UTF-8 字节偏移（用于 TsNode 位置）。
+ * ASCII 快速路径：字节偏移 == 字符下标；非 ASCII 按代码点逐字符累加字节数。
  */
 type Lexer = {
   src: string
   len: number
-  /** JS string index */
+  /** JS 字符串下标 */
   i: number
-  /** UTF-8 byte offset */
+  /** UTF-8 字节偏移 */
   b: number
-  /** Pending heredoc delimiters awaiting body scan at next newline */
+  /** 等待在下一个换行处扫描正文的 heredoc 记录列表 */
   heredocs: HeredocPending[]
-  /** Precomputed byte offset for each char index (lazy for non-ASCII) */
+  /** 每个字符下标对应的字节偏移预计算表（首次遇到非 ASCII 时惰性构建） */
   byteTable: Uint32Array | null
 }
 
-type HeredocPending = {
+/**
+ * 待处理 heredoc 记录。
+ * delim：分隔符文本；stripTabs：<<- 时为 true；quoted：分隔符被引号时为 true。
+ * bodyStart/bodyEnd/endStart/endEnd 在扫描正文后填入。
+ */
   delim: string
   stripTabs: boolean
   quoted: boolean
-  /** Filled after body scan */
+  /** 正文扫描后填入 */
   bodyStart: number
   bodyEnd: number
   endStart: number
   endEnd: number
 }
 
+/** 创建并返回初始化为 src 起始位置的词法分析器。 */
 function makeLexer(src: string): Lexer {
   return {
     src,
@@ -142,7 +162,11 @@ function makeLexer(src: string): Lexer {
   }
 }
 
-/** Advance one JS char, updating byte offset for UTF-8. */
+/**
+ * 前进一个 JS 字符，同步更新 UTF-8 字节偏移。
+ * - ASCII（< 0x80）：+1 字节；2 字节序列（< 0x800）：+2；
+ * - 高代理对（0xD800-0xDBFF）：消耗两个 JS char，+4 字节；其余 BMP：+3。
+ */
 function advance(L: Lexer): void {
   const c = L.src.charCodeAt(L.i)
   L.i++
@@ -151,7 +175,7 @@ function advance(L: Lexer): void {
   } else if (c < 0x800) {
     L.b += 2
   } else if (c >= 0xd800 && c <= 0xdbff) {
-    // High surrogate — next char completes the pair, total 4 UTF-8 bytes
+    // 高代理对 —— 下一个 JS char 构成完整代理对，共占 4 个 UTF-8 字节
     L.b += 4
     L.i++
   } else {
@@ -159,14 +183,19 @@ function advance(L: Lexer): void {
   }
 }
 
+/** 查看当前位置起第 off 个字符（不前进）；超出范围返回空字符串。 */
 function peek(L: Lexer, off = 0): string {
   return L.i + off < L.len ? L.src[L.i + off]! : ''
 }
 
+/**
+ * 返回字符下标 charIdx 对应的 UTF-8 字节偏移。
+ * 若 byteTable 尚未构建（首次非 ASCII 使用），则惰性构建全表。
+ */
 function byteAt(L: Lexer, charIdx: number): number {
-  // Fast path: ASCII-only prefix means char idx == byte idx
+  // 快速路径：全 ASCII 前缀时字符下标 == 字节偏移，byteTable 已存在时直接查表
   if (L.byteTable) return L.byteTable[charIdx]!
-  // Build table on first non-trivial lookup
+  // 首次非 ASCII 查询时构建完整的字符下标→字节偏移映射表
   const t = new Uint32Array(L.len + 1)
   let b = 0
   let i = 0
@@ -193,8 +222,12 @@ function byteAt(L: Lexer, charIdx: number): number {
   return t[charIdx]!
 }
 
+/**
+ * 判断字符是否为 Bash 单词字符（可出现在 word token 中）。
+ * 包含字母、数字及不构成操作符起始的各类标点：
+ * _ / . - + : @ % , ~ ^ ? * ! = [ ]
+ */
 function isWordChar(c: string): boolean {
-  // Bash word chars: alphanumeric + various punctuation that doesn't start operators
   return (
     (c >= 'a' && c <= 'z') ||
     (c >= 'A' && c <= 'Z') ||
@@ -219,35 +252,42 @@ function isWordChar(c: string): boolean {
   )
 }
 
+/** 判断字符是否可以作为单词起始（isWordChar 或反斜杠转义）。 */
 function isWordStart(c: string): boolean {
   return isWordChar(c) || c === '\\'
 }
 
+/** 判断字符是否为标识符起始字符（字母或下划线）。 */
 function isIdentStart(c: string): boolean {
   return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c === '_'
 }
 
+/** 判断字符是否为标识符字符（字母、数字或下划线）。 */
 function isIdentChar(c: string): boolean {
   return isIdentStart(c) || (c >= '0' && c <= '9')
 }
 
+/** 判断字符是否为十进制数字 0-9。 */
 function isDigit(c: string): boolean {
   return c >= '0' && c <= '9'
 }
 
+/** 判断字符是否为十六进制数字（0-9、a-f、A-F），用于 0x 前缀数字字面量。 */
 function isHexDigit(c: string): boolean {
   return isDigit(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
 }
 
-function isBaseDigit(c: string): boolean {
-  // Bash BASE#DIGITS: digits, letters, @ and _ (up to base 64)
+/**
+ * 判断字符是否为 Bash BASE#DIGITS 进制数字（最高支持 base-64）。
+ * 包含字母、数字、@ 和 _，例如：2#1010、16#ff、64#Az@_。
+ */
   return isIdentChar(c) || c === '@'
 }
 
 /**
- * Unquoted heredoc delimiter chars. Bash accepts most non-metacharacters —
- * not just identifiers. Stop at whitespace, redirects, pipe/list operators,
- * and structural tokens. Allows !, -, ., +, etc. (e.g. <<!HEREDOC!).
+ * 判断字符是否可以作为未引号 heredoc 分隔符的组成字符。
+ * Bash 接受除元字符（空白、重定向、管道/列表操作符、括号、引号、反斜杠）之外的大多数字符，
+ * 例如 <<!HEREDOC! 中的 ! - . + 等均合法。
  */
 function isHeredocDelimChar(c: string): boolean {
   return (
@@ -269,21 +309,22 @@ function isHeredocDelimChar(c: string): boolean {
   )
 }
 
+/** 跳过空白（空格、制表符、\r）及行续接（\<换行>），推进词法器位置。 */
 function skipBlanks(L: Lexer): void {
   while (L.i < L.len) {
     const c = L.src[L.i]!
     if (c === ' ' || c === '\t' || c === '\r') {
-      // \r is whitespace per tree-sitter-bash extras /\s/ — handles CRLF inputs
+      // \r 是 tree-sitter-bash extras /\s/ 允许的空白 —— 处理 CRLF 输入
       advance(L)
     } else if (c === '\\') {
       const nx = L.src[L.i + 1]
       if (nx === '\n' || (nx === '\r' && L.src[L.i + 2] === '\n')) {
-        // Line continuation — tree-sitter extras: /\\\r?\n/
+        // 行续接 —— tree-sitter extras: /\\\r?\n/
         advance(L)
         advance(L)
         if (nx === '\r') advance(L)
       } else if (nx === ' ' || nx === '\t') {
-        // \<space> or \<tab> — tree-sitter's _whitespace is /\\?[ \t\v]+/
+        // \<空格> 或 \<制表> —— tree-sitter 的 _whitespace 规则 /\\?[ \t\v]+/
         advance(L)
         advance(L)
       } else {
@@ -296,8 +337,10 @@ function skipBlanks(L: Lexer): void {
 }
 
 /**
- * Scan next token. Context-sensitive: `cmd` mode treats [ as operator (test
- * command start), `arg` mode treats [ as word char (glob/subscript).
+ * 扫描并返回下一个词法单元。
+ * 上下文敏感：cmd 模式下 [ 被视为操作符（test 命令起始），
+ * arg 模式下 [ 被视为单词字符（glob/数组下标）。
+ * 多字符操作符采用最长匹配优先策略。
  */
 function nextToken(L: Lexer, ctx: 'cmd' | 'arg' = 'arg'): Token {
   skipBlanks(L)
@@ -324,7 +367,7 @@ function nextToken(L: Lexer, ctx: 'cmd' | 'arg' = 'arg'): Token {
     }
   }
 
-  // Multi-char operators (longest match first)
+  // 多字符操作符（最长匹配优先）
   if (c === '&' && c1 === '&') {
     advance(L)
     advance(L)
@@ -446,7 +489,7 @@ function nextToken(L: Lexer, ctx: 'cmd' | 'arg' = 'arg'): Token {
     return { type: 'OP', value: c, start, end: L.b }
   }
 
-  // In cmd position, [ [[ { start test/group; in arg position they're word chars
+  // 在 cmd 位置：[ [[ 启动 test 命令，{ 启动组命令；arg 位置时它们是单词字符
   if (ctx === 'cmd') {
     if (c === '[' && c1 === '[') {
       advance(L)
@@ -505,8 +548,7 @@ function nextToken(L: Lexer, ctx: 'cmd' | 'arg' = 'arg'): Token {
       advance(L)
       return { type: 'DOLLAR_BRACE', value: '${', start, end: L.b }
     }
-    if (c1 === "'") {
-      // ANSI-C string $'...'
+    // ANSI-C 字符串 $'...'
       const si = L.i
       advance(L)
       advance(L)
@@ -531,7 +573,7 @@ function nextToken(L: Lexer, ctx: 'cmd' | 'arg' = 'arg'): Token {
     return { type: 'BACKTICK', value: '`', start, end: L.b }
   }
 
-  // File descriptor before redirect: digit+ immediately followed by > or <
+  // 文件描述符（重定向前的数字）：紧跟 > 或 < 的数字序列
   if (isDigit(c)) {
     let j = L.i
     while (j < L.len && isDigit(L.src[j]!)) j++
@@ -548,18 +590,18 @@ function nextToken(L: Lexer, ctx: 'cmd' | 'arg' = 'arg'): Token {
     }
   }
 
-  // Word / number
+  // 单词 / 数字字面量
   if (isWordStart(c) || c === '{' || c === '}') {
     const si = L.i
     while (L.i < L.len) {
       const ch = L.src[L.i]!
       if (ch === '\\') {
         if (L.i + 1 >= L.len) {
-          // Trailing `\` at EOF — tree-sitter excludes it from the word and
-          // emits a sibling ERROR. Stop here so the word ends before `\`.
+          // 文件末尾孤立的 `\` —— tree-sitter 将其排除在单词之外并生成 ERROR 兄弟节点，
+          // 在此停止以确保单词在 `\` 之前结束
           break
         }
-        // Escape next char (including \n for line continuation mid-word)
+        // 转义下一个字符（包括行续接 \<换行>）
         if (L.src[L.i + 1] === '\n') {
           advance(L)
           advance(L)
@@ -576,37 +618,51 @@ function nextToken(L: Lexer, ctx: 'cmd' | 'arg' = 'arg'): Token {
     }
     if (L.i > si) {
       const v = L.src.slice(si, L.i)
-      // Number: optional sign then digits only
+      // 数字字面量：可选负号加纯数字序列
       if (/^-?\d+$/.test(v)) {
         return { type: 'NUMBER', value: v, start, end: L.b }
       }
       return { type: 'WORD', value: v, start, end: L.b }
     }
-    // Empty word (lone `\` at EOF) — fall through to single-char consumer
+    // 空单词（文件末孤立 `\`）—— 跳过，由后续单字符消费处理
   }
 
-  // Unknown char — consume as single-char word
+  // 未知字符 —— 消耗为单字符单词，确保词法器始终前进
   advance(L)
   return { type: 'WORD', value: c, start, end: L.b }
 }
 
 // ───────────────────────────── Parser ─────────────────────────────
 
-type ParseState = {
+/**
+ * 解析器上下文，贯穿整个解析过程传递。
+ * L：词法分析器；src/srcBytes：原始源码及其 UTF-8 字节长度；
+ * isAscii：全 ASCII 时字节偏移 == 字符下标，可走快速路径；
+ * nodeCount：已创建节点数，超出 MAX_NODES 时中止；
+ * deadline：超时截止时间（performance.now() 毫秒）；
+ * aborted：超时或预算耗尽时置为 true；
+ * inBacktick：反引号嵌套深度，> 0 时 ` 作为终止符；
+ * stopToken：当前 parseSimpleCommand 的停止 token（用于 [ 回溯）。
+ */
   L: Lexer
   src: string
   srcBytes: number
-  /** True when byte offsets == char indices (no multi-byte UTF-8) */
+  /** 全 ASCII 时字节偏移 == 字符下标（无多字节 UTF-8） */
   isAscii: boolean
   nodeCount: number
   deadline: number
   aborted: boolean
-  /** Depth of backtick nesting — inside `...`, ` terminates words */
+  /** 反引号嵌套深度 —— 在 `...` 内时 ` 作为终止符 */
   inBacktick: number
-  /** When set, parseSimpleCommand stops at this token (for `[` backtrack) */
+  /** 设置后 parseSimpleCommand 在该 token 处停止（用于 `[` 回溯） */
   stopToken: string | null
 }
 
+/**
+ * 解析 Bash 源码字符串，返回 AST 根节点（program）；
+ * 超时或发生异常时返回 null。
+ * timeoutMs 默认 50ms（PARSE_TIMEOUT_MS），传入 Infinity 可禁用超时（用于测试）。
+ */
 function parseSource(source: string, timeoutMs?: number): TsNode | null {
   const L = makeLexer(source)
   const srcBytes = byteLengthUtf8(source)
@@ -630,7 +686,10 @@ function parseSource(source: string, timeoutMs?: number): TsNode | null {
   }
 }
 
-function byteLengthUtf8(s: string): number {
+/**
+ * 计算字符串的 UTF-8 编码字节长度（无需实际编码）。
+ * 用于初始化 ParseState.srcBytes 以构建程序根节点的字节范围。
+ */
   let b = 0
   for (let i = 0; i < s.length; i++) {
     const c = s.charCodeAt(i)
@@ -644,7 +703,11 @@ function byteLengthUtf8(s: string): number {
   return b
 }
 
-function checkBudget(P: ParseState): void {
+/**
+ * 检查解析预算：每次创建节点时调用。
+ * 超出 MAX_NODES 节点上限时抛出 'budget' 异常；
+ * 每 128 个节点检查一次墙钟超时，超时时抛出 'timeout' 异常。
+ */
   P.nodeCount++
   if (P.nodeCount > MAX_NODES) {
     P.aborted = true
@@ -656,7 +719,10 @@ function checkBudget(P: ParseState): void {
   }
 }
 
-/** Build a node. Slices text from source by byte range via char-index lookup. */
+/**
+ * 构建 AST 节点。通过字节范围在源码中查找对应字符区间并提取文本。
+ * start/end 均为 UTF-8 字节偏移；ASCII 时直接切片，非 ASCII 时查表二分查找。
+ */
 function mk(
   P: ParseState,
   type: string,
@@ -674,13 +740,17 @@ function mk(
   }
 }
 
+/**
+ * 从源码中提取 [startByte, endByte) 字节范围对应的字符串。
+ * ASCII 快速路径直接切片；非 ASCII 时构建 byteTable 后二分查找字符边界。
+ */
 function sliceBytes(P: ParseState, startByte: number, endByte: number): string {
   if (P.isAscii) return P.src.slice(startByte, endByte)
-  // Find char indices for byte offsets. Build byte table if needed.
+  // 查找字节偏移对应的字符下标，如需先构建 byteTable
   const L = P.L
   if (!L.byteTable) byteAt(L, 0)
   const t = L.byteTable!
-  // Binary search for char index where byte offset matches
+  // 二分查找：找到字节偏移 startByte 对应的字符下标
   let lo = 0
   let hi = P.src.length
   while (lo < hi) {
@@ -699,13 +769,18 @@ function sliceBytes(P: ParseState, startByte: number, endByte: number): string {
   return P.src.slice(sc, lo)
 }
 
+/** 根据 Token 构建叶子节点（无子节点的终端节点）。 */
 function leaf(P: ParseState, type: string, tok: Token): TsNode {
   return mk(P, type, tok.start, tok.end, [])
 }
 
-function parseProgram(P: ParseState): TsNode {
+/**
+ * 解析整个 Bash 程序，返回 program 根节点。
+ * 跳过顶层注释和空行后开始解析语句序列；无法解析时发出 ERROR 节点并跳过一个 token。
+ * tree-sitter 规范：program 节点的字节范围覆盖首尾空白。
+ */
   const children: TsNode[] = []
-  // Skip leading whitespace & newlines — program start is first content byte
+  // 跳过前导空白和换行 —— program 起始位置为第一个实际内容的字节偏移
   skipBlanks(P.L)
   while (true) {
     const save = saveLex(P.L)
@@ -731,11 +806,11 @@ function parseProgram(P: ParseState): TsNode {
     const stmts = parseStatements(P, null)
     for (const s of stmts) children.push(s)
     if (stmts.length === 0) {
-      // Couldn't parse — emit ERROR and skip one token
+      // 无法解析 —— 发出 ERROR 节点并跳过一个 token
       const errTok = nextToken(P.L, 'cmd')
       if (errTok.type === 'EOF') break
-      // Stray `;;` at program level (e.g., `var=;;` outside case) — tree-sitter
-      // silently elides. Keep leading `;` as ERROR (security: paste artifact).
+      // 顶层游离的 `;;`（如 `var=;;` 出现在 case 外）—— tree-sitter 静默忽略。
+      // 保留前导 `;` 作为 ERROR（安全性：防止粘贴产物逃逸）
       if (
         errTok.type === 'OP' &&
         errTok.value === ';;' &&
@@ -746,25 +821,31 @@ function parseProgram(P: ParseState): TsNode {
       children.push(mk(P, 'ERROR', errTok.start, errTok.end, []))
     }
   }
-  // tree-sitter includes trailing whitespace in program extent
+  // tree-sitter 将尾部空白计入 program 节点范围
   const progEnd = children.length > 0 ? P.srcBytes : progStart
   return mk(P, 'program', progStart, progEnd, children)
 }
 
-/** Packed as (b << 16) | i — avoids heap alloc on every backtrack. */
+/**
+ * 词法状态保存点，压缩为单个整数以避免每次回溯时的堆分配。
+ * 编码方式：(b << 16) | i，其中 b 为字节偏移，i 为字符下标。
+ * 适用于 b < 65536 字节的脚本；超大脚本极罕见，不影响安全性。
+ */
 type LexSave = number
+/** 保存当前词法位置为压缩整数，用于后续回溯。 */
 function saveLex(L: Lexer): LexSave {
   return L.b * 0x10000 + L.i
 }
+/** 从保存点恢复词法位置（解压缩字节偏移和字符下标）。 */
 function restoreLex(L: Lexer, s: LexSave): void {
   L.i = s & 0xffff
   L.b = s >>> 16
 }
 
 /**
- * Parse a sequence of statements separated by ; & newline. Returns a flat list
- * where ; and & are sibling leaves (NOT wrapped in 'list' — only && || get
- * that). Stops at terminator or EOF.
+ * 解析由 ; & 换行分隔的语句序列，返回展平的节点列表。
+ * ; 和 & 作为兄弟叶子节点保留（不包裹为 'list'，只有 && || 才这样做）。
+ * 在遇到 terminator、EOF、闭合操作符或关键字（then/fi/do/done/esac 等）时停止。
  */
 function parseStatements(P: ParseState, terminator: string | null): TsNode[] {
   const out: TsNode[] = []
@@ -777,7 +858,7 @@ function parseStatements(P: ParseState, terminator: string | null): TsNode[] {
       break
     }
     if (t.type === 'NEWLINE') {
-      // Process pending heredocs
+      // 遇到换行时处理所有待扫描的 heredoc 正文
       if (P.L.heredocs.length > 0) {
         scanHeredocBodies(P)
       }
@@ -826,12 +907,12 @@ function parseStatements(P: ParseState, terminator: string | null): TsNode[] {
     const stmt = parseAndOr(P)
     if (!stmt) break
     out.push(stmt)
-    // Look for separator
+    // 查找分隔符
     skipBlanks(P.L)
     const save2 = saveLex(P.L)
     const sep = nextToken(P.L, 'cmd')
     if (sep.type === 'OP' && (sep.value === ';' || sep.value === '&')) {
-      // Check if terminator follows — if so, emit separator but stop
+      // 检查是否紧跟终止符 —— 若是，则发出分隔符后停止
       const save3 = saveLex(P.L)
       const after = nextToken(P.L, 'cmd')
       restoreLex(P.L, save3)
@@ -853,8 +934,7 @@ function parseStatements(P: ParseState, terminator: string | null): TsNode[] {
             after.value === 'done' ||
             after.value === 'esac'))
       ) {
-        // Trailing separator — don't include it at program level unless
-        // there's content after. But at inner levels we keep it.
+    // 尾部分隔符处理：不在顶层保留，但内层保留
         continue
       }
     } else if (sep.type === 'NEWLINE') {
@@ -866,15 +946,15 @@ function parseStatements(P: ParseState, terminator: string | null): TsNode[] {
       restoreLex(P.L, save2)
     }
   }
-  // Trim trailing separator if at program level
+  // 若在顶层，裁剪末尾的分隔符
   return out
 }
 
 /**
- * Parse pipeline chains joined by && ||. Left-associative nesting.
- * tree-sitter quirk: trailing redirect on the last pipeline wraps the ENTIRE
- * list in a redirected_statement — `a > x && b > y` becomes
- * redirected_statement(list(redirected_statement(a,>x), &&, b), >y).
+ * 解析由 && || 连接的管道链，构建左结合的 list 节点。
+ * tree-sitter 特殊行为：最后一个管道的尾部重定向会将整个 list 包裹在
+ * redirected_statement 中 —— 例如 `a > x && b > y` 生成
+ * redirected_statement(list(redirected_statement(a,>x), &&, b), >y)。
  */
 function parseAndOr(P: ParseState): TsNode | null {
   let left = parsePipeline(P)
@@ -890,7 +970,7 @@ function parseAndOr(P: ParseState): TsNode | null {
         left = mk(P, 'list', left.startIndex, op.endIndex, [left, op])
         break
       }
-      // If right is a redirected_statement, hoist its redirects to wrap the list.
+      // 若右侧为 redirected_statement，将其重定向提升以包裹整个 list 节点
       if (right.type === 'redirected_statement' && right.children.length >= 2) {
         const inner = right.children[0]!
         const redirs = right.children.slice(1)
@@ -918,6 +998,7 @@ function parseAndOr(P: ParseState): TsNode | null {
   return left
 }
 
+/** 跳过零个或多个换行符（解析 && || 后右侧可能有多个换行）。 */
 function skipNewlines(P: ParseState): void {
   while (true) {
     const save = saveLex(P.L)
@@ -930,10 +1011,9 @@ function skipNewlines(P: ParseState): void {
 }
 
 /**
- * Parse commands joined by | or |&. Flat children with operator leaves.
- * tree-sitter quirk: `a | b 2>nul | c` hoists the redirect on `b` to wrap
- * the preceding pipeline fragment — pipeline(redirected_statement(
- * pipeline(a,|,b), 2>nul), |, c).
+ * 解析由 | 或 |& 连接的命令管道，子节点展平存储（操作符也作为叶子节点）。
+ * tree-sitter 特殊行为：`a | b 2>nul | c` 中 b 的重定向会提升并包裹前段管道：
+ * pipeline(redirected_statement(pipeline(a,|,b), 2>nul), |, c)。
  */
 function parsePipeline(P: ParseState): TsNode | null {
   let first = parseCommand(P)
@@ -950,7 +1030,7 @@ function parsePipeline(P: ParseState): TsNode | null {
         parts.push(op)
         break
       }
-      // Hoist trailing redirect on `next` to wrap current pipeline fragment
+      // 将 next 的尾部重定向提升，包裹当前管道片段
       if (
         next.type === 'redirected_statement' &&
         next.children.length >= 2 &&
@@ -958,7 +1038,7 @@ function parsePipeline(P: ParseState): TsNode | null {
       ) {
         const inner = next.children[0]!
         const redirs = next.children.slice(1)
-        // Wrap existing parts + op + inner as a pipeline
+        // 将已有片段 + op + inner 包裹为管道节点
         const pipeKids = [...parts, op, inner]
         const pipeNode = mk(
           P,
@@ -991,7 +1071,12 @@ function parsePipeline(P: ParseState): TsNode | null {
   return mk(P, 'pipeline', parts[0]!.startIndex, last.endIndex, parts)
 }
 
-/** Parse a single command: simple, compound, or control structure. */
+/**
+ * 解析单条命令：简单命令、复合命令或控制结构。
+ * 优先处理 !（取反）、(（子 shell）、((（算术）、{（组命令）、[ [[（test）；
+ * 然后检查控制流关键字（if/while/for/case/function 等）；
+ * 最后回退到 parseSimpleCommand。
+ */
 function parseCommand(P: ParseState): TsNode | null {
   skipBlanks(P.L)
   const save = saveLex(P.L)
@@ -1002,7 +1087,7 @@ function parseCommand(P: ParseState): TsNode | null {
     return null
   }
 
-  // Negation — tree-sitter wraps just the command, redirects go outside.
+  // 取反命令 —— tree-sitter 仅包裹命令本体，重定向置于外层：
   // `! cmd > out` → redirected_statement(negated_command(!, cmd), >out)
   if (t.type === 'OP' && t.value === '!') {
     const bang = leaf(P, '!', t)
@@ -1011,7 +1096,7 @@ function parseCommand(P: ParseState): TsNode | null {
       restoreLex(P.L, save)
       return null
     }
-    // If inner is a redirected_statement, hoist redirects outside negation
+    // 若内层已经是 redirected_statement，将重定向提升到取反命令之外
     if (inner.type === 'redirected_statement' && inner.children.length >= 2) {
       const cmd = inner.children[0]!
       const redirs = inner.children.slice(1)
@@ -1081,15 +1166,15 @@ function parseCommand(P: ParseState): TsNode | null {
   if (t.type === 'OP' && (t.value === '[' || t.value === '[[')) {
     const open = leaf(P, t.value, t)
     const closer = t.value === '[' ? ']' : ']]'
-    // Grammar: `[` can contain choice(_expression, redirected_statement).
-    // Try _expression first; if we don't reach `]`, backtrack and parse as
-    // redirected_statement (handles `[ ! cmd -v go &>/dev/null ]`).
+    // 语法：`[` 内容可为 _expression 或 redirected_statement。
+    // 优先尝试 _expression；若解析后未到达 `]`，回溯并尝试解析为 redirected_statement
+    // （处理 `[ ! cmd -v go &>/dev/null ]` 等模式）
     const exprSave = saveLex(P.L)
     let expr = parseTestExpr(P, closer)
     skipBlanks(P.L)
     if (t.value === '[' && peek(P.L) !== ']') {
-      // Expression parse didn't reach `]` — try as redirected_statement.
-      // Thread `]` stop-token so parseSimpleCommand doesn't eat it as arg.
+      // 表达式解析未能到达 `]` —— 改为解析 redirected_statement。
+      // 传入 `]` stop-token，防止 parseSimpleCommand 将 `]` 作为参数吃掉
       restoreLex(P.L, exprSave)
       const prevStop = P.stopToken
       P.stopToken = ']'
@@ -1098,7 +1183,7 @@ function parseCommand(P: ParseState): TsNode | null {
       if (rstmt && rstmt.type === 'redirected_statement') {
         expr = rstmt
       } else {
-        // Neither worked — restore and keep the expression result
+        // 两种方式均失败 —— 恢复并使用表达式解析结果
         restoreLex(P.L, exprSave)
         expr = parseTestExpr(P, closer)
       }
@@ -1135,8 +1220,9 @@ function parseCommand(P: ParseState): TsNode | null {
 }
 
 /**
- * Parse a simple command: [assignment]* word [arg|redirect]*
- * Returns variable_assignment if only one assignment and no command.
+ * 解析简单命令：[赋值]* 命令名 [参数|重定向]*。
+ * 若只有单个赋值而无命令名，则直接返回 variable_assignment 节点；
+ * 支持检测函数定义（name() { ... }）并返回 function_definition 节点。
  */
 function parseSimpleCommand(P: ParseState): TsNode | null {
   const start = P.L.b
@@ -1174,12 +1260,12 @@ function parseSimpleCommand(P: ParseState): TsNode | null {
       nameTok.value !== 'in')
   ) {
     restoreLex(P.L, save)
-    // No command — standalone assignment(s) or redirect
+    // 无命令名 —— 仅有独立赋值或重定向
     if (assignments.length === 1 && preRedirects.length === 0) {
       return assignments[0]!
     }
     if (preRedirects.length > 0 && assignments.length === 0) {
-      // Bare redirect → redirected_statement with just file_redirect children
+      // 裸重定向 → 仅含 file_redirect 子节点的 redirected_statement
       const last = preRedirects[preRedirects.length - 1]!
       return mk(
         P,
@@ -1190,7 +1276,7 @@ function parseSimpleCommand(P: ParseState): TsNode | null {
       )
     }
     if (assignments.length > 1 && preRedirects.length === 0) {
-      // `A=1 B=2` with no command → variable_assignments (plural)
+      // `A=1 B=2` 无命令名 → variable_assignments（复数）
       const last = assignments[assignments.length - 1]!
       return mk(
         P,
@@ -1209,7 +1295,7 @@ function parseSimpleCommand(P: ParseState): TsNode | null {
   }
   restoreLex(P.L, save)
 
-  // Check for function definition: name() { ... }
+  // 检查函数定义：name() { ... }
   const fnSave = saveLex(P.L)
   const nm = parseWord(P, 'cmd')
   if (nm && nm.type === 'word') {
@@ -1223,8 +1309,8 @@ function parseSimpleCommand(P: ParseState): TsNode | null {
       skipNewlines(P)
       const body = parseCommand(P)
       if (body) {
-        // If body is redirected_statement(compound_statement, file_redirect...),
-        // hoist redirects to function_definition level per tree-sitter grammar
+      // 若函数体已经是 redirected_statement(compound_statement, file_redirect...)，
+      // 按 tree-sitter 语法将重定向提升到 function_definition 层级
         let bodyKids: TsNode[] = [body]
         if (
           body.type === 'redirected_statement' &&
@@ -1261,10 +1347,10 @@ function parseSimpleCommand(P: ParseState): TsNode | null {
 
   while (true) {
     skipBlanks(P.L)
-    // Post-command redirects are greedy (repeat1 $._literal) — once a redirect
-    // appears after command_name, subsequent literals attach to it per grammar's
-    // prec.left. `grep 2>/dev/null -q foo` → file_redirect eats `-q foo`.
-    // Args parsed BEFORE the first redirect still go to command (cat a b > out).
+    // 命令名后的重定向是贪婪的（repeat1 $._literal）——
+    // 一旦出现重定向，后续字面量都挂到该重定向下（语法的 prec.left）：
+    // `grep 2>/dev/null -q foo` → file_redirect 吃掉 `-q foo`。
+    // 在第一个重定向前解析的参数仍属于命令（cat a b > out 正常工作）
     const r = tryParseRedirect(P, true)
     if (r) {
       if (r.type === 'heredoc_redirect') {
@@ -1276,11 +1362,10 @@ function parseSimpleCommand(P: ParseState): TsNode | null {
       }
       continue
     }
-    // Once a file_redirect has been seen, command args are done — grammar's
-    // command rule doesn't allow file_redirect in its post-name choice, so
-    // anything after belongs to redirected_statement's file_redirect children.
+    // 出现 file_redirect 后命令参数解析结束 —— 语法的 command 规则在命令名后
+    // 不允许 file_redirect，后续内容属于 redirected_statement 的子节点
     if (redirects.length > 0) break
-    // `[` test_command backtrack — stop at `]` so outer handler can consume it
+    // `[` test_command 回溯 —— 在 `]` 处停止，让外层处理器消费它
     if (P.stopToken === ']' && peek(P.L) === ']') break
     const save2 = saveLex(P.L)
     const pk = nextToken(P.L, 'arg')
@@ -1308,8 +1393,8 @@ function parseSimpleCommand(P: ParseState): TsNode | null {
     restoreLex(P.L, save2)
     const arg = parseWord(P, 'arg')
     if (!arg) {
-      // Lone `(` in arg position — tree-sitter parses this as subshell arg
-      // e.g., `echo =(cmd)` → command has ERROR(=), subshell(cmd) as args
+      // arg 位置的孤立 `(` —— tree-sitter 将其解析为 subshell 参数：
+      // 例如 `echo =(cmd)` → command 含 ERROR(=)、subshell(cmd) 作为参数
       if (peek(P.L) === '(') {
         const oTok = nextToken(P.L, 'cmd')
         const open = leaf(P, '(', oTok)
@@ -1330,15 +1415,14 @@ function parseSimpleCommand(P: ParseState): TsNode | null {
       }
       break
     }
-    // Lone `=` in arg position is a parse error in bash — tree-sitter wraps
-    // it in ERROR for recovery. Happens in `echo =(cmd)` (zsh process-sub).
+    // arg 位置的孤立 `=` 是 bash 解析错误 —— tree-sitter 用 ERROR 包裹恢复。
+    // 在 `echo =(cmd)` (zsh 进程替换) 等场景中出现
     if (arg.type === 'word' && arg.text === '=') {
       args.push(mk(P, 'ERROR', arg.startIndex, arg.endIndex, [arg]))
       continue
     }
-    // Word immediately followed by `(` (no whitespace) is a parse error —
-    // bash doesn't allow glob-then-subshell adjacency. tree-sitter wraps the
-    // word in ERROR. Catches zsh glob qualifiers like `*.(e:'cmd':)`.
+    // 单词紧跟 `(` 时（无空白）是解析错误 —— bash 不允许 glob-then-subshell 紧邻。
+    // tree-sitter 用 ERROR 包裹该单词。捕获 zsh glob 限定符如 `*.(e:'cmd':)`
     if (
       (arg.type === 'word' || arg.type === 'concatenation') &&
       peek(P.L) === '(' &&
@@ -1350,8 +1434,8 @@ function parseSimpleCommand(P: ParseState): TsNode | null {
     args.push(arg)
   }
 
-  // preRedirects (e.g., `2>&1 cat`, `<<<str cmd`) go INSIDE the command node
-  // before command_name per tree-sitter grammar, not in redirected_statement
+  // preRedirects（如 `2>&1 cat`、`<<<str cmd`）按 tree-sitter 语法位于命令节点内
+  // 的 command_name 之前，而非在 redirected_statement 层级
   const cmdChildren = [...assignments, ...preRedirects, cmdName, ...args]
   const cmdEnd =
     cmdChildren.length > 0
@@ -1361,7 +1445,7 @@ function parseSimpleCommand(P: ParseState): TsNode | null {
   const cmd = mk(P, 'command', cmdStart, cmdEnd, cmdChildren)
 
   if (heredocRedirect) {
-    // Scan heredoc body now
+    // 立即扫描 heredoc 正文，将 body/end 节点追加到 heredoc_redirect 子节点中
     scanHeredocBodies(P)
     const hd = P.L.heredocs.shift()
     if (hd && heredocRedirect.children.length >= 2) {
@@ -1403,6 +1487,10 @@ function parseSimpleCommand(P: ParseState): TsNode | null {
   return cmd
 }
 
+/**
+ * 尝试在 node 后附加重定向，若存在则返回 redirected_statement；否则返回原节点。
+ * allowHerestring 为 true 时允许 herestring_redirect（用于控制结构）。
+ */
 function maybeRedirect(
   P: ParseState,
   node: TsNode,
@@ -1428,18 +1516,22 @@ function maybeRedirect(
   ])
 }
 
+/**
+ * 尝试解析变量赋值语句（identifier[subscript]?[+]=value）。
+ * 必须以标识符起始，后跟 = 或 += 操作符才构成赋值；否则回溯并返回 null。
+ */
 function tryParseAssignment(P: ParseState): TsNode | null {
   const save = saveLex(P.L)
   skipBlanks(P.L)
   const startB = P.L.b
-  // Must start with identifier
+  // 赋值语句必须以标识符起始
   if (!isIdentStart(peek(P.L))) {
     restoreLex(P.L, save)
     return null
   }
   while (isIdentChar(peek(P.L))) advance(P.L)
   const nameEnd = P.L.b
-  // Optional subscript
+  // 可选下标 [index]（如 arr[0]=value 或 map[key]=value）
   let subEnd = nameEnd
   if (peek(P.L) === '[') {
     advance(P.L)
@@ -1464,7 +1556,7 @@ function tryParseAssignment(P: ParseState): TsNode | null {
     return null
   }
   const nameNode = mk(P, 'variable_name', startB, nameEnd, [])
-  // Subscript handling: wrap in subscript node if present
+  // 若存在下标部分，将标识符节点包裹进 subscript 节点
   let lhs: TsNode = nameNode
   if (subEnd > nameEnd) {
     const brOpen = mk(P, '[', nameEnd, nameEnd + 1, [])
@@ -1479,7 +1571,7 @@ function tryParseAssignment(P: ParseState): TsNode | null {
   const opNode = mk(P, op, opStart, opEnd, [])
   let val: TsNode | null = null
   if (peek(P.L) === '(') {
-    // Array
+    // 数组赋值：arr=(elem1 elem2 ...)
     const aoTok = nextToken(P.L, 'cmd')
     const aOpen = leaf(P, '(', aoTok)
     const elems: TsNode[] = [aOpen]
@@ -1519,21 +1611,22 @@ function tryParseAssignment(P: ParseState): TsNode | null {
 }
 
 /**
- * Parse subscript index content. Parsed arithmetically per tree-sitter grammar:
- * `${a[1+2]}` → binary_expression; `${a[++i]}` → unary_expression(word);
- * `${a[(($n+1))]}` → compound_statement(binary_expression). Falls back to
- * simple patterns (@, *) as word.
+ * 解析下标索引内容（内联版，用于扩展表达式中的 `${a[…]}` 语法）。
+ * 按 tree-sitter grammar 的算术规则解析：
+ * - `@ / *` 单独出现 → word（关联数组全部键）
+ * - `(( expr ))` → compound_statement 包裹内部算术表达式
+ * - 其他情况 → parseArithExpr（'word' 模式，裸标识符视为 word）
  */
 function parseSubscriptIndexInline(P: ParseState): TsNode | null {
   skipBlanks(P.L)
   const c = peek(P.L)
-  // @ or * alone → word (associative array all-keys)
+  // @ 或 * 单独出现 → word（如 ${arr[@]} / ${arr[*]}）
   if ((c === '@' || c === '*') && peek(P.L, 1) === ']') {
     const s = P.L.b
     advance(P.L)
     return mk(P, 'word', s, P.L.b, [])
   }
-  // ((expr)) → compound_statement wrapping the inner arithmetic
+  // (( expr )) → compound_statement 包裹内部算术表达式
   if (c === '(' && peek(P.L, 1) === '(') {
     const oStart = P.L.b
     advance(P.L)
@@ -1553,12 +1646,15 @@ function parseSubscriptIndexInline(P: ParseState): TsNode | null {
     const kids = inner ? [open, inner, close] : [open, close]
     return mk(P, 'compound_statement', open.startIndex, close.endIndex, kids)
   }
-  // Arithmetic — but bare identifiers in subscript use 'word' mode per
-  // tree-sitter (${words[++counter]} → unary_expression(word)).
+  // 算术表达式模式：裸标识符在下标中视为 word（与 tree-sitter 一致）
+  // 如 ${words[++counter]} → unary_expression(word)
   return parseArithExpr(P, ']', 'word')
 }
 
-/** Legacy byte-range subscript index parser — kept for callers that pre-scan. */
+/**
+ * 旧版字节范围下标索引解析器（供预先扫描的调用方使用）。
+ * 按文本内容判断类型：纯数字 → number，$var → simple_expansion，其他 → word。
+ */
 function parseSubscriptIndex(
   P: ParseState,
   startB: number,
@@ -1581,49 +1677,47 @@ function parseSubscriptIndex(
 }
 
 /**
- * Can the current position start a redirect destination literal?
- * Returns false at redirect ops, terminators, or file-descriptor-prefixed ops
- * so file_redirect's repeat1($._literal) stops at the right boundary.
+ * 判断当前位置是否可以作为重定向目标字面量的起始位置。
+ * 遇到重定向操作符、命令终止符、或文件描述符前缀时返回 false，
+ * 确保 file_redirect 的 repeat1($._literal) 在正确边界停止。
  */
 function isRedirectLiteralStart(P: ParseState): boolean {
   const c = peek(P.L)
   if (c === '' || c === '\n') return false
-  // Shell terminators and operators
+  // Shell 终止符和操作符
   if (c === '|' || c === '&' || c === ';' || c === '(' || c === ')')
     return false
-  // Redirect operators (< > with any suffix; <( >( handled by caller)
+  // 重定向操作符（< > 及其变体；<( >( 进程替换由调用方处理）
   if (c === '<' || c === '>') {
-    // <( >( are process substitutions — those ARE literals
+    // <( >( 是进程替换 — 这些属于字面量，允许通过
     return peek(P.L, 1) === '('
   }
-  // N< N> file descriptor prefix — starts a new redirect, not a literal
+  // N< N> 文件描述符前缀 — 开始新的重定向，不是字面量
   if (isDigit(c)) {
     let j = P.L.i
     while (j < P.L.len && isDigit(P.L.src[j]!)) j++
     const after = j < P.L.len ? P.L.src[j]! : ''
     if (after === '>' || after === '<') return false
   }
-  // `}` only terminates if we're in a context where it's a closer — but
-  // file_redirect sees `}` as word char (e.g., `>$HOME}` is valid path char).
-  // Actually `}` at top level terminates compound_statement — need to stop.
+  // `}` 在顶层会终止 compound_statement — 需要在此停止
   if (c === '}') return false
-  // Test command closer — when parseSimpleCommand is called from `[` context,
-  // `]` must terminate so parseCommand can return and `[` handler consume it.
+  // 测试命令关闭符 — 当 parseSimpleCommand 从 `[` 上下文调用时，
+  // `]` 必须终止，以便 parseCommand 返回并由 `[` 处理器消费
   if (P.stopToken === ']' && c === ']') return false
   return true
 }
 
 /**
- * Parse a redirect operator + destination(s).
- * @param greedy When true, file_redirect consumes repeat1($._literal) per
- *   grammar's prec.left — `cmd >f a b c` attaches `a b c` to the redirect.
- *   When false (preRedirect context), takes only 1 destination because
- *   command's dynamic precedence beats redirected_statement's prec(-1).
+ * 解析重定向操作符及其目标字面量。
+ * @param greedy 为 true 时，file_redirect 按语法的 prec.left 贪婪消费多个字面量
+ *   （如 `cmd >f a b c` 中 `a b c` 均附属于重定向）。
+ *   为 false（preRedirect 上下文）时仅取 1 个目标，
+ *   因为 command 的动态优先级高于 redirected_statement 的 prec(-1)。
  */
 function tryParseRedirect(P: ParseState, greedy = false): TsNode | null {
   const save = saveLex(P.L)
   skipBlanks(P.L)
-  // File descriptor prefix?
+  // 文件描述符前缀（如 2> 或 1<）
   let fd: TsNode | null = null
   if (isDigit(peek(P.L))) {
     const startB = P.L.b
@@ -1657,7 +1751,7 @@ function tryParseRedirect(P: ParseState, greedy = false): TsNode | null {
   }
   if (v === '<<' || v === '<<-') {
     const op = leaf(P, v, t)
-    // Heredoc start — delimiter word (may be quoted)
+    // Heredoc 起始 — 分隔符单词（可能带引号，引号控制主体是否展开变量）
     skipBlanks(P.L)
     const dStart = P.L.b
     let quoted = false
@@ -1672,22 +1766,22 @@ function tryParseRedirect(P: ParseState, greedy = false): TsNode | null {
       }
       if (P.L.i < P.L.len) advance(P.L)
     } else if (dc === '\\') {
-      // Backslash-escaped delimiter: \X — exactly one escaped char, body is
-      // quoted (literal). Covers <<\EOF <<\' <<\\ etc.
+      // 反斜杠转义分隔符：\X — 恰好一个转义字符，主体为字面量（已引号）
+      // 涵盖 <<\EOF <<\' <<\\ 等形式
       quoted = true
       advance(P.L)
       if (P.L.i < P.L.len && peek(P.L) !== '\n') {
         delim += peek(P.L)
         advance(P.L)
       }
-      // May be followed by more ident chars (e.g. <<\EOF → delim "EOF")
+      // 后面可能跟随更多标识符字符（如 <<\EOF → 分隔符为 "EOF"）
       while (P.L.i < P.L.len && isIdentChar(peek(P.L))) {
         delim += peek(P.L)
         advance(P.L)
       }
     } else {
-      // Unquoted delimiter: bash accepts most non-metacharacters (not just
-      // identifiers). Allow !, -, ., etc. — stop at shell metachars.
+      // 未引号的分隔符：bash 接受大多数非元字符（不限于标识符）
+      // 允许 !、-、. 等字符 — 遇到 shell 元字符时停止
       while (P.L.i < P.L.len && isHeredocDelimChar(peek(P.L))) {
         delim += peek(P.L)
         advance(P.L)
@@ -1695,7 +1789,7 @@ function tryParseRedirect(P: ParseState, greedy = false): TsNode | null {
     }
     const dEnd = P.L.b
     const startNode = mk(P, 'heredoc_start', dStart, dEnd, [])
-    // Register pending heredoc — body scanned at next newline
+    // 注册待扫描的 heredoc — 主体在下一个换行符处扫描
     P.L.heredocs.push({
       delim,
       stripTabs: v === '<<-',
@@ -1707,18 +1801,17 @@ function tryParseRedirect(P: ParseState, greedy = false): TsNode | null {
     })
     const kids = fd ? [fd, op, startNode] : [op, startNode]
     const startIdx = fd ? fd.startIndex : op.startIndex
-    // SECURITY: tree-sitter nests any pipeline/list/file_redirect appearing
-    // between heredoc_start and the newline as a CHILD of heredoc_redirect.
-    // `ls <<'EOF' | rm -rf /tmp/evil` must not silently drop the rm. Parse
-    // trailing words and file_redirects properly (ast.ts walkHeredocRedirect
-    // fails closed on any unrecognized child via tooComplex). Pipeline / list
-    // operators (| && || ;) are structurally complex — emit ERROR so the same
-    // fail-closed path rejects them.
+    // 安全性：tree-sitter 将 heredoc_start 与换行之间的 pipeline/list/file_redirect
+    // 作为 heredoc_redirect 的子节点嵌套。
+    // `ls <<'EOF' | rm -rf /tmp/evil` 不能静默丢弃 rm。
+    // 正确解析末尾的 word 和 file_redirect（ast.ts 的 walkHeredocRedirect
+    // 通过 tooComplex 对所有未识别的子节点关闭失败路径）。
+    // pipeline/list 操作符（| && || ;）结构复杂 — 发出 ERROR 让同一失败路径拒绝它们。
     while (true) {
       skipBlanks(P.L)
       const tc = peek(P.L)
       if (tc === '\n' || tc === '' || P.L.i >= P.L.len) break
-      // File redirect after delimiter: cat <<EOF > out.txt
+      // 分隔符后的文件重定向：cat <<EOF > out.txt
       if (tc === '>' || tc === '<' || isDigit(tc)) {
         const rSave = saveLex(P.L)
         const r = tryParseRedirect(P)
@@ -1728,9 +1821,9 @@ function tryParseRedirect(P: ParseState, greedy = false): TsNode | null {
         }
         restoreLex(P.L, rSave)
       }
-      // Pipeline after heredoc_start: `one <<EOF | grep two` — tree-sitter
-      // nests the pipeline as a child of heredoc_redirect. ast.ts
-      // walkHeredocRedirect fails closed on pipeline/command via tooComplex.
+      // heredoc_start 后的管道：`one <<EOF | grep two` — tree-sitter
+      // 将管道作为 heredoc_redirect 的子节点嵌套。ast.ts 的
+      // walkHeredocRedirect 通过 tooComplex 对 pipeline/command 执行 fail-closed。
       if (tc === '|' && peek(P.L, 1) !== '|') {
         advance(P.L)
         skipBlanks(P.L)
@@ -1751,15 +1844,15 @@ function tryParseRedirect(P: ParseState, greedy = false): TsNode | null {
         }
         if (pipeCmds.length > 0) {
           const pl = pipeCmds[pipeCmds.length - 1]!
-          // tree-sitter always wraps in pipeline after `|`, even single command
+          // tree-sitter 在 `|` 之后总是包裹 pipeline，即使只有单条命令
           kids.push(
             mk(P, 'pipeline', pipeCmds[0]!.startIndex, pl.endIndex, pipeCmds),
           )
         }
         continue
       }
-      // && / || after heredoc_start: `cat <<-EOF || die "..."` — tree-sitter
-      // nests just the RHS command (not a list) as a child of heredoc_redirect.
+      // heredoc_start 后的 && / ||：`cat <<-EOF || die "..."` — tree-sitter
+      // 仅将 RHS 命令（而非完整 list）嵌套为 heredoc_redirect 的子节点。
       if (
         (tc === '&' && peek(P.L, 1) === '&') ||
         (tc === '|' && peek(P.L, 1) === '|')
@@ -1771,21 +1864,21 @@ function tryParseRedirect(P: ParseState, greedy = false): TsNode | null {
         if (rhs) kids.push(rhs)
         continue
       }
-      // Terminator / unhandled metachar — consume rest of line as ERROR so
-      // ast.ts rejects it. Covers ; & ( )
+      // 终止符/未处理元字符 — 将该行其余内容作为 ERROR 消费（ast.ts 拒绝）
+      // 涵盖 ; & ( )
       if (tc === '&' || tc === ';' || tc === '(' || tc === ')') {
         const eStart = P.L.b
         while (P.L.i < P.L.len && peek(P.L) !== '\n') advance(P.L)
         kids.push(mk(P, 'ERROR', eStart, P.L.b, []))
         break
       }
-      // Trailing word argument: newins <<-EOF - org.freedesktop.service
+      // 末尾单词参数：如 newins <<-EOF - org.freedesktop.service
       const w = parseWord(P, 'arg')
       if (w) {
         kids.push(w)
         continue
       }
-      // Unrecognized — consume rest of line as ERROR
+      // 无法识别 — 将行剩余内容作为 ERROR 消费
       const eStart = P.L.b
       while (P.L.i < P.L.len && peek(P.L) !== '\n') advance(P.L)
       if (P.L.b > eStart) kids.push(mk(P, 'ERROR', eStart, P.L.b, []))
@@ -1793,13 +1886,13 @@ function tryParseRedirect(P: ParseState, greedy = false): TsNode | null {
     }
     return mk(P, 'heredoc_redirect', startIdx, P.L.b, kids)
   }
-  // Close-fd variants: `<&-` `>&-` have OPTIONAL destination (0 or 1)
+  // 关闭文件描述符变体：`<&-` `>&-` 的目标是可选的（0 或 1 个）
   if (v === '<&-' || v === '>&-') {
     const op = leaf(P, v, t)
     const kids: TsNode[] = []
     if (fd) kids.push(fd)
     kids.push(op)
-    // Optional single destination — only consume if next is a literal
+    // 可选的单个目标 — 仅在下一字符是字面量时消费
     skipBlanks(P.L)
     const dSave = saveLex(P.L)
     const dest = isRedirectLiteralStart(P) ? parseWord(P, 'arg') : null
@@ -1826,12 +1919,12 @@ function tryParseRedirect(P: ParseState, greedy = false): TsNode | null {
     const kids: TsNode[] = []
     if (fd) kids.push(fd)
     kids.push(op)
-    // Grammar: destination is repeat1($._literal) — greedily consume literals
-    // until a non-literal (redirect op, terminator, etc). tree-sitter's
-    // prec.left makes `cmd >f a b c` attach `a b c` to the file_redirect,
-    // NOT to the command. Structural quirk but required for corpus parity.
-    // In preRedirect context (greedy=false), take only 1 literal because
-    // command's dynamic precedence beats redirected_statement's prec(-1).
+    // 语法：目标为 repeat1($._literal) — 贪婪消费字面量，
+    // 直到非字面量（重定向操作符、终止符等）。tree-sitter 的
+    // prec.left 使 `cmd >f a b c` 中的 `a b c` 归属 file_redirect，
+    // 而非命令本体。这是结构上的特殊性，但为满足语料库一致性必须保留。
+    // preRedirect 上下文（greedy=false）只取 1 个字面量，
+    // 因为 command 的动态优先级高于 redirected_statement 的 prec(-1)。
     let end = op.endIndex
     let taken = 0
     while (true) {
@@ -1882,8 +1975,13 @@ function parseProcessSub(P: ParseState): TsNode | null {
   ])
 }
 
+/**
+ * 扫描并填充所有待处理 heredoc 的主体内容。
+ * 跳到当前行末尾的换行符，然后逐行读取直到找到分隔符行，
+ * 记录主体起始/结束字节偏移及分隔符行的起始/结束偏移。
+ */
 function scanHeredocBodies(P: ParseState): void {
-  // Skip to newline if not already there
+  // 若还未在换行符处，先跳至行末
   while (P.L.i < P.L.len && P.L.src[P.L.i] !== '\n') advance(P.L)
   if (P.L.i < P.L.len) advance(P.L)
   for (const hd of P.L.heredocs) {
@@ -1892,12 +1990,12 @@ function scanHeredocBodies(P: ParseState): void {
     while (P.L.i < P.L.len) {
       const lineStart = P.L.i
       const lineStartB = P.L.b
-      // Skip leading tabs if <<-
+      // 若为 <<-，跳过前导 tab
       let checkI = lineStart
       if (hd.stripTabs) {
         while (checkI < P.L.len && P.L.src[checkI] === '\t') checkI++
       }
-      // Check if this line is the delimiter
+      // 检查当前行是否为分隔符行
       if (
         P.L.src.startsWith(hd.delim, checkI) &&
         (checkI + delimLen >= P.L.len ||
@@ -1905,45 +2003,50 @@ function scanHeredocBodies(P: ParseState): void {
           P.L.src[checkI + delimLen] === '\r')
       ) {
         hd.bodyEnd = lineStartB
-        // Advance past tabs
+        // 跳过 tab 字符
         while (P.L.i < checkI) advance(P.L)
         hd.endStart = P.L.b
-        // Advance past delimiter
+        // 跳过分隔符字符
         for (let k = 0; k < delimLen; k++) advance(P.L)
         hd.endEnd = P.L.b
-        // Skip trailing newline
+        // 跳过尾部换行符
         if (P.L.i < P.L.len && P.L.src[P.L.i] === '\n') advance(P.L)
         return
       }
-      // Consume line
+      // 消费当前行内容
       while (P.L.i < P.L.len && P.L.src[P.L.i] !== '\n') advance(P.L)
       if (P.L.i < P.L.len) advance(P.L)
     }
-    // Unterminated
+    // 未终止的 heredoc
     hd.bodyEnd = P.L.b
     hd.endStart = P.L.b
     hd.endEnd = P.L.b
   }
 }
 
+/**
+ * 解析未引号 heredoc 主体内的扩展表达式，返回 heredoc_content/expansion 节点列表。
+ * 按字节范围 [start, end) 扫描；将 $.../ `...` 扩展与纯文本段分开为独立节点。
+ * 若主体内无任何扩展，返回空数组（调用方直接用叶节点表示 heredoc_body）。
+ */
 function parseHeredocBodyContent(
   P: ParseState,
   start: number,
   end: number,
 ): TsNode[] {
-  // Parse expansions inside an unquoted heredoc body.
+  // 解析未引号 heredoc 主体内的扩展表达式
   const saved = saveLex(P.L)
-  // Position lexer at body start
+  // 将 lexer 定位到主体起始字节
   restoreLexToByte(P, start)
   const out: TsNode[] = []
   let contentStart = P.L.b
-  // tree-sitter-bash's heredoc_body rule hides the initial text segment
-  // (_heredoc_body_beginning) — only content AFTER the first expansion is
-  // emitted as heredoc_content. Track whether we've seen an expansion yet.
+  // tree-sitter-bash 的 heredoc_body 规则隐藏了初始文本段
+  // (_heredoc_body_beginning) — 只有第一个展开之后的内容才以
+  // heredoc_content 形式发出。此处跟踪是否已遇到展开。
   let sawExpansion = false
   while (P.L.b < end) {
     const c = peek(P.L)
-    // Backslash escapes suppress expansion: \$ \` stay literal in heredoc.
+    // 反斜杠转义抑制展开：\$ \` 在 heredoc 中保持字面量。
     if (c === '\\') {
       const nxt = peek(P.L, 1)
       if (nxt === '$' || nxt === '`' || nxt === '\\') {
@@ -1957,8 +2060,8 @@ function parseHeredocBodyContent(
     if (c === '$' || c === '`') {
       const preB = P.L.b
       const exp = parseDollarLike(P)
-      // Bare `$` followed by non-name (e.g. `$'` in a regex) returns a lone
-      // '$' leaf, not an expansion — treat as literal content, don't split.
+      // 裸 `$` 后接非名称字符（如正则中的 `$'`）返回单独的 '$' 叶节点，
+      // 而非展开节点 — 视为字面量内容，不拆分。
       if (
         exp &&
         (exp.type === 'simple_expansion' ||
@@ -1977,8 +2080,8 @@ function parseHeredocBodyContent(
     }
     advance(P.L)
   }
-  // Only emit heredoc_content children if there were expansions — otherwise
-  // the heredoc_body is a leaf node (tree-sitter convention).
+  // 只有存在展开时才发出 heredoc_content 子节点 ——
+  // 否则 heredoc_body 是叶节点（tree-sitter 约定）。
   if (sawExpansion) {
     out.push(mk(P, 'heredoc_content', contentStart, end, []))
   }
@@ -1986,6 +2089,11 @@ function parseHeredocBodyContent(
   return out
 }
 
+/**
+ * 将 lexer 的位置恢复到指定 UTF-8 字节偏移处。
+ * 通过二分搜索 byteTable（JS char index → UTF-8 byte offset）找到对应的字符索引。
+ * 用于 heredoc 主体扫描：heredoc 结束后需跳回主体起始字节重新解析扩展内容。
+ */
 function restoreLexToByte(P: ParseState, targetByte: number): void {
   if (!P.L.byteTable) byteAt(P.L, 0)
   const t = P.L.byteTable!
@@ -2001,9 +2109,8 @@ function restoreLexToByte(P: ParseState, targetByte: number): void {
 }
 
 /**
- * Parse a word-position element: bare word, string, expansion, or concatenation
- * thereof. Returns a single node; if multiple adjacent fragments, wraps in
- * concatenation.
+ * 解析单词位置的元素：裸单词、字符串、展开表达式，或它们的拼接。
+ * 返回单个节点；若存在多个相邻片段，则包裹在 concatenation 节点中。
  */
 function parseWord(P: ParseState, _ctx: 'cmd' | 'arg'): TsNode | null {
   skipBlanks(P.L)
@@ -2024,7 +2131,7 @@ function parseWord(P: ParseState, _ctx: 'cmd' | 'arg'): TsNode | null {
     ) {
       break
     }
-    // < > are redirect operators unless <( >( (process substitution)
+    // < > 是重定向操作符，除非是 <( >( 进程替换
     if (c === '<' || c === '>') {
       if (peek(P.L, 1) === '(') {
         const ps = parseProcessSub(P)
@@ -2050,7 +2157,7 @@ function parseWord(P: ParseState, _ctx: 'cmd' | 'arg'): TsNode | null {
         continue
       }
       if (c1 === '"') {
-        // Translated string: emit $ leaf + string node
+        // 翻译字符串 $"..."：先发出 $ 叶节点，再发出 string 节点
         const dTok: Token = {
           type: 'DOLLAR',
           value: '$',
@@ -2063,9 +2170,8 @@ function parseWord(P: ParseState, _ctx: 'cmd' | 'arg'): TsNode | null {
         continue
       }
       if (c1 === '`') {
-        // `$` followed by backtick — tree-sitter elides the $ entirely
-        // and emits just (command_substitution). Consume $ and let next
-        // iteration handle the backtick.
+        // `$` 后接反引号 — tree-sitter 完全省略 $，只发出 (command_substitution)。
+        // 消费 $ 并让下一次迭代处理反引号。
         advance(P.L)
         continue
       }
@@ -2079,17 +2185,17 @@ function parseWord(P: ParseState, _ctx: 'cmd' | 'arg'): TsNode | null {
       if (bt) parts.push(bt)
       continue
     }
-    // Brace expression {1..5} or {a,b,c} — only if looks like one
+    // 大括号展开 {1..5} 或 {a,b,c} — 仅在看起来是展开时尝试
     if (c === '{') {
       const be = tryParseBraceExpr(P)
       if (be) {
         parts.push(be)
         continue
       }
-      // SECURITY: if `{` is immediately followed by a command terminator
-      // (; | & newline or EOF), it's a standalone word — don't slurp the
-      // rest of the line via tryParseBraceLikeCat. `echo {;touch /tmp/evil`
-      // must split on `;` so the security walker sees `touch`.
+      // 安全性：若 `{` 紧跟命令终止符（; | & 换行 或 EOF），
+      // 则它是独立单词 — 不通过 tryParseBraceLikeCat 吞噬后续内容。
+      // `echo {;touch /tmp/evil` 必须在 `;` 处断开，
+      // 使安全扫描器能看到 `touch`。
       const nc = peek(P.L, 1)
       if (
         nc === ';' ||
@@ -2106,36 +2212,36 @@ function parseWord(P: ParseState, _ctx: 'cmd' | 'arg'): TsNode | null {
         parts.push(mk(P, 'word', bStart, P.L.b, []))
         continue
       }
-      // Otherwise treat { and } as word fragments
+      // 否则将 { 和 } 作为单词片段处理
       const cat = tryParseBraceLikeCat(P)
       if (cat) {
         for (const p of cat) parts.push(p)
         continue
       }
     }
-    // Standalone `}` in arg position is a word (e.g., `echo }foo`).
-    // parseBareWord breaks on `}` so handle it here.
+    // arg 位置的独立 `}` 是一个单词（如 `echo }foo`）。
+    // parseBareWord 在 `}` 处停止，需在此处单独处理。
     if (c === '}') {
       const bStart = P.L.b
       advance(P.L)
       parts.push(mk(P, 'word', bStart, P.L.b, []))
       continue
     }
-    // `[` and `]` are single-char word fragments (tree-sitter splits at
-    // brackets: `[:lower:]` → `[` `:lower:` `]`, `{o[k]}` → 6 words).
+    // `[` 和 `]` 是单字符单词片段（tree-sitter 在方括号处分割，
+    // 如 `[:lower:]` → `[` `:lower:` `]`，`{o[k]}` → 6 个单词）。
     if (c === '[' || c === ']') {
       const bStart = P.L.b
       advance(P.L)
       parts.push(mk(P, 'word', bStart, P.L.b, []))
       continue
     }
-    // Bare word fragment
+    // 裸单词片段
     const frag = parseBareWord(P)
     if (!frag) break
-    // `NN#${...}` or `NN#$(...)` → (number (expansion|command_substitution)).
-    // Grammar: number can be seq(/-?(0x)?[0-9]+#/, choice(expansion, cmd_sub)).
-    // `10#${cmd}` must NOT be concatenation — it's a single number node with
-    // the expansion as child. Detect here: frag ends with `#`, next is $ {/(.
+    // `NN#${...}` 或 `NN#$(...)` → (number (expansion|command_substitution))。
+    // 语法：number 可以是 seq(/-?(0x)?[0-9]+#/, choice(expansion, cmd_sub))。
+    // `10#${cmd}` 不能是拼接节点 — 它是含展开子节点的单个 number 节点。
+    // 检测：frag 以 `#` 结尾，下一字符是 $ 且紧跟 {/(。
     if (
       frag.type === 'word' &&
       /^-?(0x)?[0-9]+#$/.test(frag.text) &&
@@ -2144,8 +2250,7 @@ function parseWord(P: ParseState, _ctx: 'cmd' | 'arg'): TsNode | null {
     ) {
       const exp = parseDollarLike(P)
       if (exp) {
-        // Prefix `NN#` is an anonymous pattern in grammar — only the
-        // expansion/cmd_sub is a named child.
+        // 前缀 `NN#` 是语法中的匿名模式 — 只有展开/命令替换是具名子节点。
         parts.push(mk(P, 'number', frag.startIndex, exp.endIndex, [exp]))
         continue
       }
@@ -2154,12 +2259,17 @@ function parseWord(P: ParseState, _ctx: 'cmd' | 'arg'): TsNode | null {
   }
   if (parts.length === 0) return null
   if (parts.length === 1) return parts[0]!
-  // Concatenation
+  // 拼接多个片段为 concatenation 节点
   const first = parts[0]!
   const last = parts[parts.length - 1]!
   return mk(P, 'concatenation', first.startIndex, last.endIndex, parts)
 }
 
+/**
+ * 解析裸单词片段（不含引号、展开、大括号）。
+ * 遇到空白、shell 元字符或特殊字符时停止；
+ * 内容为纯数字时返回 number 节点，否则返回 word 节点。
+ */
 function parseBareWord(P: ParseState): TsNode | null {
   const start = P.L.b
   const startI = P.L.i
@@ -2167,13 +2277,13 @@ function parseBareWord(P: ParseState): TsNode | null {
     const c = peek(P.L)
     if (c === '\\') {
       if (P.L.i + 1 >= P.L.len) {
-        // Trailing unpaired `\` at true EOF — tree-sitter emits word WITHOUT
-        // the `\` plus a sibling ERROR node. Stop here; caller emits ERROR.
+        // 真正的 EOF 处出现无对应的末尾 `\` — tree-sitter 发出不含 `\` 的单词
+        // 加一个兄弟 ERROR 节点。在此停止，由调用方发出 ERROR。
         break
       }
       const nx = P.L.src[P.L.i + 1]
       if (nx === '\n' || (nx === '\r' && P.L.src[P.L.i + 2] === '\n')) {
-        // Line continuation BREAKS the word (tree-sitter quirk) — handles \r?\n
+        // 行续接会断开当前单词（tree-sitter 特性）— 兼容 \r?\n
         break
       }
       advance(P.L)
@@ -2212,14 +2322,19 @@ function parseBareWord(P: ParseState): TsNode | null {
   return mk(P, type, start, P.L.b, [])
 }
 
+/**
+ * 尝试解析 `{N..M}` 大括号范围表达式（brace_expression）。
+ * 两端必须同为数字或同为单字符，混合类型则回溯并返回 null。
+ * 成功时返回包含 `{`、p1、`..`、p2、`}` 五个子节点的 brace_expression 节点。
+ */
 function tryParseBraceExpr(P: ParseState): TsNode | null {
-  // {N..M} where N, M are numbers or single chars
+  // {N..M}：其中 N、M 为数字或单字符
   const save = saveLex(P.L)
   if (peek(P.L) !== '{') return null
   const oStart = P.L.b
   advance(P.L)
   const oEnd = P.L.b
-  // First part
+  // 第一部分
   const p1Start = P.L.b
   while (isDigit(peek(P.L)) || isIdentStart(peek(P.L))) advance(P.L)
   const p1End = P.L.b
@@ -2245,7 +2360,7 @@ function tryParseBraceExpr(P: ParseState): TsNode | null {
   const p2Text = sliceBytes(P, p2Start, p2End)
   const p1IsNum = /^\d+$/.test(p1Text)
   const p2IsNum = /^\d+$/.test(p2Text)
-  // Valid brace expression: both numbers OR both single chars. Mixed = reject.
+  // 有效大括号展开：两者均为数字，或两者均为单字符。混合则拒绝。
   if (p1IsNum !== p2IsNum) {
     restoreLex(P.L, save)
     return null
@@ -2265,8 +2380,14 @@ function tryParseBraceExpr(P: ParseState): TsNode | null {
   ])
 }
 
+/**
+ * 尝试解析 `{a,b,c}` 或 `{}` 形式的大括号类表达式，将其分割为多个 word 片段节点。
+ * 按照 tree-sitter 的行为，`{`、内部各段、`}` 分别作为独立 word 节点返回。
+ * 安全：在命令终止符处停止，防止 `{foo;cmd}` 管道注入。
+ * `[` 和 `]` 也作为独立单字符 word 节点拆分。
+ */
 function tryParseBraceLikeCat(P: ParseState): TsNode[] | null {
-  // {a,b,c} or {} → split into word fragments like tree-sitter does
+  // {a,b,c} 或 {} → 像 tree-sitter 一样分割为单词片段
   if (peek(P.L) !== '{') return null
   const oStart = P.L.b
   advance(P.L)
@@ -2274,7 +2395,7 @@ function tryParseBraceLikeCat(P: ParseState): TsNode[] | null {
   const inner: TsNode[] = [mk(P, 'word', oStart, oEnd, [])]
   while (P.L.i < P.L.len) {
     const bc = peek(P.L)
-    // SECURITY: stop at command terminators so `{foo;rm x` splits correctly.
+    // 安全：在命令终止符处停止，确保 `{foo;rm x` 能正确分割。
     if (
       bc === '}' ||
       bc === '\n' ||
@@ -2290,7 +2411,7 @@ function tryParseBraceLikeCat(P: ParseState): TsNode[] | null {
     ) {
       break
     }
-    // `[` and `]` are single-char words: {o[k]} → { o [ k ] }
+    // `[` 和 `]` 是单字符单词：{o[k]} → { o [ k ] }
     if (bc === '[' || bc === ']') {
       const bStart = P.L.b
       advance(P.L)
@@ -2336,6 +2457,12 @@ function tryParseBraceLikeCat(P: ParseState): TsNode[] | null {
   return inner
 }
 
+/**
+ * 解析双引号字符串 `"..."` 并返回 string 节点。
+ * 内部识别 `$(...)`、`${...}`、`$var`、`` `...` ``、裸 `$` 等展开形式，
+ * 纯文本段作为 string_content 节点；纯空白段按 tree-sitter extras 规则省略。
+ * 换行处会分割 string_content，确保字节范围连续。
+ */
 function parseDoubleQuoted(P: ParseState): TsNode {
   const qStart = P.L.b
   advance(P.L)
@@ -2346,12 +2473,10 @@ function parseDoubleQuoted(P: ParseState): TsNode {
   let contentStartI = P.L.i
   const flushContent = (): void => {
     if (P.L.b > contentStart) {
-      // Tree-sitter's extras rule /\s/ has higher precedence than
-      // string_content (prec -1), so whitespace-only segments are elided.
-      // `" ${x} "` → (string (expansion)) not (string (string_content)(expansion)(string_content)).
-      // Note: this intentionally diverges from preserving all content — cc
-      // tests relying on whitespace-only string_content need updating
-      // (CCReconcile).
+      // tree-sitter 的 extras 规则 /\s/ 优先级高于 string_content（prec -1），
+      // 因此纯空白段会被省略。
+      // `" ${x} "` → (string (expansion)) 而非 (string (string_content)(expansion)(string_content))。
+      // 注意：此处有意偏离保留全部内容的做法 — 依赖纯空白 string_content 的测试需更新。
       const txt = P.src.slice(contentStartI, P.L.i)
       if (!/^[ \t]+$/.test(txt)) {
         parts.push(mk(P, 'string_content', contentStart, P.L.b, []))
@@ -2367,7 +2492,7 @@ function parseDoubleQuoted(P: ParseState): TsNode {
       continue
     }
     if (c === '\n') {
-      // Split string_content at newline
+      // 在换行处分割 string_content
       flushContent()
       advance(P.L)
       contentStart = P.L.b
@@ -2390,9 +2515,8 @@ function parseDoubleQuoted(P: ParseState): TsNode {
         contentStartI = P.L.i
         continue
       }
-      // Bare $ not at end-of-string: tree-sitter emits it as an anonymous
-      // '$' token, which splits string_content. $ immediately before the
-      // closing " is absorbed into the preceding string_content.
+      // 裸 $ 不在字符串末尾：tree-sitter 将其作为匿名 '$' token 发出，
+      // 从而分割 string_content。紧靠闭合 " 前的 $ 被并入前面的 string_content。
       if (c1 !== '"' && c1 !== '') {
         flushContent()
         const dS = P.L.b
@@ -2426,11 +2550,21 @@ function parseDoubleQuoted(P: ParseState): TsNode {
   return mk(P, 'string', qStart, close.endIndex, parts)
 }
 
+/**
+ * 解析以 `$` 开头的各类展开表达式，返回对应节点或 null。
+ * 支持分支：
+ * - `$((expr))` → arithmetic_expansion
+ * - `$[expr]` → arithmetic_expansion（bash 遗留语法）
+ * - `$(cmd)` → command_substitution；`$(< file)` 解包为 file_redirect
+ * - `${...}` → expansion（委托给 parseExpansionBody）
+ * - `$VAR`、`$?`、`$$` 等 → simple_expansion
+ * - 裸 `$` → `$` 叶节点
+ */
 function parseDollarLike(P: ParseState): TsNode | null {
   const c1 = peek(P.L, 1)
   const dStart = P.L.b
   if (c1 === '(' && peek(P.L, 2) === '(') {
-    // $(( arithmetic ))
+    // $(( 算术展开 ))
     advance(P.L)
     advance(P.L)
     advance(P.L)
@@ -2453,7 +2587,7 @@ function parseDollarLike(P: ParseState): TsNode | null {
     ])
   }
   if (c1 === '[') {
-    // $[ arithmetic ] — legacy bash syntax, same as $((...))
+    // $[ 算术展开 ] — bash 遗留语法，等同于 $((...))
     advance(P.L)
     advance(P.L)
     const open = mk(P, '$[', dStart, P.L.b, [])
@@ -2487,8 +2621,8 @@ function parseDollarLike(P: ParseState): TsNode | null {
     } else {
       close = mk(P, ')', P.L.b, P.L.b, [])
     }
-    // $(< file) shorthand: unwrap redirected_statement → bare file_redirect
-    // tree-sitter emits (command_substitution (file_redirect (word))) directly
+    // $(< file) 简写：将 redirected_statement 解包为裸 file_redirect
+    // tree-sitter 直接发出 (command_substitution (file_redirect (word)))
     if (
       body.length === 1 &&
       body[0]!.type === 'redirected_statement' &&
@@ -2518,12 +2652,12 @@ function parseDollarLike(P: ParseState): TsNode | null {
     }
     return mk(P, 'expansion', dStart, close.endIndex, [open, ...inner, close])
   }
-  // Simple expansion $VAR or $? $$ $@ etc
+  // 简单展开 $VAR 或 $? $$ $@ 等
   advance(P.L)
   const dEnd = P.L.b
   const dollar = mk(P, '$', dStart, dEnd, [])
   const nc = peek(P.L)
-  // $_ is special_variable_name only when not followed by more ident chars
+  // $_ 仅在后面不跟标识符字符时才是 special_variable_name
   if (nc === '_' && !isIdentChar(peek(P.L, 1))) {
     const vStart = P.L.b
     advance(P.L)
@@ -2548,17 +2682,23 @@ function parseDollarLike(P: ParseState): TsNode | null {
     const vn = mk(P, 'special_variable_name', vStart, P.L.b, [])
     return mk(P, 'simple_expansion', dStart, P.L.b, [dollar, vn])
   }
-  // Bare $ — just a $ leaf (tree-sitter treats trailing $ as literal)
+  // 裸 $ — 仅发出 $ 叶节点（tree-sitter 将末尾 $ 视为字面量）
   return dollar
 }
 
+/**
+ * 解析 `${...}` 大括号展开的主体内容，返回子节点列表。
+ * 处理 `#` 长度前缀、`!`/`=`/`~` 间接展开前缀、变量名/特殊变量、
+ * 可选下标 `[idx]`、尾部 `*`/`@` 间接枚举、`@op` 参数变换，
+ * 以及 `:-`、`:=`、`#`、`%`、`/` 等操作符及其 RHS 内容。
+ * 特殊情况：`${#!}`、`${!#}`、`${!##}` 等返回空节点列表。
+ */
 function parseExpansionBody(P: ParseState): TsNode[] {
   const out: TsNode[] = []
   skipBlanks(P.L)
-  // Bizarre cases: ${#!} ${!#} ${!##} ${!# } ${!## } all emit empty (expansion)
-  // — both # and ! become anonymous nodes when only combined with each other
-  // and optional trailing space before }. Note ${!##/} does NOT match (has
-  // content after), so it parses normally as (special_variable_name)(regex).
+  // 特殊情况：${#!} ${!#} ${!##} ${!# } ${!## } 全部发出空 (expansion)
+  // — # 和 ! 在仅与对方组合（以及可选的 } 前空格）时均变为匿名节点。
+  // 注意：${!##/} 不匹配（后面有内容），因此会正常解析为 (special_variable_name)(regex)。
   {
     const c0 = peek(P.L)
     const c1 = peek(P.L, 1)
@@ -2568,7 +2708,7 @@ function parseExpansionBody(P: ParseState): TsNode[] {
       return out
     }
     if (c0 === '!' && c1 === '#') {
-      // ${!#} ${!##} with optional trailing space then }
+      // ${!#} ${!##}，后面可选空格再接 }
       let j = 2
       if (peek(P.L, j) === '#') j++
       if (peek(P.L, j) === ' ') j++
@@ -2578,15 +2718,15 @@ function parseExpansionBody(P: ParseState): TsNode[] {
       }
     }
   }
-  // Optional # prefix for length
+  // 可选 # 前缀，用于获取长度
   if (peek(P.L) === '#') {
     const s = P.L.b
     advance(P.L)
     out.push(mk(P, '#', s, P.L.b, []))
   }
-  // Optional ! prefix for indirect expansion: ${!varname} ${!prefix*} ${!prefix@}
-  // Only when followed by an identifier — ${!} alone is special var $!
-  // Also = ~ prefixes (zsh-style ${=var} ${~var})
+  // 可选 ! 前缀，用于间接展开：${!varname} ${!prefix*} ${!prefix@}
+  // 仅在后接标识符时有效 — 单独的 ${!} 是特殊变量 $!
+  // = ~ 前缀为 zsh 风格（${=var} ${~var}）
   const pc = peek(P.L)
   if (
     (pc === '!' || pc === '=' || pc === '~') &&
@@ -2597,7 +2737,7 @@ function parseExpansionBody(P: ParseState): TsNode[] {
     out.push(mk(P, pc, s, P.L.b, []))
   }
   skipBlanks(P.L)
-  // Variable name
+  // 变量名（标识符、数字或特殊变量）
   if (isIdentStart(peek(P.L))) {
     const s = P.L.b
     while (isIdentChar(peek(P.L))) advance(P.L)
@@ -2611,7 +2751,7 @@ function parseExpansionBody(P: ParseState): TsNode[] {
     advance(P.L)
     out.push(mk(P, 'special_variable_name', s, P.L.b, []))
   }
-  // Optional subscript [idx] — parsed arithmetically
+  // 可选下标 [idx] — 以算术方式解析
   if (peek(P.L) === '[') {
     const varNode = out[out.length - 1]
     const brOpen = P.L.b
@@ -2630,8 +2770,8 @@ function parseExpansionBody(P: ParseState): TsNode[] {
     }
   }
   skipBlanks(P.L)
-  // Trailing * or @ for indirect expansion (${!prefix*} ${!prefix@}) or
-  // @operator for parameter transformation (${var@U} ${var@Q}) — anonymous
+  // 间接展开的末尾 * 或 @（${!prefix*} ${!prefix@}），
+  // 或参数变换的 @operator（${var@U} ${var@Q}）— 均为匿名节点
   const tc = peek(P.L)
   if ((tc === '*' || tc === '@') && peek(P.L, 1) === '}') {
     const s = P.L.b
@@ -2640,23 +2780,22 @@ function parseExpansionBody(P: ParseState): TsNode[] {
     return out
   }
   if (tc === '@' && isIdentStart(peek(P.L, 1))) {
-    // ${var@U} transformation — @ is anonymous, consume op char(s)
+    // ${var@U} 变换 — @ 为匿名节点，消费操作符字符
     const s = P.L.b
     advance(P.L)
     out.push(mk(P, '@', s, P.L.b, []))
     while (isIdentChar(peek(P.L))) advance(P.L)
     return out
   }
-  // Operator :- := :? :+ - = ? + # ## % %% / // ^ ^^ , ,, etc.
+  // 操作符：:- := :? :+ - = ? + # ## % %% / // ^ ^^ , ,, 等
   const c = peek(P.L)
-  // Bare `:` substring operator ${var:off:len} — offset and length parsed
-  // arithmetically. Must come BEFORE the generic operator handling so `(` after
-  // `:` goes to parenthesized_expression not the array path. `:-` `:=` `:?`
-  // `:+` (no space) remain default-value operators; `: -1` (with space before
-  // -1) is substring with negative offset.
+  // 裸 `:` 子串操作符 ${var:off:len} — 偏移量和长度以算术方式解析。
+  // 必须在通用操作符处理之前处理，以便 `:` 后的 `(` 进入括号表达式路径，
+  // 而非数组路径。`:-` `:=` `:?` `:+`（无空格）仍为默认值操作符；
+  // `: -1`（- 前有空格）是带负偏移量的子串展开。
   if (c === ':') {
     const c1 = peek(P.L, 1)
-    // `:\n` or `:}` — empty substring expansion, emits nothing (variable_name only)
+    // `:\n` 或 `:}` — 空子串展开，不发出任何节点（仅有 variable_name）
     if (c1 === '\n' || c1 === '}') {
       advance(P.L)
       while (peek(P.L) === '\n') advance(P.L)
@@ -2665,8 +2804,8 @@ function parseExpansionBody(P: ParseState): TsNode[] {
     if (c1 !== '-' && c1 !== '=' && c1 !== '?' && c1 !== '+') {
       advance(P.L)
       skipBlanks(P.L)
-      // Offset — arithmetic. `-N` at top level is a single number node per
-      // tree-sitter; inside parens it's unary_expression(number).
+      // 偏移量 — 算术解析。顶层的 `-N` 按 tree-sitter 规则发出单个 number 节点；
+      // 括号内则发出 unary_expression(number)。
       const offC = peek(P.L)
       let off: TsNode | null
       if (offC === '-' && isDigit(peek(P.L, 1))) {
@@ -2720,7 +2859,7 @@ function parseExpansionBody(P: ParseState): TsNode[] {
       (c === '#' || c === '%' || c === '/' || c === '^' || c === ',') &&
       c1 === c
     ) {
-      // Doubled operators: ## %% // ^^ ,,
+      // 双字符操作符：## %% // ^^ ,,
       advance(P.L)
       advance(P.L)
       op = c + c
@@ -2728,10 +2867,10 @@ function parseExpansionBody(P: ParseState): TsNode[] {
       advance(P.L)
     }
     out.push(mk(P, op, s, P.L.b, []))
-    // Rest is the default/replacement — parse as word or regex until }
-    // Pattern-matching operators (# ## % %% / // ^ ^^ , ,,) emit regex;
-    // value-substitution operators (:- := :? :+ - = ? + :) emit word.
-    // `/` and `//` split at next `/` into (regex)+(word) for pat/repl.
+    // 其余部分为默认值/替换值 — 解析为单词或正则表达式直至 }
+    // 模式匹配操作符（# ## % %% / // ^ ^^ , ,,）发出 regex；
+    // 值替换操作符（:- := :? :+ - = ? + :）发出 word。
+    // `/` 和 `//` 在下一个 `/` 处拆分为 (regex)+(word)（用于 pat/repl）。
     const isPattern =
       op === '#' ||
       op === '##' ||
@@ -2744,18 +2883,18 @@ function parseExpansionBody(P: ParseState): TsNode[] {
       op === ',' ||
       op === ',,'
     if (op === '/' || op === '//') {
-      // Optional /# or /% anchor prefix — anonymous node
+      // 可选 /# 或 /% 锚定前缀 — 匿名节点
       const ac = peek(P.L)
       if (ac === '#' || ac === '%') {
         const aStart = P.L.b
         advance(P.L)
         out.push(mk(P, ac, aStart, P.L.b, []))
       }
-      // Pattern: per grammar _expansion_regex_replacement, pattern is
-      // choice(regex, string, cmd_sub, seq(string, regex)). If it STARTS
-      // with ", emit (string) and any trailing chars become (regex).
-      // `${v//"${old}"/}` → (string(expansion)); `${v//"${c}"\//}` →
-      // (string)(regex).
+      // 模式：按语法 _expansion_regex_replacement，模式为
+      // choice(regex, string, cmd_sub, seq(string, regex))。若以 " 开头，
+      // 发出 (string)，其余字符变为 (regex)。
+      // `${v//"${old}"/}` → (string(expansion))；`${v//"${c}"\//}` →
+      // (string)(regex)。
       if (peek(P.L) === '"') {
         out.push(parseDoubleQuoted(P))
         const tail = parseExpansionRest(P, 'regex', true)
@@ -2768,16 +2907,14 @@ function parseExpansionBody(P: ParseState): TsNode[] {
         const sepStart = P.L.b
         advance(P.L)
         out.push(mk(P, '/', sepStart, P.L.b, []))
-        // Replacement: per grammar, choice includes `seq(cmd_sub, word)`
-        // which emits TWO siblings (not concatenation). Also `(` at start
-        // of replacement is a regular word char, NOT array — unlike `:-`
-        // default-value context. `${v/(/(Gentoo ${x}, }` replacement
-        // `(Gentoo ${x}, ` is (concatenation (word)(expansion)(word)).
+        // 替换值：按语法，choice 包含 `seq(cmd_sub, word)`，
+        // 发出两个兄弟节点（不是拼接节点）。替换值起始的 `(` 是普通单词字符，
+        // 而非数组 — 与 `:-` 默认值上下文不同。`${v/(/(Gentoo ${x}, }` 的替换
+        // `(Gentoo ${x}, ` 为 (concatenation (word)(expansion)(word))。
         const repl = parseExpansionRest(P, 'replword', false)
         if (repl) {
-          // seq(cmd_sub, word) special case → siblings. Detected when
-          // replacement is a concatenation of exactly 2 parts with first
-          // being command_substitution.
+          // seq(cmd_sub, word) 特殊情况 → 兄弟节点。检测条件：
+          // 替换值为恰好 2 个部分的拼接节点，且第一个为 command_substitution。
           if (
             repl.type === 'concatenation' &&
             repl.children.length === 2 &&
@@ -2791,10 +2928,10 @@ function parseExpansionBody(P: ParseState): TsNode[] {
         }
       }
     } else if (op === '#' || op === '##' || op === '%' || op === '%%') {
-      // Pattern-removal: per grammar _expansion_regex, pattern is
-      // repeat(choice(regex, string, raw_string, ')')). Each quote/string
-      // is a SIBLING, not absorbed into one regex. `${f%'str'*}` →
-      // (raw_string)(regex); `${f/'str'*}` (slash) stays single regex.
+      // 模式删除：按语法 _expansion_regex，模式为
+      // repeat(choice(regex, string, raw_string, ')'))。每个引号/字符串
+      // 作为兄弟节点，不合并为单个 regex。`${f%'str'*}` →
+      // (raw_string)(regex)；`${f/'str'*}`（斜杠）保持单个 regex。
       for (const p of parseExpansionRegexSegmented(P)) out.push(p)
     } else {
       const rest = parseExpansionRest(P, isPattern ? 'regex' : 'word', false)
@@ -2804,20 +2941,28 @@ function parseExpansionBody(P: ParseState): TsNode[] {
   return out
 }
 
+/**
+ * 解析 `${...}` 展开操作符后的 RHS 内容，返回单个节点或 null。
+ * - `nodeType='word'`：值替换模式，识别嵌套展开、引号字符串等，并在 `(` 处解析为 array；
+ * - `nodeType='regex'`：模式匹配模式，整体扫描为单个 regex 节点，引号被跳过；
+ * - `nodeType='replword'`：类似 word 但 `(` 不触发 array（用于 `/` `//` 替换值）。
+ * `stopAtSlash=true` 在 `/` 处停止，用于 `${var/pat/repl}` 模式/替换拆分。
+ * 前导纯空白段在有后续内容时丢弃（与 tree-sitter extras 规则一致）。
+ */
 function parseExpansionRest(
   P: ParseState,
   nodeType: string,
   stopAtSlash: boolean,
 ): TsNode | null {
-  // Don't skipBlanks — `${var:- }` space IS the word. Stop at } or newline
-  // (`${var:\n}` emits no word). stopAtSlash=true stops at `/` for pat/repl
-  // split in ${var/pat/repl}. nodeType 'replword' is word-mode for the
-  // replacement in `/` `//` — same as 'word' but `(` is NOT array.
+  // 不调用 skipBlanks — `${var:- }` 中的空格就是单词内容。在 } 或换行处停止
+  // （`${var:\n}` 不发出任何单词）。stopAtSlash=true 在 `/` 处停止，
+  // 用于 ${var/pat/repl} 中的 pat/repl 分割。nodeType 'replword' 是 `/` `//`
+  // 替换值的单词模式 — 与 'word' 相同，但 `(` 不作为数组处理。
   const start = P.L.b
-  // Value-substitution RHS starting with `(` parses as array: ${var:-(x)} →
-  // (expansion (variable_name) (array (word))). Only for 'word' context (not
-  // pattern-matching operators which emit regex, and not 'replword' where `(`
-  // is a regular char per grammar `_expansion_regex_replacement`).
+  // 值替换 RHS 以 `(` 开头时解析为数组：${var:-(x)} →
+  // (expansion (variable_name) (array (word)))。仅适用于 'word' 上下文（
+  // 不适用于发出 regex 的模式匹配操作符，以及语法 `_expansion_regex_replacement`
+  // 中 `(` 为普通字符的 'replword'）。
   if (nodeType === 'word' && peek(P.L) === '(') {
     advance(P.L)
     const open = mk(P, '(', start, P.L.b, [])
@@ -2852,9 +2997,8 @@ function parseExpansionRest(
     while (peek(P.L) === '\n') advance(P.L)
     return mk(P, 'array', start, P.L.b, elems)
   }
-  // REGEX mode: flat single-span scan. Quotes are opaque (skipped past so
-  // `/` inside them doesn't break stopAtSlash), but NOT emitted as separate
-  // nodes — the entire range becomes one regex node.
+  // REGEX 模式：平坦单跨度扫描。引号不透明（跳过，防止其中的 `/` 触发 stopAtSlash），
+  // 但不作为独立节点发出 — 整个范围变为一个 regex 节点。
   if (nodeType === 'regex') {
     let braceDepth = 0
     while (P.L.i < P.L.len) {
@@ -2878,7 +3022,7 @@ function parseExpansionRest(
         if (peek(P.L) === c) advance(P.L)
         continue
       }
-      // Skip past nested ${...} $(...) $[...] so their } / don't terminate us
+      // 跳过嵌套的 ${...} $(...) $[...]，防止其 } / 终止当前扫描
       if (c === '$') {
         const c1 = peek(P.L, 1)
         if (c1 === '{') {
@@ -2917,9 +3061,9 @@ function parseExpansionRest(
     if (end === start) return null
     return mk(P, 'regex', start, end, [])
   }
-  // WORD mode: segmenting parser — recognize nested ${...}, $(...), $'...',
-  // "...", '...', $ident, <(...)/>(...); bare chars accumulate into word
-  // segments. Multiple parts → wrapped in concatenation.
+  // WORD 模式：分段解析器 — 识别嵌套的 ${...}、$(...)、$'...'、
+  // "..."、'...'、$ident、<(...)/>(...)；裸字符累积为 word 段。
+  // 多个部分 → 包裹为 concatenation 节点。
   const parts: TsNode[] = []
   let segStart = P.L.b
   let braceDepth = 0
@@ -2950,7 +3094,7 @@ function parseExpansionRest(
         continue
       }
       if (c1 === "'") {
-        // $'...' ANSI-C string
+        // $'...' ANSI-C 字符串
         flushSeg()
         const aStart = P.L.b
         advance(P.L)
@@ -3002,19 +3146,18 @@ function parseExpansionRest(
       segStart = P.L.b
       continue
     }
-    // Brace tracking so nested {a,b} brace-expansion chars don't prematurely
-    // terminate (rare, but the `?` in `${cond}? (` should be treated as word).
+    // 大括号深度跟踪，防止嵌套 {a,b} 的字符过早终止
+    // （罕见，但 `${cond}?` 中的 `?` 应视为单词字符）。
     if (c === '{') braceDepth++
     else if (c === '}' && braceDepth > 0) braceDepth--
     advance(P.L)
   }
   flushSeg()
-  // Consume trailing newlines before } so caller sees }
+  // 消费尾部换行符（在 } 之前），使调用方能看到 }
   while (peek(P.L) === '\n') advance(P.L)
-  // Tree-sitter skips leading whitespace (extras) in expansion RHS when
-  // there's content after: `${2+ ${2}}` → just (expansion). But `${v:- }`
-  // (space-only RHS) keeps the space as (word). So drop leading whitespace-
-  // only word segment if it's NOT the only part.
+  // tree-sitter 在展开 RHS 有内容时跳过前导空白（extras）：
+  // `${2+ ${2}}` → 仅有 (expansion)。但 `${v:- }`（纯空白 RHS）
+  // 保留空格作为 (word)。因此，若前导纯空白 word 段不是唯一部分，则丢弃。
   if (
     parts.length > 1 &&
     parts[0]!.type === 'word' &&
@@ -3024,15 +3167,17 @@ function parseExpansionRest(
   }
   if (parts.length === 0) return null
   if (parts.length === 1) return parts[0]!
-  // Multiple parts: wrap in concatenation (word mode keeps concat wrapping;
-  // regex mode also concats per tree-sitter for mixed quote+glob patterns).
+  // 多个部分：包裹为 concatenation（word 模式保留拼接包裹；
+  // regex 模式在混合引号+glob 模式时也按 tree-sitter 拼接）。
   const last = parts[parts.length - 1]!
   return mk(P, 'concatenation', parts[0]!.startIndex, last.endIndex, parts)
 }
 
-// Pattern for # ## % %% operators — per grammar _expansion_regex:
-// repeat(choice(regex, string, raw_string, ')', /\s+/→regex)). Each quote
-// becomes a SIBLING node, not absorbed. `${f%'str'*}` → (raw_string)(regex).
+/**
+ * 解析 `#` `##` `%` `%%` 操作符后的正则模式，返回 regex/string/raw_string 节点列表。
+ * 按语法 `_expansion_regex` 规则，每个引号块作为独立兄弟节点，不合并到 regex 中。
+ * 遇到嵌套 `${...}` / `$(...)` 时，以不透明方式跳过，防止其 `}` 提前终止扫描。
+ */
 function parseExpansionRegexSegmented(P: ParseState): TsNode[] {
   const out: TsNode[] = []
   let segStart = P.L.b
@@ -3063,7 +3208,7 @@ function parseExpansionRegexSegmented(P: ParseState): TsNode[] {
       segStart = P.L.b
       continue
     }
-    // Nested ${...} $(...) — opaque scan so their } doesn't terminate us
+    // 嵌套 ${...} $(...) — 不透明扫描，防止其 } 终止当前扫描
     if (c === '$') {
       const c1 = peek(P.L, 1)
       if (c1 === '{') {
@@ -3098,12 +3243,19 @@ function parseExpansionRegexSegmented(P: ParseState): TsNode[] {
   return out
 }
 
+/**
+ * 解析反引号命令替换 `` `...` ``，返回 command_substitution 节点或 null。
+ * 内部语句委托给 parseAndOr 解析；支持分号/`&` 分隔的多语句。
+ * 空反引号（仅含空白/换行）被 tree-sitter 忽略，此时返回 null——
+ * 可用作行续接技巧：`"foo"``\n``"bar"` → (concatenation (string)(string))。
+ * 使用 `P.inBacktick` 计数器支持嵌套反引号（如 `` `echo \`date\`` ``）。
+ */
 function parseBacktick(P: ParseState): TsNode | null {
   const start = P.L.b
   advance(P.L)
   const open = mk(P, '`', start, P.L.b, [])
   P.inBacktick++
-  // Parse statements inline — stop at closing backtick
+  // 内联解析语句 — 在反引号处停止
   const body: TsNode[] = []
   while (true) {
     skipBlanks(P.L)
@@ -3138,9 +3290,9 @@ function parseBacktick(P: ParseState): TsNode | null {
   } else {
     close = mk(P, '`', P.L.b, P.L.b, [])
   }
-  // Empty backticks (whitespace/newline only) are elided entirely by
-  // tree-sitter — used as a line-continuation hack: "foo"`<newline>`"bar"
-  // → (concatenation (string) (string)) with no command_substitution.
+  // 空反引号（仅含空白/换行）会被 tree-sitter 完全省略 —
+  // 常用作行续接技巧：`"foo"``<newline>``"bar"`
+  // → (concatenation (string) (string))，不含 command_substitution。
   if (body.length === 0) return null
   return mk(P, 'command_substitution', start, close.endIndex, [
     open,
@@ -3149,6 +3301,10 @@ function parseBacktick(P: ParseState): TsNode | null {
   ])
 }
 
+/**
+ * 解析 `if...then...elif...else...fi` 语句，返回 if_statement 节点。
+ * 循环处理 elif_clause 和 else_clause；通过 consumeKeyword 消费 then/fi 关键字。
+ */
 function parseIf(P: ParseState, ifTok: Token): TsNode {
   const ifKw = leaf(P, 'if', ifTok)
   const kids: TsNode[] = [ifKw]
@@ -3186,6 +3342,10 @@ function parseIf(P: ParseState, ifTok: Token): TsNode {
   return mk(P, 'if_statement', ifKw.startIndex, last.endIndex, kids)
 }
 
+/**
+ * 解析 `while`/`until` 循环，返回 while_statement 节点。
+ * 条件部分由 parseStatements 解析，循环体由 parseDoGroup 解析。
+ */
 function parseWhile(P: ParseState, kwTok: Token): TsNode {
   const kw = leaf(P, kwTok.value, kwTok)
   const kids: TsNode[] = [kw]
@@ -3197,19 +3357,26 @@ function parseWhile(P: ParseState, kwTok: Token): TsNode {
   return mk(P, 'while_statement', kw.startIndex, last.endIndex, kids)
 }
 
+/**
+ * 解析 `for`/`select` 循环，返回 for_statement 或 c_style_for_statement 节点。
+ * - C 风格 `for (( init; cond; update ))` → c_style_for_statement，仅 `for` 支持；
+ * - 普通 `for VAR in words; do...done` → for_statement；
+ * - `select VAR in words; do...done` → select_statement。
+ * 循环体既可以是 do/done 组，也可以是 `{...}` 复合语句（C 风格 for 特有）。
+ */
 function parseFor(P: ParseState, forTok: Token): TsNode {
   const forKw = leaf(P, forTok.value, forTok)
   skipBlanks(P.L)
-  // C-style for (( ; ; )) — only for `for`, not `select`
+  // C 风格 for (( ; ; )) — 仅适用于 `for`，不适用于 `select`
   if (forTok.value === 'for' && peek(P.L) === '(' && peek(P.L, 1) === '(') {
     const oStart = P.L.b
     advance(P.L)
     advance(P.L)
     const open = mk(P, '((', oStart, P.L.b, [])
     const kids: TsNode[] = [forKw, open]
-    // init; cond; update — all three use 'assign' mode so `c = expr` emits
-    // variable_assignment, while bare idents (c in `c<=5`) → word. Each
-    // clause may be a comma-separated list.
+    // init; cond; update — 三个子句均使用 'assign' 模式，使 `c = expr` 发出
+    // variable_assignment，而裸标识符（如 `c<=5` 中的 c）→ word。每个子句
+    // 均可为逗号分隔的列表。
     for (let k = 0; k < 3; k++) {
       skipBlanks(P.L)
       const es = parseArithCommaList(P, k < 2 ? ';' : '))', 'assign')
@@ -3229,7 +3396,7 @@ function parseFor(P: ParseState, forTok: Token): TsNode {
       advance(P.L)
       kids.push(mk(P, '))', cStart, P.L.b, []))
     }
-    // Optional ; or newline
+    // 可选的 ; 或换行符
     const save = saveLex(P.L)
     const sep = nextToken(P.L, 'cmd')
     if (sep.type === 'OP' && sep.value === ';') {
@@ -3241,7 +3408,7 @@ function parseFor(P: ParseState, forTok: Token): TsNode {
     if (dg) {
       kids.push(dg)
     } else {
-      // C-style for can also use `{ ... }` body instead of `do ... done`
+      // C 风格 for 也可用 `{ ... }` 替代 `do ... done` 作为循环体
       skipNewlines(P)
       skipBlanks(P.L)
       if (peek(P.L) === '{') {
@@ -3269,7 +3436,7 @@ function parseFor(P: ParseState, forTok: Token): TsNode {
     const last = kids[kids.length - 1]!
     return mk(P, 'c_style_for_statement', forKw.startIndex, last.endIndex, kids)
   }
-  // Regular for VAR in words; do ... done
+  // 普通 for VAR in words; do ... done
   const kids: TsNode[] = [forKw]
   const varTok = nextToken(P.L, 'arg')
   kids.push(mk(P, 'variable_name', varTok.start, varTok.end, []))
@@ -3289,7 +3456,7 @@ function parseFor(P: ParseState, forTok: Token): TsNode {
   } else {
     restoreLex(P.L, save)
   }
-  // Separator
+  // 分隔符（; 或换行）
   const save2 = saveLex(P.L)
   const sep = nextToken(P.L, 'cmd')
   if (sep.type === 'OP' && sep.value === ';') {
@@ -3303,6 +3470,11 @@ function parseFor(P: ParseState, forTok: Token): TsNode {
   return mk(P, 'for_statement', forKw.startIndex, last.endIndex, kids)
 }
 
+/**
+ * 解析 `do...done` 循环体组，返回 do_group 节点或 null。
+ * 期望下一个 token 为 `do` 关键字；若不符合则回溯并返回 null。
+ * 内部语句由 parseStatements 解析，`done` 由 consumeKeyword 消费。
+ */
 function parseDoGroup(P: ParseState): TsNode | null {
   skipNewlines(P)
   const save = saveLex(P.L)
@@ -3319,6 +3491,11 @@ function parseDoGroup(P: ParseState): TsNode | null {
   return mk(P, 'do_group', doKw.startIndex, last.endIndex, kids)
 }
 
+/**
+ * 解析 `case WORD in ... esac` 语句，返回 case_statement 节点。
+ * 循环读取 case_item 分支，直至遇到 `esac` 关键字或 EOF 为止。
+ * 每个分支委托给 parseCaseItem 解析。
+ */
 function parseCase(P: ParseState, caseTok: Token): TsNode {
   const caseKw = leaf(P, 'case', caseTok)
   const kids: TsNode[] = [caseKw]
@@ -3347,17 +3524,23 @@ function parseCase(P: ParseState, caseTok: Token): TsNode {
   return mk(P, 'case_statement', caseKw.startIndex, last.endIndex, kids)
 }
 
+/**
+ * 解析单个 case 分支项（case_item），返回节点或 null（无模式时）。
+ * 结构：可选 `(` → 一或多个模式（`|` 分隔）→ `)` → 语句体 → `;;`/`;&`/`;;&` 终止符。
+ * tree-sitter 特性：后续备选项含多段时包裹为 concatenation，首段保留平铺形式。
+ * 空 body 且模式形如 extglob 操作符前缀时降级为普通 word 节点。
+ */
 function parseCaseItem(P: ParseState): TsNode | null {
   skipBlanks(P.L)
   const start = P.L.b
   const kids: TsNode[] = []
-  // Optional leading '(' before pattern — bash allows (pattern) syntax
+  // 可选的前置 '('（bash 允许 (pattern) 语法）
   if (peek(P.L) === '(') {
     const s = P.L.b
     advance(P.L)
     kids.push(mk(P, '(', s, P.L.b, []))
   }
-  // Pattern(s)
+  // 模式（可能多个）
   let isFirstAlt = true
   while (true) {
     skipBlanks(P.L)
@@ -3365,9 +3548,8 @@ function parseCaseItem(P: ParseState): TsNode | null {
     if (c === ')' || c === '') break
     const pats = parseCasePattern(P)
     if (pats.length === 0) break
-    // tree-sitter quirk: first alternative with quotes is inlined as flat
-    // siblings; subsequent alternatives are wrapped in (concatenation) with
-    // `word` instead of `extglob_pattern` for bare segments.
+    // tree-sitter 特性：第一个含引号的备选项以平铺兄弟节点形式内联；
+    // 后续备选项包裹在 (concatenation) 中，裸段使用 `word` 而非 `extglob_pattern`。
     if (!isFirstAlt && pats.length > 1) {
       const rewritten = pats.map(p =>
         p.type === 'extglob_pattern'
@@ -3384,7 +3566,7 @@ function parseCaseItem(P: ParseState): TsNode | null {
     }
     isFirstAlt = false
     skipBlanks(P.L)
-    // \<newline> line continuation between alternatives
+    // \<换行> 行续接（备选项之间）
     if (peek(P.L) === '\\' && peek(P.L, 1) === '\n') {
       advance(P.L)
       advance(P.L)
@@ -3394,7 +3576,7 @@ function parseCaseItem(P: ParseState): TsNode | null {
       const s = P.L.b
       advance(P.L)
       kids.push(mk(P, '|', s, P.L.b, []))
-      // \<newline> after | is also a line continuation
+      // \<换行> 在 | 之后同样为行续接
       if (peek(P.L) === '\\' && peek(P.L, 1) === '\n') {
         advance(P.L)
         advance(P.L)
@@ -3421,9 +3603,9 @@ function parseCaseItem(P: ParseState): TsNode | null {
     restoreLex(P.L, save)
   }
   if (kids.length === 0) return null
-  // tree-sitter quirk: case_item with EMPTY body and a single pattern matching
-  // extglob-operator-char-prefix (no actual glob metachars) downgrades to word.
-  // `-o) owner=$2 ;;` (has body) → extglob_pattern; `-g) ;;` (empty) → word.
+  // tree-sitter 特性：case_item 空 body 且单个模式匹配 extglob 操作符字符前缀
+  // （无实际 glob 元字符）时降级为 word。
+  // `-o) owner=$2 ;;`（有 body）→ extglob_pattern；`-g) ;;`（空）→ word。
   if (body.length === 0) {
     for (let i = 0; i < kids.length; i++) {
       const k = kids[i]!
@@ -3438,6 +3620,13 @@ function parseCaseItem(P: ParseState): TsNode | null {
   return mk(P, 'case_item', start, last.endIndex, kids)
 }
 
+/**
+ * 解析单个 case 模式，返回节点数组（可能为空）。
+ * 扫描至 `)` `|` 空白 或换行为止；遇到引号则跳过其内容（避免 `|` 误截断）。
+ * - 含引号但无 extglob 括号：委托给 parseCasePatternSegmented 按段分割；
+ * - 含 `$` 或 `[`（无 extglob 括号）：委托给 parseWord 获得 concatenation；
+ * - 其余：依据是否有 extglob 元字符决定节点类型（extglob_pattern 或 word）。
+ */
 function parseCasePattern(P: ParseState): TsNode[] {
   skipBlanks(P.L)
   const save = saveLex(P.L)
@@ -3450,16 +3639,15 @@ function parseCasePattern(P: ParseState): TsNode[] {
   while (P.L.i < P.L.len) {
     const c = peek(P.L)
     if (c === '\\' && P.L.i + 1 < P.L.len) {
-      // Escaped char — consume both (handles `bar\ baz` as single pattern)
-      // \<newline> is a line continuation; eat it but stay in pattern.
-      advance(P.L)
+    // 转义字符 — 同时消费两个字符（处理 `bar\ baz` 作为单一模式）
+    // \<换行> 为行续接；消费但继续扫描。
+    advance(P.L)
       advance(P.L)
       continue
     }
     if (c === '"' || c === "'") {
       hasQuote = true
-      // Skip past the quoted segment so its content (spaces, |, etc.) doesn't
-      // break the peek-ahead scan.
+      // 跳过引号段内容（空格、| 等），避免干扰前瞻扫描。
       advance(P.L)
       while (P.L.i < P.L.len && peek(P.L) !== c) {
         if (peek(P.L) === '\\' && P.L.i + 1 < P.L.len) advance(P.L)
@@ -3468,8 +3656,8 @@ function parseCasePattern(P: ParseState): TsNode[] {
       if (peek(P.L) === c) advance(P.L)
       continue
     }
-    // Paren counting: any ( inside pattern opens a scope; don't break at ) or |
-    // until balanced. Handles extglob *(a|b) and nested shapes *([0-9])([0-9]).
+    // 圆括号计数：模式中的任何 ( 开启一个作用域；在括号平衡前不在 ) 或 | 处断开。
+    // 处理 extglob *(a|b) 以及嵌套形态 *([0-9])([0-9])。
     if (c === '(') {
       parenDepth++
       advance(P.L)
@@ -3493,25 +3681,24 @@ function parseCasePattern(P: ParseState): TsNode[] {
   if (P.L.b === start) return []
   const text = P.src.slice(startI, P.L.i)
   const hasExtglobParen = /[*?+@!]\(/.test(text)
-  // Quoted segments in pattern: tree-sitter splits at quote boundaries into
-  // multiple sibling nodes. `*"foo"*` → (extglob_pattern)(string)(extglob_pattern).
-  // Re-scan with a segmenting pass.
+  // 模式中的引号段：tree-sitter 在引号边界处分割为多个兄弟节点。
+  // `*"foo"*` → (extglob_pattern)(string)(extglob_pattern)。使用分段扫描重新处理。
   if (hasQuote && !hasExtglobParen) {
     restoreLex(P.L, save)
     return parseCasePatternSegmented(P)
   }
-  // tree-sitter splits patterns with [ or $ into concatenation via word parsing
-  // UNLESS pattern has extglob parens (those override and emit extglob_pattern).
-  // `*.[1357]` → concat(word word number word); `${PN}.pot` → concat(expansion word);
-  // but `*([0-9])` → extglob_pattern (has extglob paren).
+  // tree-sitter 对含 [ 或 $ 的模式通过 word 解析分割为 concatenation，
+  // 除非模式含 extglob 圆括号（此时覆盖并发出 extglob_pattern）。
+  // `*.[1357]` → concat(word word number word)；`${PN}.pot` → concat(expansion word)；
+  // 但 `*([0-9])` → extglob_pattern（含 extglob 圆括号）。
   if (!hasExtglobParen && (hasDollar || hasBracketOutsideParen)) {
     restoreLex(P.L, save)
     const w = parseWord(P, 'arg')
     return w ? [w] : []
   }
-  // Patterns starting with extglob operator chars (+ - ? * @ !) followed by
-  // identifier chars are extglob_pattern per tree-sitter, even without parens
-  // or glob metachars. `-o)` → extglob_pattern; plain `foo)` → word.
+  // 以 extglob 操作符字符（+ - ? * @ !）加标识符字符开头的模式，
+  // 即使没有圆括号或 glob 元字符，tree-sitter 也视为 extglob_pattern。
+  // `-o)` → extglob_pattern；普通 `foo)` → word。
   const type =
     hasExtglobParen || /[*?]/.test(text) || /^[-+?*@!][a-zA-Z]/.test(text)
       ? 'extglob_pattern'
@@ -3519,9 +3706,15 @@ function parseCasePattern(P: ParseState): TsNode[] {
   return [mk(P, type, start, P.L.b, [])]
 }
 
-// Segmented scan for case patterns containing quotes: `*"foo"*` →
-// [extglob_pattern, string, extglob_pattern]. Bare segments → extglob_pattern
-// if they have */?, else word. Stops at ) | space tab newline outside quotes.
+// 含引号 case 模式的分段扫描：`*"foo"*` →
+// [extglob_pattern, string, extglob_pattern]。裸段若含 */? 则为 extglob_pattern，否则为 word。
+// 在引号外遇到 ) | 空格 制表符 换行 时停止。
+/**
+ * 对含引号的 case 模式进行分段扫描，返回子节点列表。
+ * `*"foo"*` → [extglob_pattern, string, extglob_pattern]。
+ * 裸文本段依据是否含 `*`/`?` 决定类型；`"..."` 委托给 parseDoubleQuoted，`'...'` 作为 raw_string。
+ * 在引号外遇到 `)` `|` 空白 换行时停止。
+ */
 function parseCasePatternSegmented(P: ParseState): TsNode[] {
   const parts: TsNode[] = []
   let segStart = P.L.b
@@ -3562,6 +3755,12 @@ function parseCasePatternSegmented(P: ParseState): TsNode[] {
   return parts
 }
 
+/**
+ * 解析 `function NAME [()]` 函数定义，返回 function_definition 节点。
+ * 可选的 `()` 括号对被消费为子节点；函数体由 parseCommand 解析。
+ * tree-sitter 特性：若函数体为 `redirected_statement(compound_statement, ...)` 形式，
+ * 其重定向子节点会被提升（hoist）到 function_definition 顶层。
+ */
 function parseFunction(P: ParseState, fnTok: Token): TsNode {
   const fnKw = leaf(P, 'function', fnTok)
   skipBlanks(P.L)
@@ -3579,8 +3778,8 @@ function parseFunction(P: ParseState, fnTok: Token): TsNode {
   skipNewlines(P)
   const body = parseCommand(P)
   if (body) {
-    // Hoist redirects from redirected_statement(compound_statement, ...) to
-    // function_definition level per tree-sitter grammar
+    // 将重定向从 redirected_statement(compound_statement, ...) 提升至
+    // function_definition 层级（按 tree-sitter 语法规则）
     if (
       body.type === 'redirected_statement' &&
       body.children.length >= 2 &&
@@ -3595,6 +3794,12 @@ function parseFunction(P: ParseState, fnTok: Token): TsNode {
   return mk(P, 'function_definition', fnKw.startIndex, last.endIndex, kids)
 }
 
+/**
+ * 解析声明命令（`local`/`declare`/`export`/`readonly`/`typeset` 等），
+ * 返回 declaration_command 节点。
+ * 循环消费赋值表达式、引号字符串、标志参数（`-a`）或裸变量名，
+ * 直至遇到命令终止符为止。
+ */
 function parseDeclaration(P: ParseState, kwTok: Token): TsNode {
   const kw = leaf(P, kwTok.value, kwTok)
   const kids: TsNode[] = [kw]
@@ -3618,7 +3823,7 @@ function parseDeclaration(P: ParseState, kwTok: Token): TsNode {
       kids.push(a)
       continue
     }
-    // Quoted string or concatenation: `export "FOO=bar"`, `export 'X'`
+    // 引号字符串或拼接：`export "FOO=bar"`、`export 'X'`
     if (c === '"' || c === "'" || c === '$') {
       const w = parseWord(P, 'arg')
       if (w) {
@@ -3627,7 +3832,7 @@ function parseDeclaration(P: ParseState, kwTok: Token): TsNode {
       }
       break
     }
-    // Flag like -a or bare variable name
+    // 标志（如 -a）或裸变量名
     const save = saveLex(P.L)
     const tok = nextToken(P.L, 'arg')
     if (tok.type === 'WORD' || tok.type === 'NUMBER') {
@@ -3647,6 +3852,13 @@ function parseDeclaration(P: ParseState, kwTok: Token): TsNode {
   return mk(P, 'declaration_command', kw.startIndex, last.endIndex, kids)
 }
 
+/**
+ * 解析 `unset`/`unsetenv` 命令，返回 unset_command 节点。
+ * 安全性：使用 parseWord（而非裸 nextToken）解析参数，
+ * 确保 `unset 'a[$(id)]'` 中的引号字符串以 raw_string 节点呈现，
+ * 从而让安全检查器能够拒绝算术下标代码执行向量。
+ * `-f`/`-v` 等标志作为 word 节点保留；裸变量名升级为 variable_name 节点。
+ */
 function parseUnset(P: ParseState, kwTok: Token): TsNode {
   const kw = leaf(P, 'unset', kwTok)
   const kids: TsNode[] = [kw]
@@ -3665,10 +3877,10 @@ function parseUnset(P: ParseState, kwTok: Token): TsNode {
     ) {
       break
     }
-    // SECURITY: use parseWord (not raw nextToken) so quoted strings like
-    // `unset 'a[$(id)]'` emit a raw_string child that ast.ts can reject.
-    // Previously `break` silently dropped non-WORD args — hiding the
-    // arithmetic-subscript code-exec vector from the security walker.
+    // 安全：使用 parseWord（而非原始 nextToken），确保 `unset 'a[$(id)]'` 这类
+    // 引号字符串以 raw_string 子节点形式发出，使 ast.ts 能够拒绝。
+    // 此前 `break` 会静默丢弃非 WORD 参数，从而对安全遍历器隐藏
+    // 算术下标代码执行漏洞。
     const arg = parseWord(P, 'arg')
     if (!arg) break
     if (arg.type === 'word') {
@@ -3685,6 +3897,11 @@ function parseUnset(P: ParseState, kwTok: Token): TsNode {
   return mk(P, 'unset_command', kw.startIndex, last.endIndex, kids)
 }
 
+/**
+ * 尝试消费指定名称的关键字 token，若成功则追加到 kids 数组。
+ * 跳过换行后读取下一个 token；若不匹配则回溯，不修改 kids。
+ * 用于消费 `then`/`do`/`done`/`fi`/`in` 等控制结构关键字。
+ */
 function consumeKeyword(P: ParseState, name: string, kids: TsNode[]): void {
   skipNewlines(P)
   const save = saveLex(P.L)
@@ -3698,10 +3915,17 @@ function consumeKeyword(P: ParseState, name: string, kids: TsNode[]): void {
 
 // ───────────────────── Test & Arithmetic Expressions ─────────────────────
 
+/**
+ * 解析测试表达式（`[[ ... ]]` 或 `[ ... ]` 内部），
+ * 委托给 parseTestOr 作为顶层入口。
+ */
 function parseTestExpr(P: ParseState, closer: string): TsNode | null {
   return parseTestOr(P, closer)
 }
 
+/**
+ * 解析测试 `||` 或运算层，返回 binary_expression 或委托给 parseTestAnd。
+ */
 function parseTestOr(P: ParseState, closer: string): TsNode | null {
   let left = parseTestAnd(P, closer)
   if (!left) return null
@@ -3730,6 +3954,9 @@ function parseTestOr(P: ParseState, closer: string): TsNode | null {
   return left
 }
 
+/**
+ * 解析测试 `&&` 与运算层，返回 binary_expression 或委托给 parseTestUnary。
+ */
 function parseTestAnd(P: ParseState, closer: string): TsNode | null {
   let left = parseTestUnary(P, closer)
   if (!left) return null
@@ -3754,6 +3981,11 @@ function parseTestAnd(P: ParseState, closer: string): TsNode | null {
   return left
 }
 
+/**
+ * 解析测试一元表达式层。
+ * 处理括号分组 `(...)` → parenthesized_expression；
+ * 其余委托给 parseTestBinary 解析二元比较或可否定原子式。
+ */
 function parseTestUnary(P: ParseState, closer: string): TsNode | null {
   skipBlanks(P.L)
   const c = peek(P.L)
@@ -3784,9 +4016,9 @@ function parseTestUnary(P: ParseState, closer: string): TsNode | null {
 }
 
 /**
- * Parse `!`-negated or test-operator (`-f`) or parenthesized primary — but NOT
- * a binary comparison. Used as LHS of binary_expression so `! x =~ y` binds
- * `!` to `x` only, not the whole `x =~ y`.
+ * 解析 `!` 取反或测试操作符（`-f`）或带括号的主元 — 但不解析二元比较。
+ * 作为 binary_expression 的左侧使用，使 `! x =~ y` 中的 `!` 仅绑定 `x`，
+ * 而非整个 `x =~ y`。
  */
 function parseTestNegatablePrimary(
   P: ParseState,
@@ -3818,15 +4050,21 @@ function parseTestNegatablePrimary(
   return parseTestPrimary(P, closer)
 }
 
+/**
+ * 解析测试二元比较层，返回 binary_expression 或单侧原子节点。
+ * LHS 由 parseTestNegatablePrimary 解析；操作符包括 `==` `!=` `=~` `=` `<` `>` `-eq` 等。
+ * 在 `[[ ]]` 上下文中：`=~` RHS 解析为 regex；`=` RHS 解析为 regex；
+ * `==`/`!=` RHS 解析为 extglob_pattern 分段列表。
+ */
 function parseTestBinary(P: ParseState, closer: string): TsNode | null {
   skipBlanks(P.L)
-  // `!` in test context binds tighter than =~/==.
+  // `!` 在 test 上下文中比 =~/== 绑定更紧。
   // `[[ ! "x" =~ y ]]` → (binary_expression (unary_expression (string)) (regex))
   // `[[ ! -f x ]]` → (unary_expression ! (unary_expression (test_operator) (word)))
   const left = parseTestNegatablePrimary(P, closer)
   if (!left) return null
   skipBlanks(P.L)
-  // Binary comparison: == != =~ -eq -lt etc.
+  // 二元比较：== != =~ -eq -lt 等
   const c = peek(P.L)
   const c1 = peek(P.L, 1)
   let op: TsNode | null = null
@@ -3859,16 +4097,16 @@ function parseTestBinary(P: ParseState, closer: string): TsNode | null {
   }
   if (!op) return left
   skipBlanks(P.L)
-  // In [[ ]], RHS of ==/!=/=/=~ gets special pattern parsing: paren counting
-  // so @(a|b|c) doesn't break on |, and segments become extglob_pattern/regex.
+  // 在 [[ ]] 中，==/!=/=/=~ 的右侧使用特殊模式解析：
+  // 括号计数确保 @(a|b|c) 不在 | 处断开，各段成为 extglob_pattern/regex。
   if (closer === ']]') {
     const opText = op.type
     if (opText === '=~') {
       skipBlanks(P.L)
-      // If the ENTIRE RHS is a quoted string, emit string/raw_string not
-      // regex: `[[ "$x" =~ "$y" ]]` → (binary_expression (string) (string)).
-      // If there's content after the quote (`' boop '(.*)$`), the whole RHS
-      // stays a single (regex). Peek past the quote to check.
+      // 若整个 RHS 为引号字符串，发出 string/raw_string 而非 regex：
+      // `[[ "$x" =~ "$y" ]]` → (binary_expression (string) (string))。
+      // 若引号后还有内容（如 `' boop '(.*)$`），整个 RHS 保持为单个 (regex)。
+      // 向前窥探引号之后的内容以判断。
       const rc = peek(P.L)
       let rhs: TsNode | null = null
       if (rc === '"' || rc === "'") {
@@ -3877,7 +4115,7 @@ function parseTestBinary(P: ParseState, closer: string): TsNode | null {
           rc === '"'
             ? parseDoubleQuoted(P)
             : leaf(P, 'raw_string', nextToken(P.L, 'arg'))
-        // Check if RHS ends here: only whitespace then ]] or &&/|| or newline
+        // 检查 RHS 是否到此结束：后面只有空白，然后是 ]] 或 &&/|| 或换行
         let j = P.L.i
         while (j < P.L.len && (P.src[j] === ' ' || P.src[j] === '\t')) j++
         const nc = P.src[j] ?? ''
@@ -3902,7 +4140,7 @@ function parseTestBinary(P: ParseState, closer: string): TsNode | null {
         rhs,
       ])
     }
-    // Single `=` emits (regex) per tree-sitter; `==` and `!=` emit extglob_pattern
+    // 单个 `=` 按 tree-sitter 发出 (regex)；`==` 和 `!=` 发出 extglob_pattern
     if (opText === '=') {
       const rhs = parseTestRegexRhs(P)
       if (!rhs) return left
@@ -3932,8 +4170,13 @@ function parseTestBinary(P: ParseState, closer: string): TsNode | null {
   ])
 }
 
-// RHS of =~ in [[ ]] — scan as single (regex) node with paren/bracket counting
-// so | ( ) inside the regex don't break parsing. Stop at ]] or ws+&&/||.
+// [[ ]] 中 =~ 的右侧 — 以括号/方括号计数扫描为单个 (regex) 节点，
+// 使正则中的 | ( ) 不干扰解析。遇到 ]] 或 空白+&&/|| 时停止。
+/**
+ * 解析 `[[ ]]` 中 `=~` 的右侧，返回单个 regex 节点。
+ * 维护括号深度与方括号深度，确保正则内的 `|` `(` `)` 不被误识别为测试终止符。
+ * 遇到 `]]`、空白后跟 `&&`/`||` 或换行时停止扫描。
+ */
 function parseTestRegexRhs(P: ParseState): TsNode | null {
   skipBlanks(P.L)
   const start = P.L.b
@@ -3950,7 +4193,7 @@ function parseTestRegexRhs(P: ParseState): TsNode | null {
     if (parenDepth === 0 && bracketDepth === 0) {
       if (c === ']' && peek(P.L, 1) === ']') break
       if (c === ' ' || c === '\t') {
-        // Peek past blanks for ]] or &&/||
+        // 跳过空白，窥探 ]] 或 &&/||
         let j = P.L.i
         while (j < P.L.len && (P.L.src[j] === ' ' || P.L.src[j] === '\t')) j++
         const nc = P.L.src[j] ?? ''
@@ -3976,9 +4219,14 @@ function parseTestRegexRhs(P: ParseState): TsNode | null {
   return mk(P, 'regex', start, P.L.b, [])
 }
 
-// RHS of ==/!=/= in [[ ]] — returns array of parts. Bare text → extglob_pattern
-// (with paren counting for @(a|b)); $(...)/${}/quoted → proper node types.
-// Multiple parts become flat children of binary_expression per tree-sitter.
+// [[ ]] 中 ==/!=/= 的右侧 — 返回节点数组。裸文本 → extglob_pattern
+// （含括号计数以处理 @(a|b)）；$(...)/$/引号 → 对应节点类型。
+// 多个部分作为 binary_expression 的平铺子节点（按 tree-sitter 规则）。
+/**
+ * 解析 `[[ ]]` 中 `==`/`!=`/`=` 的右侧，返回节点数组。
+ * 裸文本段（含 extglob 括号计数）生成 extglob_pattern；`$`/引号生成对应节点类型。
+ * 多个部分作为 binary_expression 的平铺子节点存在（tree-sitter 规则）。
+ */
 function parseTestExtglobRhs(P: ParseState): TsNode[] {
   skipBlanks(P.L)
   const parts: TsNode[] = []
@@ -3988,7 +4236,7 @@ function parseTestExtglobRhs(P: ParseState): TsNode[] {
   const flushSeg = () => {
     if (P.L.i > segStartI) {
       const text = P.src.slice(segStartI, P.L.i)
-      // Pure number stays number; everything else is extglob_pattern
+      // 纯数字保持为 number；其他一律为 extglob_pattern
       const type = /^\d+$/.test(text) ? 'number' : 'extglob_pattern'
       parts.push(mk(P, type, segStart, P.L.b, []))
     }
@@ -4019,8 +4267,8 @@ function parseTestExtglobRhs(P: ParseState): TsNode[] {
         continue
       }
     }
-    // $ " ' must be parsed even inside @( ) extglob parens — parseDollarLike
-    // consumes matching ) so parenDepth stays consistent.
+    // $ " ' 即使在 @( ) extglob 括号内也必须解析 — parseDollarLike
+    // 会消费对应的 )，从而保持 parenDepth 一致性。
     if (c === '$') {
       const c1 = peek(P.L, 1)
       if (
@@ -4060,23 +4308,27 @@ function parseTestExtglobRhs(P: ParseState): TsNode[] {
   return parts
 }
 
+/**
+ * 解析测试原子项（primary）：检查 closer 边界后委托给 parseWord 获取单个词节点。
+ * `closer=']]'` 时在双方括号前停止；`closer=']'` 时在单方括号前停止。
+ */
 function parseTestPrimary(P: ParseState, closer: string): TsNode | null {
   skipBlanks(P.L)
-  // Stop at closer
+  // 在 closer 处停止
   if (closer === ']' && peek(P.L) === ']') return null
   if (closer === ']]' && peek(P.L) === ']' && peek(P.L, 1) === ']') return null
   return parseWord(P, 'arg')
 }
 
 /**
- * Arithmetic context modes:
- * - 'var': bare identifiers → variable_name (default, used in $((..)), ((..)))
- * - 'word': bare identifiers → word (c-style for head condition/update clauses)
- * - 'assign': identifiers with = → variable_assignment (c-style for init clause)
+ * 算术上下文模式：
+ * - 'var'：裸标识符 → variable_name（默认，用于 $((..))/((..))）
+ * - 'word'：裸标识符 → word（C 风格 for 循环头的条件/更新子句）
+ * - 'assign'：含 = 的标识符 → variable_assignment（C 风格 for 循环的 init 子句）
  */
 type ArithMode = 'var' | 'word' | 'assign'
 
-/** Operator precedence table (higher = tighter binding). */
+/** 操作符优先级表（值越大绑定越紧）。 */
 const ARITH_PREC: Record<string, number> = {
   '=': 2,
   '+=': 2,
@@ -4110,7 +4362,7 @@ const ARITH_PREC: Record<string, number> = {
   '**': 14,
 }
 
-/** Right-associative operators (assignment and exponent). */
+/** 右结合操作符（赋值与幂运算）。 */
 const ARITH_RIGHT_ASSOC = new Set([
   '=',
   '+=',
@@ -4126,6 +4378,11 @@ const ARITH_RIGHT_ASSOC = new Set([
   '**',
 ])
 
+/**
+ * 解析算术表达式顶层入口，委托给 parseArithTernary。
+ * `stop` 指定终止字符串（`))` `}` `)` `;` `:` `]` `:}` 等）；
+ * `mode` 控制裸标识符解析为 variable_name（var）或 word（word/assign）。
+ */
 function parseArithExpr(
   P: ParseState,
   stop: string,
@@ -4134,7 +4391,7 @@ function parseArithExpr(
   return parseArithTernary(P, stop, mode)
 }
 
-/** Top-level: comma-separated list. arithmetic_expansion emits multiple children. */
+/** 顶层：逗号分隔列表。arithmetic_expansion 发出多个子节点。 */
 function parseArithCommaList(
   P: ParseState,
   stop: string,
@@ -4154,6 +4411,10 @@ function parseArithCommaList(
   return out
 }
 
+/**
+ * 解析算术三元表达式 `cond ? true : false`，返回 ternary_expression 节点或传递给 parseArithBinary。
+ * `?` 和 `:` 分别作为独立叶节点；缺少 `:` 时以零长度节点占位。
+ */
 function parseArithTernary(
   P: ParseState,
   stop: string,
@@ -4187,15 +4448,15 @@ function parseArithTernary(
   return cond
 }
 
-/** Scan next arithmetic binary operator; returns [text, length] or null. */
+/** 扫描下一个算术二元操作符；返回 [文本, 长度] 或 null。 */
 function scanArithOp(P: ParseState): [string, number] | null {
   const c = peek(P.L)
   const c1 = peek(P.L, 1)
   const c2 = peek(P.L, 2)
-  // 3-char: <<= >>=
+  // 三字符操作符：<<= >>=
   if (c === '<' && c1 === '<' && c2 === '=') return ['<<=', 3]
   if (c === '>' && c1 === '>' && c2 === '=') return ['>>=', 3]
-  // 2-char
+  // 双字符操作符
   if (c === '*' && c1 === '*') return ['**', 2]
   if (c === '<' && c1 === '<') return ['<<', 2]
   if (c === '>' && c1 === '>') return ['>>', 2]
@@ -4213,7 +4474,7 @@ function scanArithOp(P: ParseState): [string, number] | null {
   if (c === '&' && c1 === '=') return ['&=', 2]
   if (c === '^' && c1 === '=') return ['^=', 2]
   if (c === '|' && c1 === '=') return ['|=', 2]
-  // 1-char — but NOT ++ -- (those are pre/postfix)
+  // 单字符操作符 — 但不含 ++ --（它们是前/后缀操作符）
   if (c === '+' && c1 !== '+') return ['+', 1]
   if (c === '-' && c1 !== '-') return ['-', 1]
   if (c === '*') return ['*', 1]
@@ -4228,7 +4489,7 @@ function scanArithOp(P: ParseState): [string, number] | null {
   return null
 }
 
-/** Precedence-climbing binary expression parser. */
+/** 优先级爬升二元表达式解析器。 */
 function parseArithBinary(
   P: ParseState,
   stop: string,
@@ -4261,6 +4522,11 @@ function parseArithBinary(
   return left
 }
 
+/**
+ * 解析算术一元表达式层：前缀 `++`/`--`、`-`/`+`/`!`/`~` 操作符。
+ * `word`/`assign` 模式下 `-N`（负数字面量）不产生 unary_expression，直接作为 number 节点。
+ * 无一元操作符时委托给 parseArithPostfix。
+ */
 function parseArithUnary(
   P: ParseState,
   stop: string,
@@ -4270,7 +4536,7 @@ function parseArithUnary(
   if (isArithStop(P, stop)) return null
   const c = peek(P.L)
   const c1 = peek(P.L, 1)
-  // Prefix ++ --
+  // 前缀 ++ --
   if ((c === '+' && c1 === '+') || (c === '-' && c1 === '-')) {
     const s = P.L.b
     advance(P.L)
@@ -4281,8 +4547,8 @@ function parseArithUnary(
     return mk(P, 'unary_expression', op.startIndex, inner.endIndex, [op, inner])
   }
   if (c === '-' || c === '+' || c === '!' || c === '~') {
-    // In 'word'/'assign' mode (c-style for head), `-N` is a single number
-    // literal per tree-sitter, not unary_expression. 'var' mode uses unary.
+    // 在 'word'/'assign' 模式（C 风格 for 循环头）中，`-N` 是单个数字字面量，
+    // 而非 unary_expression（tree-sitter 规则）。'var' 模式使用 unary。
     if (mode !== 'var' && c === '-' && isDigit(c1)) {
       const s = P.L.b
       advance(P.L)
@@ -4299,6 +4565,10 @@ function parseArithUnary(
   return parseArithPostfix(P, stop, mode)
 }
 
+/**
+ * 解析算术后缀表达式层：后缀 `++`/`--` 操作符。
+ * 先尝试解析 primary；若其后紧跟 `++`/`--` 则包装为 postfix_expression。
+ */
 function parseArithPostfix(
   P: ParseState,
   stop: string,
@@ -4318,6 +4588,13 @@ function parseArithPostfix(
   return prim
 }
 
+/**
+ * 解析算术原子项（primary）：括号表达式、双引号字符串、`$` 展开、数字字面量、标识符。
+ * - 括号 `(...)` → parenthesized_expression（支持逗号列表）
+ * - 数字：支持十进制、十六进制（`0x`）、Base#Digits 记法
+ * - 标识符：`assign` 模式下若后跟 `=` 则生成 variable_assignment；
+ *   后跟 `[` 则生成 subscript；其余依 mode 生成 variable_name 或 word
+ */
 function parseArithPrimary(
   P: ParseState,
   stop: string,
@@ -4330,7 +4607,7 @@ function parseArithPrimary(
     const s = P.L.b
     advance(P.L)
     const open = mk(P, '(', s, P.L.b, [])
-    // Parenthesized expression may contain comma-separated exprs
+    // 带括号表达式可包含逗号分隔的多个表达式
     const inners = parseArithCommaList(P, ')', mode)
     skipBlanks(P.L)
     let close: TsNode
@@ -4356,7 +4633,7 @@ function parseArithPrimary(
   if (isDigit(c)) {
     const s = P.L.b
     while (isDigit(peek(P.L))) advance(P.L)
-    // Hex: 0x1f
+    // 十六进制：0x1f
     if (
       P.L.b - s === 1 &&
       c === '0' &&
@@ -4365,7 +4642,7 @@ function parseArithPrimary(
       advance(P.L)
       while (isHexDigit(peek(P.L))) advance(P.L)
     }
-    // Base notation: BASE#DIGITS e.g. 2#1010, 16#ff
+    // 基数表示法：BASE#DIGITS，如 2#1010、16#ff
     else if (peek(P.L) === '#') {
       advance(P.L)
       while (isBaseDigit(peek(P.L))) advance(P.L)
@@ -4376,9 +4653,8 @@ function parseArithPrimary(
     const s = P.L.b
     while (isIdentChar(peek(P.L))) advance(P.L)
     const nc = peek(P.L)
-    // Assignment in 'assign' mode (c-style for init): emit variable_assignment
-    // so chained `a = b = c = 1` nests correctly. Other modes treat `=` as a
-    // binary_expression operator via the precedence table.
+    // 'assign' 模式下的赋值（C 风格 for 循环 init 子句）：发出 variable_assignment，
+    // 使链式 `a = b = c = 1` 正确嵌套。其他模式通过优先级表将 `=` 视为 binary_expression 操作符。
     if (mode === 'assign') {
       skipBlanks(P.L)
       const ac = peek(P.L)
@@ -4388,14 +4664,14 @@ function parseArithPrimary(
         const es = P.L.b
         advance(P.L)
         const eq = mk(P, '=', es, P.L.b, [])
-        // RHS may itself be another assignment (chained)
+        // RHS 本身也可能是赋值（链式赋值）
         const val = parseArithTernary(P, stop, mode)
         const end = val ? val.endIndex : eq.endIndex
         const kids = val ? [vn, eq, val] : [vn, eq]
         return mk(P, 'variable_assignment', s, end, kids)
       }
     }
-    // Subscript
+    // 下标访问
     if (nc === '[') {
       const vn = mk(P, 'variable_name', s, P.L.b, [])
       const brS = P.L.b
@@ -4414,15 +4690,20 @@ function parseArithPrimary(
       const kids = idx ? [vn, brOpen, idx, brClose] : [vn, brOpen, brClose]
       return mk(P, 'subscript', s, brClose.endIndex, kids)
     }
-    // Bare identifier: variable_name in 'var' mode, word in 'word'/'assign' mode.
-    // 'assign' mode falls through to word when no `=` follows (c-style for
-    // cond/update clauses: `c<=5` → binary_expression(word, number)).
+    // 裸标识符：'var' 模式 → variable_name，'word'/'assign' 模式 → word。
+    // 'assign' 模式在没有 `=` 跟随时降级为 word（C 风格 for 的条件/更新子句：
+    // `c<=5` → binary_expression(word, number)）。
     const identType = mode === 'var' ? 'variable_name' : 'word'
     return mk(P, identType, s, P.L.b, [])
   }
   return null
 }
 
+/**
+ * 判断当前位置是否为算术表达式的终止边界。
+ * 根据 `stop` 字符串匹配对应的终止字符：
+ * `))` `)` `;` `:` `]` `}` `:}`（`:`或`}`均可）以及 EOF / 换行。
+ */
 function isArithStop(P: ParseState, stop: string): boolean {
   const c = peek(P.L)
   if (stop === '))') return c === ')' && peek(P.L, 1) === ')'

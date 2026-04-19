@@ -1,16 +1,17 @@
 /**
- * Config/settings-backed NODE_EXTRA_CA_CERTS population for `caCerts.ts`.
+ * 基于配置文件的 NODE_EXTRA_CA_CERTS 填充模块。
  *
- * Split from `caCerts.ts` because `config.ts` → `file.ts` →
- * `permissions/filesystem.ts` → `commands.ts` transitively pulls in ~5300
- * modules (REPL, React, every slash command). `proxy.ts`/`mtls.ts` (and
- * therefore anything using HTTPS through our proxy agent — WebSocketTransport,
- * CCRClient, telemetry) must NOT depend on that graph, or the Agent SDK
- * bundle (`connectRemoteControl` path) bloats from ~0.4 MB to ~10.8 MB.
+ * 在 Claude Code 系统中，该模块在 CLI 启动时将 settings.json 中配置的
+ * NODE_EXTRA_CA_CERTS 路径写入 process.env，供 caCerts.ts 在 TLS 握手前读取。
  *
- * `getCACertificates()` only reads `process.env.NODE_EXTRA_CA_CERTS`. This
- * module is the one place allowed to import `config.ts` to *populate* that
- * env var at CLI startup. Only `init.ts` imports this file.
+ * 从 caCerts.ts 拆分的原因：config.ts → file.ts → permissions/filesystem.ts → commands.ts
+ * 的传递依赖会引入约 5300 个模块（REPL、React、所有 slash 命令），
+ * 使 proxy.ts/mtls.ts 的 Agent SDK bundle 从约 0.4 MB 膨胀到约 10.8 MB。
+ * 该模块是唯一允许导入 config.ts 的地方，且仅由 init.ts 导入。
+ *
+ * - applyExtraCACertsFromConfig()：在 init 阶段尽早调用，将配置文件中的路径写入 process.env
+ * - getExtraCertsPathFromConfig()（内部）：从 ~/.claude.json 和 ~/.claude/settings.json 读取路径，
+ *   仅读取用户可控文件，避免恶意项目在信任弹窗前注入 CA 证书
  */
 
 import { getGlobalConfig } from './config.js'

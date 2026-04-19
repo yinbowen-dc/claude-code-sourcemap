@@ -1,3 +1,16 @@
+/**
+ * FileEditPermissionRequest/FileEditPermissionRequest.tsx
+ *
+ * 【在 Claude Code 权限系统中的位置】
+ * 本文件是 FileEdit 工具（str_replace_editor）的专用权限请求组件。
+ * 当 Claude 调用 FileEdit 工具对文件进行字符串替换编辑时，权限系统渲染本组件，
+ * 向用户展示 diff 视图并请求确认。
+ *
+ * 【主要功能】
+ * - 定义 ideDiffSupport：支持在 IDE 中展示和应用 diff 的配置对象
+ * - FileEditPermissionRequest：解析输入并渲染文件编辑权限确认对话框
+ * - _temp：React Compiler 提取的 parseInput 辅助函数
+ */
 import { c as _c } from "react/compiler-runtime";
 import { basename, relative } from 'path';
 import React from 'react';
@@ -9,12 +22,23 @@ import { FileEditTool } from '../../../tools/FileEditTool/FileEditTool.js';
 import { FilePermissionDialog } from '../FilePermissionDialog/FilePermissionDialog.js';
 import { createSingleEditDiffConfig, type FileEdit, type IDEDiffSupport } from '../FilePermissionDialog/ideDiffConfig.js';
 import type { PermissionRequestProps } from '../PermissionRequest.js';
+
+// FileEdit 工具输入类型（从 Zod schema 推断）
 type FileEditInput = z.infer<typeof FileEditTool.inputSchema>;
+
+/**
+ * ideDiffSupport — IDE diff 集成配置
+ *
+ * 【功能说明】
+ * - getConfig：根据 file_path / old_string / new_string / replace_all 生成单编辑 diff 配置
+ * - applyChanges：将 IDE 中用户修改后的 diff 内容应用回工具输入（取第一条编辑）
+ */
 const ideDiffSupport: IDEDiffSupport<FileEditInput> = {
   getConfig: (input: FileEditInput) => createSingleEditDiffConfig(input.file_path, input.old_string, input.new_string, input.replace_all),
   applyChanges: (input: FileEditInput, modifiedEdits: FileEdit[]) => {
     const firstEdit = modifiedEdits[0];
     if (firstEdit) {
+      // 将 IDE 修改后的字符串更新回 input 对象
       return {
         ...input,
         old_string: firstEdit.old_string,
@@ -22,9 +46,21 @@ const ideDiffSupport: IDEDiffSupport<FileEditInput> = {
         replace_all: firstEdit.replace_all
       };
     }
+    // 无修改时原样返回
     return input;
   }
 };
+
+/**
+ * FileEditPermissionRequest — 文件编辑权限请求组件
+ *
+ * 【执行流程】
+ * 1. 用 parseInput（FileEditTool.inputSchema.parse）解析 toolUseConfirm.input
+ * 2. 提取 file_path / old_string / new_string / replace_all
+ * 3. 构建问题文本：询问用户是否对指定文件进行此编辑
+ * 4. 渲染 FileEditToolDiff 展示 diff 视图
+ * 5. 将所有内容传入 FilePermissionDialog（completionType = "str_replace_single"）
+ */
 export function FileEditPermissionRequest(props) {
   const $ = _c(51);
   const parseInput = _temp;
@@ -176,6 +212,7 @@ export function FileEditPermissionRequest(props) {
   }
   return t16;
 }
+// React Compiler 提取的辅助函数：用 FileEditTool schema 解析并验证输入
 function _temp(input) {
   return FileEditTool.inputSchema.parse(input);
 }

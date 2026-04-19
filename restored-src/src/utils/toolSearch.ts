@@ -1,9 +1,17 @@
 /**
- * Tool Search utilities for dynamically discovering deferred tools.
+ * 工具搜索（Tool Search）核心工具模块
  *
- * When enabled, deferred tools (MCP and shouldDefer tools) are sent with
- * defer_loading: true and discovered via ToolSearchTool rather than being
- * loaded upfront.
+ * 在 Claude Code 系统流程中的位置：
+ * 本模块是工具动态加载机制的控制中枢，位于 API 请求构建层与 MCP 工具管理层之间。
+ * 每次 API 请求前，系统会调用 isToolSearchEnabled() 决定是否将 MCP 工具及
+ * shouldDefer 工具以"延迟加载"（defer_loading: true）方式发送，而非全量内联。
+ *
+ * 主要功能：
+ * - 根据环境变量 ENABLE_TOOL_SEARCH 与 GrowthBook 特性标志确定工具搜索模式
+ * - 支持三种模式：'tst'（始终延迟）、'tst-auto'（超过阈值才延迟）、'standard'（全量内联）
+ * - 通过 token 数量（或字符数回退）判断是否超过自动启用阈值
+ * - 从历史消息中提取已发现的 tool_reference 工具名，供后续 API 请求使用
+ * - 维护"延迟工具池变更差异"（DeferredToolsDelta）用于渐进式广播
  */
 
 import memoize from 'lodash-es/memoize.js'
@@ -42,22 +50,32 @@ import { jsonStringify } from './slowOperations.js'
 import { zodToJsonSchema } from './zodToJsonSchema.js'
 
 /**
- * Default percentage of context window at which to auto-enable tool search.
- * When MCP tool descriptions exceed this percentage (in tokens), tool search is enabled.
- * Can be overridden via ENABLE_TOOL_SEARCH=auto:N where N is 0-100.
+ * 自动启用工具搜索的默认上下文窗口占比（百分比）。
+ * 当 MCP 工具描述的 token 数量超过上下文窗口的此百分比时，自动开启工具搜索。
+ * 可通过 ENABLE_TOOL_SEARCH=auto:N 覆盖（N 为 0-100 的整数）。
  */
-const DEFAULT_AUTO_TOOL_SEARCH_PERCENTAGE = 10 // 10%
+const DEFAULT_AUTO_TOOL_SEARCH_PERCENTAGE = 10 // 默认 10%
 
 /**
- * Parse auto:N syntax from ENABLE_TOOL_SEARCH env var.
- * Returns the percentage clamped to 0-100, or null if not auto:N format or not a number.
+ * 解析 ENABLE_TOOL_SEARCH 环境变量中的 auto:N 语法。
+ *
+ * 流程：
+ * 1. 检查字符串是否以 "auto:" 开头
+ * 2. 解析后缀数字，非法时打印调试日志并返回 null
+ * 3. 将结果钳制到 [0, 100] 区间后返回
+ *
+ * @param value ENABLE_TOOL_SEARCH 环境变量的字符串值
+ * @returns 合法范围内的百分比数字，或 null（非 auto:N 格式/无效数字）
  */
 function parseAutoPercentage(value: string): number | null {
+  // 仅处理以 "auto:" 开头的格式
   if (!value.startsWith('auto:')) return null
 
+  // 截取冒号后的数字部分
   const percentStr = value.slice(5)
   const percent = parseInt(percentStr, 10)
 
+  // 数字无效时输出调试日志
   if (isNaN(percent)) {
     logForDebugging(
       `Invalid ENABLE_TOOL_SEARCH value "${value}": expected auto:N where N is a number.`,
@@ -65,41 +83,61 @@ function parseAutoPercentage(value: string): number | null {
     return null
   }
 
-  // Clamp to valid range
+  // 钳制到合法范围 [0, 100]
   return Math.max(0, Math.min(100, percent))
 }
 
 /**
- * Check if ENABLE_TOOL_SEARCH is set to auto mode (auto or auto:N).
+ * 检查 ENABLE_TOOL_SEARCH 是否设置为自动模式（"auto" 或 "auto:N"）。
+ *
+ * @param value 环境变量字符串，可为 undefined
+ * @returns 是否为自动模式
  */
 function isAutoToolSearchMode(value: string | undefined): boolean {
   if (!value) return false
+  // "auto" 或 "auto:N" 均为自动模式
   return value === 'auto' || value.startsWith('auto:')
 }
 
 /**
- * Get the auto-enable percentage from env var or default.
+ * 从环境变量或默认值中获取自动启用工具搜索的百分比阈值。
+ *
+ * 流程：
+ * 1. 若未设置环境变量，返回默认值 10
+ * 2. 若值为 "auto"，返回默认值 10
+ * 3. 尝试解析 "auto:N" 格式，成功则返回解析值
+ * 4. 其他情况均返回默认值
+ *
+ * @returns 百分比数字（0-100）
  */
 function getAutoToolSearchPercentage(): number {
   const value = process.env.ENABLE_TOOL_SEARCH
   if (!value) return DEFAULT_AUTO_TOOL_SEARCH_PERCENTAGE
 
+  // 纯 "auto" 时使用默认百分比
   if (value === 'auto') return DEFAULT_AUTO_TOOL_SEARCH_PERCENTAGE
 
+  // 尝试解析 "auto:N" 格式
   const parsed = parseAutoPercentage(value)
   if (parsed !== null) return parsed
 
+  // 兜底返回默认值
   return DEFAULT_AUTO_TOOL_SEARCH_PERCENTAGE
 }
 
 /**
- * Approximate chars per token for MCP tool definitions (name + description + input schema).
- * Used as fallback when the token counting API is unavailable.
+ * 字符数与 token 数的近似换算比例（MCP 工具名+描述+输入 schema）。
+ * 在 token 计数 API 不可用时作为字符数回退启发式估算。
  */
 const CHARS_PER_TOKEN = 2.5
 
 /**
- * Get the token threshold for auto-enabling tool search for a given model.
+ * 获取指定模型的自动启用工具搜索 token 阈值。
+ *
+ * 流程：合并模型 beta → 查询上下文窗口大小 → 乘以百分比 → 向下取整
+ *
+ * @param model 模型名称
+ * @returns token 数阈值
  */
 function getAutoToolSearchTokenThreshold(model: string): number {
   const betas = getMergedBetas(model)
@@ -109,17 +147,27 @@ function getAutoToolSearchTokenThreshold(model: string): number {
 }
 
 /**
- * Get the character threshold for auto-enabling tool search for a given model.
- * Used as fallback when the token counting API is unavailable.
+ * 获取指定模型的自动启用工具搜索字符数阈值（token API 不可用时的回退）。
+ *
+ * @param model 模型名称
+ * @returns 字符数阈值
  */
 export function getAutoToolSearchCharThreshold(model: string): number {
+  // 将 token 阈值换算为字符数
   return Math.floor(getAutoToolSearchTokenThreshold(model) * CHARS_PER_TOKEN)
 }
 
 /**
- * Get the total token count for all deferred tools using the token counting API.
- * Memoized by deferred tool names — cache is invalidated when MCP servers connect/disconnect.
- * Returns null if the API is unavailable (caller should fall back to char heuristic).
+ * 通过 token 计数 API 获取所有延迟工具的总 token 数量。
+ * 以延迟工具名称列表为 memoize 键，MCP 服务器连接/断开时缓存失效。
+ * API 不可用时返回 null，调用方应回退到字符数启发式估算。
+ *
+ * 流程：
+ * 1. 过滤出所有延迟工具
+ * 2. 无延迟工具时直接返回 0
+ * 3. 调用 countToolDefinitionTokens() 计算总 token 数
+ * 4. API 返回 0 视为不可用，返回 null
+ * 5. 减去固定开销后返回（最小为 0）
  */
 const getDeferredToolTokenCount = memoize(
   async (
@@ -128,6 +176,7 @@ const getDeferredToolTokenCount = memoize(
     agents: AgentDefinition[],
     model: string,
   ): Promise<number | null> => {
+    // 仅统计被标记为延迟加载的工具
     const deferredTools = tools.filter(t => isDeferredTool(t))
     if (deferredTools.length === 0) return 0
 
@@ -138,12 +187,16 @@ const getDeferredToolTokenCount = memoize(
         { activeAgents: agents, allAgents: agents },
         model,
       )
-      if (total === 0) return null // API unavailable
+      // API 返回 0 表示不可用，退化为字符数估算
+      if (total === 0) return null
+      // 减去固定的工具定义开销，结果不小于 0
       return Math.max(0, total - TOOL_TOKEN_COUNT_OVERHEAD)
     } catch {
-      return null // Fall back to char heuristic
+      // 任何异常均视为 API 不可用
+      return null
     }
   },
+  // memoize 键：以延迟工具名称逗号拼接字符串
   (tools: Tools) =>
     tools
       .filter(t => isDeferredTool(t))
@@ -152,124 +205,138 @@ const getDeferredToolTokenCount = memoize(
 )
 
 /**
- * Tool search mode. Determines how deferrable tools (MCP + shouldDefer) are
- * surfaced:
- *   - 'tst': Tool Search Tool — deferred tools discovered via ToolSearchTool (always enabled)
- *   - 'tst-auto': auto — tools deferred only when they exceed threshold
- *   - 'standard': tool search disabled — all tools exposed inline
+ * 工具搜索模式类型。决定可延迟工具（MCP + shouldDefer）的暴露方式：
+ *   - 'tst'      : 始终延迟 — 所有延迟工具通过 ToolSearchTool 动态发现
+ *   - 'tst-auto' : 自动延迟 — 延迟工具描述超过阈值时才开启
+ *   - 'standard' : 关闭工具搜索 — 所有工具内联在请求中
  */
 export type ToolSearchMode = 'tst' | 'tst-auto' | 'standard'
 
 /**
- * Determines the tool search mode from ENABLE_TOOL_SEARCH.
+ * 根据 ENABLE_TOOL_SEARCH 环境变量确定工具搜索模式。
  *
- *   ENABLE_TOOL_SEARCH    Mode
+ * 映射关系：
+ *   ENABLE_TOOL_SEARCH    模式
  *   auto / auto:1-99      tst-auto
  *   true / auto:0         tst
  *   false / auto:100      standard
- *   (unset)               tst (default: always defer MCP and shouldDefer tools)
+ *   （未设置）             tst（默认始终延迟 MCP 和 shouldDefer 工具）
+ *
+ * 流程：
+ * 1. 若设置了 CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS 终止开关，强制返回 'standard'
+ * 2. 解析 auto:N 边界情况：auto:0 → 'tst'，auto:100 → 'standard'
+ * 3. 检测 auto 或 auto:N 模式返回 'tst-auto'
+ * 4. 明确为真值 → 'tst'，明确为假值 → 'standard'
+ * 5. 未设置时默认 'tst'
+ *
+ * @returns 当前应使用的工具搜索模式
  */
 export function getToolSearchMode(): ToolSearchMode {
-  // CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS is a kill switch for beta API
-  // features. Tool search emits defer_loading on tool definitions and
-  // tool_reference content blocks — both require the API to accept a beta
-  // header. When the kill switch is set, force 'standard' so no beta shapes
-  // reach the wire, even if ENABLE_TOOL_SEARCH is also set. This is the
-  // explicit escape hatch for proxy gateways that the heuristic in
-  // isToolSearchEnabledOptimistic doesn't cover.
-  // github.com/anthropics/claude-code/issues/20031
+  // 实验性 beta 特性总开关：proxy 网关不支持 beta 形状时使用此终止开关
   if (isEnvTruthy(process.env.CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS)) {
     return 'standard'
   }
 
   const value = process.env.ENABLE_TOOL_SEARCH
 
-  // Handle auto:N syntax - check edge cases first
+  // 处理 auto:N 的边界情况
   const autoPercent = value ? parseAutoPercentage(value) : null
-  if (autoPercent === 0) return 'tst' // auto:0 = always enabled
-  if (autoPercent === 100) return 'standard'
+  if (autoPercent === 0) return 'tst'       // auto:0 = 始终启用
+  if (autoPercent === 100) return 'standard' // auto:100 = 始终关闭
   if (isAutoToolSearchMode(value)) {
-    return 'tst-auto' // auto or auto:1-99
+    return 'tst-auto' // auto 或 auto:1-99
   }
 
+  // 显式真值 → tst
   if (isEnvTruthy(value)) return 'tst'
+  // 显式假值 → standard
   if (isEnvDefinedFalsy(process.env.ENABLE_TOOL_SEARCH)) return 'standard'
-  return 'tst' // default: always defer MCP and shouldDefer tools
+  // 未设置时默认始终延迟
+  return 'tst'
 }
 
 /**
- * Default patterns for models that do NOT support tool_reference.
- * New models are assumed to support tool_reference unless explicitly listed here.
+ * 默认不支持 tool_reference 的模型名称模式列表。
+ * 新模型默认假定支持 tool_reference，仅列出此处的模型为不支持。
  */
 const DEFAULT_UNSUPPORTED_MODEL_PATTERNS = ['haiku']
 
 /**
- * Get the list of model patterns that do NOT support tool_reference.
- * Can be configured via GrowthBook for live updates without code changes.
+ * 获取不支持 tool_reference 的模型名称模式列表。
+ * 优先从 GrowthBook 特性 'tengu_tool_search_unsupported_models' 读取，
+ * 以便无需代码变更即可热更新，读取失败时回退到硬编码默认值。
+ *
+ * @returns 模型名称模式字符串数组
  */
 function getUnsupportedToolReferencePatterns(): string[] {
   try {
-    // Try to get from GrowthBook for live configuration
+    // 从 GrowthBook 获取实时配置
     const patterns = getFeatureValue_CACHED_MAY_BE_STALE<string[] | null>(
       'tengu_tool_search_unsupported_models',
       null,
     )
+    // 非空数组时使用远程配置
     if (patterns && Array.isArray(patterns) && patterns.length > 0) {
       return patterns
     }
   } catch {
-    // GrowthBook not ready, use defaults
+    // GrowthBook 未就绪，使用默认值
   }
   return DEFAULT_UNSUPPORTED_MODEL_PATTERNS
 }
 
 /**
- * Check if a model supports tool_reference blocks (required for tool search).
+ * 检查指定模型是否支持 tool_reference 内容块（工具搜索的必要条件）。
  *
- * This uses a negative test: models are assumed to support tool_reference
- * UNLESS they match a pattern in the unsupported list. This ensures new
- * models work by default without code changes.
+ * 采用反向判断：新模型默认假定支持，除非明确列在不支持名单中。
+ * 目前 Haiku 系列不支持 tool_reference，可通过 GrowthBook 更新。
  *
- * Currently, Haiku models do NOT support tool_reference. This can be
- * updated via GrowthBook feature 'tengu_tool_search_unsupported_models'.
+ * 流程：
+ * 1. 将模型名转为小写
+ * 2. 遍历不支持模式列表，任意模式匹配则返回 false
+ * 3. 未匹配到任何模式则返回 true
  *
- * @param model The model name to check
- * @returns true if the model supports tool_reference, false otherwise
+ * @param model 模型名称
+ * @returns 是否支持 tool_reference
  */
 export function modelSupportsToolReference(model: string): boolean {
   const normalizedModel = model.toLowerCase()
   const unsupportedPatterns = getUnsupportedToolReferencePatterns()
 
-  // Check if model matches any unsupported pattern
+  // 逐一检查不支持模式
   for (const pattern of unsupportedPatterns) {
     if (normalizedModel.includes(pattern.toLowerCase())) {
-      return false
+      return false // 匹配到不支持模式
     }
   }
 
-  // New models are assumed to support tool_reference
+  // 未匹配任何不支持模式，默认支持
   return true
 }
 
 /**
- * Check if tool search *might* be enabled (optimistic check).
+ * 乐观检查：工具搜索是否"可能"开启。
  *
- * Returns true if tool search could potentially be enabled, without checking
- * dynamic factors like model support or threshold. Use this for:
- * - Including ToolSearchTool in base tools (so it's available if needed)
- * - Preserving tool_reference fields in messages (can be stripped later)
- * - Checking if ToolSearchTool should report itself as enabled
+ * 不检查动态因素（模型支持、阈值），仅确认工具搜索是否在配置上允许。
+ * 用于：
+ * - 在工具列表中包含 ToolSearchTool（供后续按需使用）
+ * - 保留消息中的 tool_reference 字段（后续可再过滤）
+ * - ToolSearchTool 自报是否已启用
  *
- * Returns false only when tool search is definitively disabled (standard mode).
+ * 当且仅当模式为 'standard' 时返回 false。
+ * 完整检查（含模型支持和阈值）请使用 isToolSearchEnabled()。
  *
- * For the definitive check that includes model support and threshold,
- * use isToolSearchEnabled().
+ * 流程：
+ * 1. 若模式为 'standard' → false（记录日志一次）
+ * 2. 若使用第三方 API 代理且未显式配置 ENABLE_TOOL_SEARCH → false（代理通常不支持 tool_reference）
+ * 3. 其他情况 → true
  */
-let loggedOptimistic = false
+let loggedOptimistic = false // 防止重复打印同一条调试日志
 
 export function isToolSearchEnabledOptimistic(): boolean {
   const mode = getToolSearchMode()
   if (mode === 'standard') {
+    // 仅记录一次，避免日志洪泛
     if (!loggedOptimistic) {
       loggedOptimistic = true
       logForDebugging(
@@ -279,23 +346,9 @@ export function isToolSearchEnabledOptimistic(): boolean {
     return false
   }
 
-  // tool_reference is a beta content type that third-party API gateways
-  // (ANTHROPIC_BASE_URL proxies) typically don't support. When the provider
-  // is 'firstParty' but the base URL points elsewhere, the proxy will reject
-  // tool_reference blocks with a 400. Vertex/Bedrock/Foundry are unaffected —
-  // they have their own endpoints and beta headers.
-  // https://github.com/anthropics/claude-code/issues/30912
-  //
-  // HOWEVER: some proxies DO support tool_reference (LiteLLM passthrough,
-  // Cloudflare AI Gateway, corp gateways that forward beta headers). The
-  // blanket disable breaks defer_loading for those users — all MCP tools
-  // loaded into main context instead of on-demand (gh-31936 / CC-457,
-  // likely the real cause of CC-330 "v2.1.70 defer_loading regression").
-  // This gate only applies when ENABLE_TOOL_SEARCH is unset/empty (default
-  // behavior). Setting any non-empty value — 'true', 'auto', 'auto:N' —
-  // means the user is explicitly configuring tool search and asserts their
-  // setup supports it. The falsy check (rather than === undefined) aligns
-  // with getToolSearchMode(), which also treats "" as unset.
+  // tool_reference 是 beta 内容类型，第三方代理通常不支持。
+  // 当使用非官方 Anthropic 端点且未显式配置时，默认禁用以避免 400 错误。
+  // 若用户显式设置了 ENABLE_TOOL_SEARCH，则视为用户确认代理支持该特性。
   if (
     !process.env.ENABLE_TOOL_SEARCH &&
     getAPIProvider() === 'firstParty' &&
@@ -310,6 +363,7 @@ export function isToolSearchEnabledOptimistic(): boolean {
     return false
   }
 
+  // 模式非 standard 且端点合法，乐观判断为已启用
   if (!loggedOptimistic) {
     loggedOptimistic = true
     logForDebugging(
@@ -320,12 +374,11 @@ export function isToolSearchEnabledOptimistic(): boolean {
 }
 
 /**
- * Check if ToolSearchTool is available in the provided tools list.
- * If ToolSearchTool is not available (e.g., disallowed via disallowedTools),
- * tool search cannot function and should be disabled.
+ * 检查 ToolSearchTool 是否在工具列表中可用。
+ * 若通过 disallowedTools 禁用了 ToolSearchTool，则工具搜索无法正常运行。
  *
- * @param tools Array of tools with a 'name' property
- * @returns true if ToolSearchTool is in the tools list, false otherwise
+ * @param tools 工具数组（含 name 属性）
+ * @returns ToolSearchTool 是否存在于列表中
  */
 export function isToolSearchToolAvailable(
   tools: readonly { name: string }[],
@@ -334,8 +387,20 @@ export function isToolSearchToolAvailable(
 }
 
 /**
- * Calculate total deferred tool description size in characters.
- * Includes name, description text, and input schema to match what's actually sent to the API.
+ * 计算所有延迟工具描述的总字符数（名称 + 描述 + 输入 schema）。
+ * 字符数与 token 数近似等比，用于 token API 不可用时的字符数回退阈值判断。
+ *
+ * 流程：
+ * 1. 过滤出延迟工具，无则返回 0
+ * 2. 并发获取每个工具的描述文本
+ * 3. 将 inputJSONSchema/inputSchema 序列化为 JSON 字符串
+ * 4. 对每个工具累加名称长度 + 描述长度 + schema 字符长度
+ * 5. 返回总和
+ *
+ * @param tools 工具列表
+ * @param getToolPermissionContext 工具权限上下文获取函数
+ * @param agents 代理定义列表
+ * @returns 总字符数
  */
 async function calculateDeferredToolDescriptionChars(
   tools: Tools,
@@ -345,42 +410,53 @@ async function calculateDeferredToolDescriptionChars(
   const deferredTools = tools.filter(t => isDeferredTool(t))
   if (deferredTools.length === 0) return 0
 
+  // 并发计算每个工具的描述字符数
   const sizes = await Promise.all(
     deferredTools.map(async tool => {
+      // 获取工具描述文本
       const description = await tool.prompt({
         getToolPermissionContext,
         tools,
         agents,
       })
+      // 序列化工具输入 schema 为 JSON 字符串（优先 inputJSONSchema，其次 inputSchema）
       const inputSchema = tool.inputJSONSchema
         ? jsonStringify(tool.inputJSONSchema)
         : tool.inputSchema
           ? jsonStringify(zodToJsonSchema(tool.inputSchema))
           : ''
+      // 名称 + 描述 + schema 的字符总数
       return tool.name.length + description.length + inputSchema.length
     }),
   )
 
+  // 汇总所有工具的字符数
   return sizes.reduce((total, size) => total + size, 0)
 }
 
 /**
- * Check if tool search (MCP tool deferral with tool_reference) is enabled for a specific request.
+ * 针对具体请求的工具搜索启用状态的最终判定（含所有动态因素）。
  *
- * This is the definitive check that includes:
- * - MCP mode (Tst, TstAuto, McpCli, Standard)
- * - Model compatibility (haiku doesn't support tool_reference)
- * - ToolSearchTool availability (must be in tools list)
- * - Threshold check for TstAuto mode
+ * 此函数是最权威的判定入口，涵盖：
+ * - 模型兼容性（Haiku 不支持 tool_reference）
+ * - ToolSearchTool 可用性（是否被 disallowedTools 排除）
+ * - tst-auto 模式下的阈值检查
  *
- * Use this when making actual API calls where all context is available.
+ * 流程：
+ * 1. 检查模型是否支持 tool_reference，不支持则返回 false
+ * 2. 检查 ToolSearchTool 是否在工具列表中，不存在则返回 false
+ * 3. 按模式分支：
+ *    - 'tst' → 始终返回 true
+ *    - 'tst-auto' → 检查阈值，超过则返回 true，否则 false
+ *    - 'standard' → 始终返回 false
+ * 4. 每次决策都向分析服务上报 tengu_tool_search_mode_decision 事件
  *
- * @param model The model to check for tool_reference support
- * @param tools Array of available tools (including MCP tools)
- * @param getToolPermissionContext Function to get tool permission context
- * @param agents Array of agent definitions
- * @param source Optional identifier for the caller (for debugging)
- * @returns true if tool search should be enabled for this request
+ * @param model 当前使用的模型名称
+ * @param tools 当前可用工具列表（含 MCP 工具）
+ * @param getToolPermissionContext 工具权限上下文获取函数
+ * @param agents 代理定义列表
+ * @param source 可选的调用来源标识（用于调试日志）
+ * @returns 是否应在本次请求中启用工具搜索
  */
 export async function isToolSearchEnabled(
   model: string,
@@ -389,9 +465,13 @@ export async function isToolSearchEnabled(
   agents: AgentDefinition[],
   source?: string,
 ): Promise<boolean> {
+  // 统计当前可用的 MCP 工具数量（用于上报分析事件）
   const mcpToolCount = count(tools, t => t.isMcp)
 
-  // Helper to log the mode decision event
+  /**
+   * 上报工具搜索模式决策事件到分析服务。
+   * 包含启用状态、模式、原因及相关度量指标。
+   */
   function logModeDecision(
     enabled: boolean,
     mode: ToolSearchMode,
@@ -403,9 +483,7 @@ export async function isToolSearchEnabled(
       mode: mode as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
       reason:
         reason as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
-      // Log the actual model being checked, not the session's main model.
-      // This is important for debugging subagent tool search decisions where
-      // the subagent model (e.g., haiku) differs from the session model (e.g., opus).
+      // 记录实际被检查的模型名（子代理与主会话模型可能不同）
       checkedModel:
         model as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
       mcpToolCount,
@@ -415,7 +493,7 @@ export async function isToolSearchEnabled(
     })
   }
 
-  // Check if model supports tool_reference
+  // 检查模型是否支持 tool_reference（Haiku 等旧模型不支持）
   if (!modelSupportsToolReference(model)) {
     logForDebugging(
       `Tool search disabled for model '${model}': model does not support tool_reference blocks. ` +
@@ -425,7 +503,7 @@ export async function isToolSearchEnabled(
     return false
   }
 
-  // Check if ToolSearchTool is available (respects disallowedTools)
+  // 检查 ToolSearchTool 是否可用（可能被 disallowedTools 排除）
   if (!isToolSearchToolAvailable(tools)) {
     logForDebugging(
       `Tool search disabled: ToolSearchTool is not available (may have been disallowed via disallowedTools).`,
@@ -438,10 +516,12 @@ export async function isToolSearchEnabled(
 
   switch (mode) {
     case 'tst':
+      // 始终启用模式：直接返回 true
       logModeDecision(true, mode, 'tst_enabled')
       return true
 
     case 'tst-auto': {
+      // 自动模式：检查延迟工具描述是否超过阈值
       const { enabled, debugDescription, metrics } = await checkAutoThreshold(
         tools,
         getToolPermissionContext,
@@ -467,14 +547,18 @@ export async function isToolSearchEnabled(
     }
 
     case 'standard':
+      // 标准模式：始终关闭工具搜索
       logModeDecision(false, mode, 'standard_mode')
       return false
   }
 }
 
 /**
- * Check if an object is a tool_reference block.
- * tool_reference is a beta feature not in the SDK types, so we need runtime checks.
+ * 检查对象是否为 tool_reference 内容块。
+ * tool_reference 是 beta 特性，不在 SDK 类型中，因此需要运行时类型守卫。
+ *
+ * @param obj 任意对象
+ * @returns 是否为 tool_reference 内容块
  */
 export function isToolReferenceBlock(obj: unknown): boolean {
   return (
@@ -486,7 +570,10 @@ export function isToolReferenceBlock(obj: unknown): boolean {
 }
 
 /**
- * Type guard for tool_reference block with tool_name.
+ * 带 tool_name 字段的 tool_reference 块类型守卫。
+ *
+ * @param obj 任意对象
+ * @returns 是否为含 tool_name 的 tool_reference 块
  */
 function isToolReferenceWithName(
   obj: unknown,
@@ -499,8 +586,8 @@ function isToolReferenceWithName(
 }
 
 /**
- * Type representing a tool_result block with array content.
- * Used for extracting tool_reference blocks from ToolSearchTool results.
+ * 含数组 content 的 tool_result 内容块类型。
+ * 用于从 ToolSearchTool 结果中提取 tool_reference 块。
  */
 type ToolResultBlock = {
   type: 'tool_result'
@@ -508,7 +595,10 @@ type ToolResultBlock = {
 }
 
 /**
- * Type guard for tool_result blocks with array content.
+ * 含数组 content 的 tool_result 块类型守卫。
+ *
+ * @param obj 任意对象
+ * @returns 是否为含数组 content 的 tool_result 块
  */
 function isToolResultBlockWithContent(obj: unknown): obj is ToolResultBlock {
   return (
@@ -522,34 +612,33 @@ function isToolResultBlockWithContent(obj: unknown): obj is ToolResultBlock {
 }
 
 /**
- * Extract tool names from tool_reference blocks in message history.
+ * 从历史消息中提取所有已被 tool_reference 块引用的工具名称集合。
  *
- * When dynamic tool loading is enabled, MCP tools are not predeclared in the
- * tools array. Instead, they are discovered via ToolSearchTool which returns
- * tool_reference blocks. This function scans the message history to find all
- * tool names that have been referenced, so we can include only those tools
- * in subsequent API requests.
+ * 背景：
+ * 动态工具加载开启时，MCP 工具不在 tools 数组中预声明，而是通过 ToolSearchTool
+ * 返回的 tool_reference 块动态发现。此函数扫描历史消息，找出所有已被引用的工具名，
+ * 以便在后续 API 请求中仅包含这些工具的完整定义。
  *
- * This approach:
- * - Eliminates the need to predeclare all MCP tools upfront
- * - Removes limits on total quantity of MCP tools
+ * 压缩（compaction）会将含 tool_reference 的消息替换为摘要，
+ * 并将已发现工具集快照写入 compactMetadata.preCompactDiscoveredTools，
+ * 本函数同时负责读取该快照。
  *
- * Compaction replaces tool_reference-bearing messages with a summary, so it
- * snapshots the discovered set onto compactMetadata.preCompactDiscoveredTools
- * on the boundary marker; this scan reads it back. Snip instead protects the
- * tool_reference-carrying messages from removal.
+ * 流程：
+ * 1. 遍历所有消息
+ * 2. 若为 compact_boundary 系统消息，读取 preCompactDiscoveredTools 并合并
+ * 3. 仅处理 user 类型消息的 content 数组
+ * 4. 在 tool_result 块的 content 中查找 tool_reference 块
+ * 5. 提取 tool_name 字段加入结果集
  *
- * @param messages Array of messages that may contain tool_result blocks with tool_reference content
- * @returns Set of tool names that have been discovered via tool_reference blocks
+ * @param messages 可能含 tool_result+tool_reference 的消息数组
+ * @returns 已发现工具名称的 Set
  */
 export function extractDiscoveredToolNames(messages: Message[]): Set<string> {
   const discoveredTools = new Set<string>()
-  let carriedFromBoundary = 0
+  let carriedFromBoundary = 0 // 来自压缩边界快照的工具数量（用于调试日志）
 
   for (const msg of messages) {
-    // Compact boundary carries the pre-compact discovered set. Inline type
-    // check rather than isCompactBoundaryMessage — utils/messages.ts imports
-    // from this file, so importing back would be circular.
+    // compact_boundary 系统消息携带压缩前已发现的工具集快照
     if (msg.type === 'system' && msg.subtype === 'compact_boundary') {
       const carried = msg.compactMetadata?.preCompactDiscoveredTools
       if (carried) {
@@ -559,26 +648,25 @@ export function extractDiscoveredToolNames(messages: Message[]): Set<string> {
       continue
     }
 
-    // Only user messages contain tool_result blocks (responses to tool_use)
+    // tool_result 仅出现在 user 消息中（tool_use 的响应）
     if (msg.type !== 'user') continue
 
     const content = msg.message?.content
     if (!Array.isArray(content)) continue
 
     for (const block of content) {
-      // tool_reference blocks only appear inside tool_result content, specifically
-      // in results from ToolSearchTool. The API expands these references into full
-      // tool definitions in the model's context.
+      // tool_reference 块仅出现在 ToolSearchTool 结果的 content 中
       if (isToolResultBlockWithContent(block)) {
         for (const item of block.content) {
           if (isToolReferenceWithName(item)) {
-            discoveredTools.add(item.tool_name)
+            discoveredTools.add(item.tool_name) // 记录已发现的工具名
           }
         }
       }
     }
   }
 
+  // 有发现工具时输出调试日志
   if (discoveredTools.size > 0) {
     logForDebugging(
       `Dynamic tool loading: found ${discoveredTools.size} discovered tools in message history` +
@@ -591,25 +679,25 @@ export function extractDiscoveredToolNames(messages: Message[]): Set<string> {
   return discoveredTools
 }
 
+/**
+ * 延迟工具池变更差异类型。
+ * 描述自上次广播以来新增/移除的延迟工具。
+ */
 export type DeferredToolsDelta = {
   addedNames: string[]
-  /** Rendered lines for addedNames; the scan reconstructs from names. */
+  /** 已新增工具的渲染行文本列表，由扫描时从工具名重建。 */
   addedLines: string[]
   removedNames: string[]
 }
 
 /**
- * Call-site discriminator for the tengu_deferred_tools_pool_change event.
- * The scan runs from several sites with different expected-prior semantics
- * (inc-4747):
- *   - attachments_main: main-thread getAttachments → prior=0 is a BUG on fire-2+
- *   - attachments_subagent: subagent getAttachments → prior=0 is EXPECTED
- *     (fresh conversation, initialMessages has no DTD)
- *   - compact_full: compact.ts passes [] → prior=0 is EXPECTED
- *   - compact_partial: compact.ts passes messagesToKeep → depends on what survived
- *   - reactive_compact: reactiveCompact.ts passes preservedMessages → same
- * Without this the 96%-prior=0 stat is dominated by EXPECTED buckets and
- * the real main-thread cross-turn bug (if any) is invisible in BQ.
+ * getDeferredToolsDelta 调用来源标识，用于区分不同扫描场景。
+ * 解决 inc-4747 中 prior=0 统计被多种预期情况污染的问题：
+ *   - attachments_main    : 主线程 getAttachments，fire-2+ 出现 prior=0 为 BUG
+ *   - attachments_subagent: 子代理 getAttachments，prior=0 是预期（全新会话）
+ *   - compact_full        : compact.ts 传入空消息，prior=0 是预期
+ *   - compact_partial     : compact.ts 传入保留消息，视内容而定
+ *   - reactive_compact    : reactiveCompact.ts 传入保留消息，同上
  */
 export type DeferredToolsDeltaScanContext = {
   callSite:
@@ -622,66 +710,82 @@ export type DeferredToolsDeltaScanContext = {
 }
 
 /**
- * True → announce deferred tools via persisted delta attachments.
- * False → claude.ts keeps its per-call <available-deferred-tools>
- * header prepend (the attachment does not fire).
+ * 判断延迟工具差异广播功能是否启用。
+ * 启用时通过持久化差异附件广播延迟工具变更；
+ * 禁用时 claude.ts 使用每次调用的 <available-deferred-tools> 头部预置。
+ *
+ * @returns 是否启用差异广播
  */
 export function isDeferredToolsDeltaEnabled(): boolean {
   return (
+    // Anthropic 内部用户始终启用
     process.env.USER_TYPE === 'ant' ||
+    // GrowthBook 特性标志
     getFeatureValue_CACHED_MAY_BE_STALE('tengu_glacier_2xr', false)
   )
 }
 
 /**
- * Diff the current deferred-tool pool against what's already been
- * announced in this conversation (reconstructed by scanning for prior
- * deferred_tools_delta attachments). Returns null if nothing changed.
+ * 计算当前延迟工具池与已广播集合之间的差异（新增/移除）。
+ * 通过扫描历史消息中的 deferred_tools_delta 附件重建已广播集合。
+ * 若无变更则返回 null。
  *
- * A name that was announced but has since stopped being deferred — yet
- * is still in the base pool — is NOT reported as removed. It's now
- * loaded directly, so telling the model "no longer available" would be
- * wrong.
+ * 注意：已广播但当前不再延迟（却仍在工具池中）的工具不计入移除，
+ * 因为它们已转为直接加载，不应告知模型"不再可用"。
+ *
+ * 流程：
+ * 1. 扫描消息中所有 deferred_tools_delta 附件，重建 announced 集合
+ * 2. 计算当前延迟工具池与 announced 的差集（新增）
+ * 3. 计算 announced 中不再存在于工具池的项（移除）
+ * 4. 无变更返回 null，否则返回新增/移除的名称和渲染行
+ *
+ * @param tools 当前工具列表
+ * @param messages 历史消息列表（含 attachment 类型）
+ * @param scanContext 调用来源上下文（用于分析事件分类）
+ * @returns 工具变更差异，或 null（无变更）
  */
 export function getDeferredToolsDelta(
   tools: Tools,
   messages: Message[],
   scanContext?: DeferredToolsDeltaScanContext,
 ): DeferredToolsDelta | null {
-  const announced = new Set<string>()
-  let attachmentCount = 0
-  let dtdCount = 0
-  const attachmentTypesSeen = new Set<string>()
+  const announced = new Set<string>() // 已广播过的工具名集合
+  let attachmentCount = 0             // 总附件数（用于分析）
+  let dtdCount = 0                    // deferred_tools_delta 附件数
+  const attachmentTypesSeen = new Set<string>() // 出现过的附件类型
+
+  // 扫描历史消息中的所有 deferred_tools_delta 附件
   for (const msg of messages) {
     if (msg.type !== 'attachment') continue
     attachmentCount++
     attachmentTypesSeen.add(msg.attachment.type)
     if (msg.attachment.type !== 'deferred_tools_delta') continue
     dtdCount++
+    // 合并 added（累加到已知集合）
     for (const n of msg.attachment.addedNames) announced.add(n)
+    // 应用 removed（从已知集合中删除）
     for (const n of msg.attachment.removedNames) announced.delete(n)
   }
 
   const deferred: Tool[] = tools.filter(isDeferredTool)
-  const deferredNames = new Set(deferred.map(t => t.name))
-  const poolNames = new Set(tools.map(t => t.name))
+  const deferredNames = new Set(deferred.map(t => t.name)) // 当前延迟工具名集合
+  const poolNames = new Set(tools.map(t => t.name))        // 全量工具名集合
 
+  // 新增：当前延迟但尚未广播的工具
   const added = deferred.filter(t => !announced.has(t.name))
+
+  // 移除：已广播但已从工具池完全消失的工具（不包括"已取消延迟但仍在池中"的情况）
   const removed: string[] = []
   for (const n of announced) {
-    if (deferredNames.has(n)) continue
-    if (!poolNames.has(n)) removed.push(n)
-    // else: undeferred — silent
+    if (deferredNames.has(n)) continue    // 仍在延迟池，不移除
+    if (!poolNames.has(n)) removed.push(n) // 已从工具池消失，标记移除
+    // 已取消延迟但仍在池中：静默处理（不广播移除）
   }
 
+  // 无变更时返回 null
   if (added.length === 0 && removed.length === 0) return null
 
-  // Diagnostic for the inc-4747 scan-finds-nothing bug. Round-1 fields
-  // (messagesLength/attachmentCount/dtdCount from #23167) showed 45.6% of
-  // events have attachments-but-no-DTD, but those numbers are confounded:
-  // subagent first-fires and compact-path scans have EXPECTED prior=0 and
-  // dominate the stat. callSite/querySource/attachmentTypesSeen split the
-  // buckets so the real main-thread cross-turn failure is isolable in BQ.
+  // 上报池变更分析事件，包含来源上下文以便在 BigQuery 中分类
   logEvent('tengu_deferred_tools_pool_change', {
     addedCount: added.length,
     removedCount: removed.length,
@@ -699,15 +803,26 @@ export function getDeferredToolsDelta(
   })
 
   return {
-    addedNames: added.map(t => t.name).sort(),
-    addedLines: added.map(formatDeferredToolLine).sort(),
+    addedNames: added.map(t => t.name).sort(),       // 按名称排序
+    addedLines: added.map(formatDeferredToolLine).sort(), // 渲染行文本
     removedNames: removed.sort(),
   }
 }
 
 /**
- * Check whether deferred tools exceed the auto-threshold for enabling TST.
- * Tries exact token count first; falls back to character-based heuristic.
+ * 检查延迟工具是否超过自动启用 TST 的阈值。
+ * 优先使用精确 token 计数；token API 不可用时回退到字符数启发式估算。
+ *
+ * 流程：
+ * 1. 调用 getDeferredToolTokenCount() 获取精确 token 数
+ * 2. 若返回非 null：与 token 阈值比较，生成调试描述
+ * 3. 若返回 null（API 不可用）：计算字符数并与字符阈值比较
+ *
+ * @param tools 工具列表
+ * @param getToolPermissionContext 工具权限上下文获取函数
+ * @param agents 代理定义列表
+ * @param model 模型名称
+ * @returns 是否启用、调试描述字符串、度量指标对象
  */
 async function checkAutoThreshold(
   tools: Tools,
@@ -719,7 +834,7 @@ async function checkAutoThreshold(
   debugDescription: string
   metrics: Record<string, number>
 }> {
-  // Try exact token count first (cached, one API call per toolset change)
+  // 优先使用精确 token 计数（结果有缓存，工具集变更时失效）
   const deferredToolTokens = await getDeferredToolTokenCount(
     tools,
     getToolPermissionContext,
@@ -728,6 +843,7 @@ async function checkAutoThreshold(
   )
 
   if (deferredToolTokens !== null) {
+    // token API 可用，与 token 阈值比较
     const threshold = getAutoToolSearchTokenThreshold(model)
     return {
       enabled: deferredToolTokens >= threshold,
@@ -738,7 +854,7 @@ async function checkAutoThreshold(
     }
   }
 
-  // Fallback: character-based heuristic when token API is unavailable
+  // 回退：token API 不可用，使用字符数启发式估算
   const deferredToolDescriptionChars =
     await calculateDeferredToolDescriptionChars(
       tools,

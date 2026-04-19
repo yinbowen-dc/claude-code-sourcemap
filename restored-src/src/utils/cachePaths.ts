@@ -1,3 +1,16 @@
+/**
+ * 缓存路径管理模块。
+ *
+ * 在 Claude Code 系统中，该模块提供各类缓存目录路径的统一计算方式，
+ * 基于 env-paths 获取平台标准缓存根目录，以当前工作目录的 djb2 哈希作为子目录名：
+ * - CACHE_PATHS.baseLogs()：当前项目的日志根目录
+ * - CACHE_PATHS.errors()：错误日志目录
+ * - CACHE_PATHS.messages()：消息记录目录
+ * - CACHE_PATHS.mcpLogs(serverName)：指定 MCP 服务端的日志目录
+ *
+ * 路径名净化（sanitizePath）使用 djb2Hash 而非 Bun.hash（wyhash），
+ * 确保缓存目录名跨版本升级保持稳定，防止旧缓存数据孤立。
+ */
 import envPaths from 'env-paths'
 import { join } from 'path'
 import { getFsImplementation } from './fsOperations.js'

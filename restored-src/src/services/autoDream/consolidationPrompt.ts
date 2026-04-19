@@ -1,3 +1,20 @@
+/**
+ * AutoDream 整合提示词构建模块
+ *
+ * 在 Claude Code 系统流程中的位置：
+ *   autoDream.ts 通过所有门控检查后 → 调用 buildConsolidationPrompt() 构建子代理提示词
+ *   → 将提示词传递给 runForkedAgent()，子代理按四阶段流程执行记忆整合
+ *
+ * 主要功能：
+ *  - buildConsolidationPrompt — 构建完整的 /dream 记忆整合提示词
+ *
+ * 设计特点：
+ *  - 独立提取自 dream.ts（KAIROS 特性门控的功能文件），使 AutoDream 可独立于
+ *    KAIROS feature flag 工作（dream.ts 需要 feature() 门控才能 require）
+ *  - extra 参数专门用于 AutoDream 的工具约束和会话列表说明（不影响手动 /dream 的提示词）
+ *  - 提示词分四阶段：定向（Orient）→ 收集信号（Gather）→ 整合（Consolidate）→ 修剪和索引（Prune）
+ */
+
 // Extracted from dream.ts so auto-dream ships independently of KAIROS
 // feature flags (dream.ts is behind a feature()-gated require).
 
@@ -7,6 +24,20 @@ import {
   MAX_ENTRYPOINT_LINES,
 } from '../../memdir/memdir.js'
 
+/**
+ * 构建记忆整合子代理的完整提示词。
+ *
+ * 提示词结构（四阶段 dream 流程）：
+ *  - Phase 1（Orient）：了解现有记忆结构，读取索引文件和主题文件
+ *  - Phase 2（Gather）：收集最近产生的有价值信号（日志、漂移事实、会话记录）
+ *  - Phase 3（Consolidate）：将新信号写入或更新记忆文件（合并而非创建副本）
+ *  - Phase 4（Prune & Index）：精简索引文件，控制行数和文件大小
+ *
+ * @param memoryRoot - 记忆文件根目录的绝对路径
+ * @param transcriptDir - 会话记录文件目录的绝对路径
+ * @param extra - 追加到提示词末尾的额外上下文（AutoDream 传入工具约束和会话列表）
+ * @returns 完整的整合提示词字符串
+ */
 export function buildConsolidationPrompt(
   memoryRoot: string,
   transcriptDir: string,

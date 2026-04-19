@@ -1,3 +1,31 @@
+/**
+ * SDK / Headless CLI 主引擎 — 实现无界面模式下的完整会话生命周期。
+ *
+ * 在整个 Claude Code 系统中的位置：
+ * 本文件是 Claude Code SDK 和 Headless（非交互）模式的核心执行层，
+ * 位于 CLI 入口（main.tsx）与底层 QueryEngine 之间。它负责：
+ *   - 会话初始化与恢复：从磁盘/远程加载历史对话，水合 CCR v2 内部事件
+ *   - 工具池组装：按权限策略过滤和合并工具集（MCP 服务器、内置工具等）
+ *   - MCP 服务器生命周期：连接、重连、协调（reconcile）、权限 OAuth 流程
+ *   - 权限管理：PermissionPromptTool 回调、auto mode / bypass mode 切换
+ *   - 消息调度：命令队列（QueuedCommand）的批量合并（batch）与串行执行
+ *   - 头less模式主循环：runHeadless() — 接受字符串或 AsyncIterable<string> 提示，
+ *     经 ask() 驱动 LLM，将结果以 StdoutMessage 流写入 IO 层
+ *   - SDK 模式消息处理：control_request / control_response 协议帧处理
+ *   - 插件热重载、设置变更检测、空闲超时、优雅关闭
+ *   - Team/Swarm 协调：等待队友空闲、收件箱消息读取、任务卸载
+ *
+ * 主要导出：
+ *   - runHeadless()               — 执行一次无界面对话轮次
+ *   - joinPromptValues()          — 合并多条排队命令的提示值
+ *   - canBatchWith()              — 判断两条命令是否可合批
+ *   - createCanUseToolWithPermissionPrompt() — 创建带权限弹窗的 canUseTool 函数
+ *   - getCanUseToolFn()           — 获取当前权限模式下的 canUseTool 函数
+ *   - handleMcpSetServers()       — 处理 SDK 的 set_mcp_servers 控制请求
+ *   - reconcileMcpServers()       — 对比并调和 MCP 服务器配置变更
+ *   - removeInterruptedMessage()  — 移除因中断留下的不完整消息
+ *   - handleOrphanedPermissionResponse() — 处理孤立权限响应（超时 / 重连后）
+ */
 // biome-ignore-all assist/source/organizeImports: ANT-ONLY import markers must not be reordered
 import { feature } from 'bun:bundle'
 import { readFile, stat } from 'fs/promises'

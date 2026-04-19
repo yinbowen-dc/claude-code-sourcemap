@@ -1,16 +1,19 @@
 /**
- * In-process teammate spawning
+ * swarm/spawnInProcess.ts — 进程内 Teammate 孵化模块
  *
- * Creates and registers an in-process teammate task. Unlike process-based
- * teammates (tmux/iTerm2), in-process teammates run in the same Node.js
- * process using AsyncLocalStorage for context isolation.
+ * 在 Claude Code 系统流程中的位置：
+ *   Swarm 工具链的孵化层（Spawn Layer）。当 Leader 决定以"进程内"方式创建 Teammate 时，
+ *   由本模块完成从配置到 AppState 注册的完整生命周期初始化。
  *
- * The actual agent execution loop is handled by InProcessTeammateTask
- * component (Task #14). This module handles:
- * 1. Creating TeammateContext
- * 2. Creating linked AbortController
- * 3. Registering InProcessTeammateTaskState in AppState
- * 4. Returning spawn result for backend
+ * 与进程级 Teammate（tmux/iTerm2）不同，进程内 Teammate 运行在同一个 Node.js 进程中，
+ * 通过 AsyncLocalStorage 实现上下文隔离，由 InProcessTeammateTask 组件（Task #14）
+ * 驱动实际的 Agent 执行循环。
+ *
+ * 本模块负责：
+ *   1. 创建 TeammateContext（用于 AsyncLocalStorage 身份隔离）；
+ *   2. 创建独立的 AbortController（Teammate 不受 Leader 中断影响）；
+ *   3. 向 AppState 注册 InProcessTeammateTaskState；
+ *   4. 返回孵化结果供调用方（Backend）使用。
  */
 
 import sample from 'lodash-es/sample.js'
@@ -42,64 +45,71 @@ import {
 } from '../telemetry/perfettoTracing.js'
 import { removeMemberByAgentId } from './teamHelpers.js'
 
+// AppState setter 函数的类型别名，用于统一入参类型
 type SetAppStateFn = (updater: (prev: AppState) => AppState) => void
 
 /**
- * Minimal context required for spawning an in-process teammate.
- * This is a subset of ToolUseContext - only what spawnInProcessTeammate actually uses.
+ * 孵化进程内 Teammate 所需的最小上下文。
+ * 是 ToolUseContext 的子集，仅包含 spawnInProcessTeammate 实际使用的字段。
  */
 export type SpawnContext = {
   setAppState: SetAppStateFn
-  toolUseId?: string
+  toolUseId?: string // 关联的工具调用 ID，用于 SDK 事件跟踪
 }
 
 /**
- * Configuration for spawning an in-process teammate.
+ * 孵化进程内 Teammate 的配置参数。
  */
 export type InProcessSpawnConfig = {
-  /** Display name for the teammate, e.g., "researcher" */
+  /** Teammate 的显示名称，例如 "researcher" */
   name: string
-  /** Team this teammate belongs to */
+  /** 该 Teammate 所属的团队名称 */
   teamName: string
-  /** Initial prompt/task for the teammate */
+  /** Teammate 的初始任务提示词 */
   prompt: string
-  /** Optional UI color for the teammate */
+  /** 可选的 UI 显示颜色 */
   color?: string
-  /** Whether teammate must enter plan mode before implementing */
+  /** 是否要求 Teammate 在实施前进入 Plan 模式 */
   planModeRequired: boolean
-  /** Optional model override for this teammate */
+  /** 可选的模型覆盖（覆盖全局默认模型） */
   model?: string
 }
 
 /**
- * Result from spawning an in-process teammate.
+ * 孵化进程内 Teammate 的返回结果。
  */
 export type InProcessSpawnOutput = {
-  /** Whether spawn was successful */
+  /** 孵化是否成功 */
   success: boolean
-  /** Full agent ID (format: "name@team") */
+  /** 完整的 Agent ID（格式："name@team"） */
   agentId: string
-  /** Task ID for tracking in AppState */
+  /** 在 AppState 中跟踪的 Task ID */
   taskId?: string
-  /** AbortController for this teammate (linked to parent) */
+  /** 该 Teammate 的 AbortController（与 Leader 独立） */
   abortController?: AbortController
-  /** Teammate context for AsyncLocalStorage */
+  /** 用于 AsyncLocalStorage 的 Teammate 上下文 */
   teammateContext?: ReturnType<typeof createTeammateContext>
-  /** Error message if spawn failed */
+  /** 孵化失败时的错误信息 */
   error?: string
 }
 
 /**
- * Spawns an in-process teammate.
+ * 孵化一个进程内 Teammate。
  *
- * Creates the teammate's context, registers the task in AppState, and returns
- * the spawn result. The actual agent execution is driven by the
- * InProcessTeammateTask component which uses runWithTeammateContext() to
- * execute the agent loop with proper identity isolation.
+ * 详细流程：
+ *   1. 根据 name 和 teamName 生成确定性的 agentId 与 taskId；
+ *   2. 创建独立的 AbortController（Teammate 不受 Leader 中断传播）；
+ *   3. 获取父会话 ID 用于 transcript 关联；
+ *   4. 构建 TeammateIdentity（纯数据，存入 AppState）；
+ *   5. 创建 TeammateContext（含 AbortController，用于 AsyncLocalStorage 隔离）；
+ *   6. 若启用了 Perfetto 追踪，注册 Agent 以支持层次可视化；
+ *   7. 构建 InProcessTeammateTaskState 并注册到 AppState；
+ *   8. 注册清理回调（进程退出时 abort 该 Teammate）；
+ *   9. 返回包含身份信息的孵化结果。
  *
- * @param config - Spawn configuration
- * @param context - Context with setAppState for registering task
- * @returns Spawn result with teammate info
+ * @param config  - 孵化配置
+ * @param context - 包含 setAppState 的上下文
+ * @returns 孵化结果，含 Teammate 身份及控制器引用
  */
 export async function spawnInProcessTeammate(
   config: InProcessSpawnConfig,
@@ -108,7 +118,7 @@ export async function spawnInProcessTeammate(
   const { name, teamName, prompt, color, planModeRequired, model } = config
   const { setAppState } = context
 
-  // Generate deterministic agent ID
+  // 生成确定性的 Agent ID（格式："name@teamName"）和唯一的 Task ID
   const agentId = formatAgentId(name, teamName)
   const taskId = generateTaskId('in_process_teammate')
 
@@ -117,14 +127,14 @@ export async function spawnInProcessTeammate(
   )
 
   try {
-    // Create independent AbortController for this teammate
-    // Teammates should not be aborted when the leader's query is interrupted
+    // 为该 Teammate 创建独立的 AbortController
+    // Teammate 不应因 Leader 的查询中断而被 abort
     const abortController = createAbortController()
 
-    // Get parent session ID for transcript correlation
+    // 获取父会话 ID，用于跨会话 transcript 关联
     const parentSessionId = getSessionId()
 
-    // Create teammate identity (stored as plain data in AppState)
+    // 创建 Teammate 身份对象（纯数据，持久化在 AppState 中）
     const identity: TeammateIdentity = {
       agentId,
       agentName: name,
@@ -134,8 +144,8 @@ export async function spawnInProcessTeammate(
       parentSessionId,
     }
 
-    // Create teammate context for AsyncLocalStorage
-    // This will be used by runWithTeammateContext() during agent execution
+    // 创建 Teammate 上下文（含 AbortController），供 runWithTeammateContext() 使用
+    // 在 Agent 执行循环中通过 AsyncLocalStorage 提供身份隔离
     const teammateContext = createTeammateContext({
       agentId,
       agentName: name,
@@ -146,14 +156,15 @@ export async function spawnInProcessTeammate(
       abortController,
     })
 
-    // Register agent in Perfetto trace for hierarchy visualization
+    // 若启用了 Perfetto 追踪，注册 Agent 以支持层次可视化
     if (isPerfettoTracingEnabled()) {
       registerPerfettoAgent(agentId, name, parentSessionId)
     }
 
-    // Create task state
+    // 截取提示词前 50 字符作为任务描述，超出部分用省略号替代
     const description = `${name}: ${prompt.substring(0, 50)}${prompt.length > 50 ? '...' : ''}`
 
+    // 构建完整的 InProcessTeammateTaskState，包含运行时所需的所有字段
     const taskState: InProcessTeammateTaskState = {
       ...createTaskStateBase(
         taskId,
@@ -162,32 +173,32 @@ export async function spawnInProcessTeammate(
         context.toolUseId,
       ),
       type: 'in_process_teammate',
-      status: 'running',
+      status: 'running',          // 初始状态直接为运行中
       identity,
       prompt,
       model,
       abortController,
-      awaitingPlanApproval: false,
-      spinnerVerb: sample(getSpinnerVerbs()),
-      pastTenseVerb: sample(TURN_COMPLETION_VERBS),
-      permissionMode: planModeRequired ? 'plan' : 'default',
+      awaitingPlanApproval: false, // 初始不处于等待计划审批状态
+      spinnerVerb: sample(getSpinnerVerbs()),         // 随机选取加载动词用于 UI 展示
+      pastTenseVerb: sample(TURN_COMPLETION_VERBS),   // 随机选取完成动词用于 UI 展示
+      permissionMode: planModeRequired ? 'plan' : 'default', // 根据配置确定权限模式
       isIdle: false,
       shutdownRequested: false,
       lastReportedToolCount: 0,
       lastReportedTokenCount: 0,
       pendingUserMessages: [],
-      messages: [], // Initialize to empty array so getDisplayedMessages works immediately
+      messages: [], // 初始化为空数组，使 getDisplayedMessages 立即可用
     }
 
-    // Register cleanup handler for graceful shutdown
+    // 注册清理回调，进程退出时优雅中止该 Teammate
     const unregisterCleanup = registerCleanup(async () => {
       logForDebugging(`[spawnInProcessTeammate] Cleanup called for ${agentId}`)
       abortController.abort()
-      // Task state will be updated by the execution loop when it detects abort
+      // 执行循环检测到 abort 后会自行更新任务状态
     })
     taskState.unregisterCleanup = unregisterCleanup
 
-    // Register task in AppState
+    // 将任务注册到 AppState，使 React UI 可以感知并渲染该 Teammate
     registerTask(taskState, setAppState)
 
     logForDebugging(
@@ -202,6 +213,7 @@ export async function spawnInProcessTeammate(
       teammateContext,
     }
   } catch (error) {
+    // 捕获孵化过程中的任何错误，返回失败结果而非抛出异常
     const errorMessage =
       error instanceof Error ? error.message : 'Unknown error during spawn'
     logForDebugging(
@@ -216,13 +228,22 @@ export async function spawnInProcessTeammate(
 }
 
 /**
- * Kills an in-process teammate by aborting its controller.
+ * 通过中止 AbortController 终止一个进程内 Teammate。
  *
- * Note: This is the implementation called by InProcessBackend.kill().
+ * 详细流程：
+ *   1. 在 AppState 中查找指定 taskId 对应的 Teammate 任务；
+ *   2. 若任务存在且状态为 running，中止其 AbortController 并调用清理回调；
+ *   3. 触发所有等待"空闲"的回调（解除 engine.waitForIdle 的阻塞）；
+ *   4. 从 teamContext.teammates 中移除该 Teammate；
+ *   5. 将任务状态更新为 killed，清理敏感字段；
+ *   6. 在 AppState 更新完成后，从磁盘团队文件中移除该成员；
+ *   7. 驱逐磁盘输出缓存，发送 SDK 终止事件，延迟驱逐任务状态。
  *
- * @param taskId - Task ID of the teammate to kill
+ * 注意：该函数是 InProcessBackend.kill() 的实现层。
+ *
+ * @param taskId      - 需要终止的 Teammate 的 Task ID
  * @param setAppState - AppState setter
- * @returns true if killed successfully
+ * @returns 若成功终止则返回 true
  */
 export function killInProcessTeammate(
   taskId: string,
@@ -236,35 +257,36 @@ export function killInProcessTeammate(
 
   setAppState((prev: AppState) => {
     const task = prev.tasks[taskId]
+    // 任务不存在或类型不匹配，直接返回原状态
     if (!task || task.type !== 'in_process_teammate') {
       return prev
     }
 
     const teammateTask = task as InProcessTeammateTaskState
 
+    // 只能终止运行中的任务
     if (teammateTask.status !== 'running') {
       return prev
     }
 
-    // Capture identity for cleanup after state update
+    // 捕获身份信息，供状态更新后在外部进行文件 I/O
     teamName = teammateTask.identity.teamName
     agentId = teammateTask.identity.agentId
     toolUseId = teammateTask.toolUseId
     description = teammateTask.description
 
-    // Abort the controller to stop execution
+    // 中止执行循环
     teammateTask.abortController?.abort()
 
-    // Call cleanup handler
+    // 调用注册的清理回调
     teammateTask.unregisterCleanup?.()
 
-    // Update task state and remove from teamContext.teammates
     killed = true
 
-    // Call pending idle callbacks to unblock any waiters (e.g., engine.waitForIdle)
+    // 触发所有等待空闲的回调，解除阻塞（如 engine.waitForIdle）
     teammateTask.onIdleCallbacks?.forEach(cb => cb())
 
-    // Remove from teamContext.teammates using the agentId
+    // 从 teamContext.teammates 中移除该 Teammate
     let updatedTeamContext = prev.teamContext
     if (prev.teamContext && prev.teamContext.teammates && agentId) {
       const { [agentId]: _, ...remainingTeammates } = prev.teamContext.teammates
@@ -282,15 +304,15 @@ export function killInProcessTeammate(
         [taskId]: {
           ...teammateTask,
           status: 'killed' as const,
-          notified: true,
+          notified: true,           // 预设为已通知，避免重复触发 XML 通知
           endTime: Date.now(),
-          onIdleCallbacks: [], // Clear callbacks to prevent stale references
+          onIdleCallbacks: [],       // 清空回调，防止悬空引用
           messages: teammateTask.messages?.length
             ? [teammateTask.messages[teammateTask.messages.length - 1]!]
             : undefined,
           pendingUserMessages: [],
           inProgressToolUseIDs: undefined,
-          abortController: undefined,
+          abortController: undefined,      // 释放 AbortController 引用
           unregisterCleanup: undefined,
           currentWorkAbortController: undefined,
         },
@@ -298,28 +320,28 @@ export function killInProcessTeammate(
     }
   })
 
-  // Remove from team file (outside state updater to avoid file I/O in callback)
+  // 在 AppState 更新完成后，从磁盘团队文件中移除成员（避免在 state updater 中做文件 I/O）
   if (teamName && agentId) {
     removeMemberByAgentId(teamName, agentId)
   }
 
   if (killed) {
+    // 驱逐磁盘输出缓存
     void evictTaskOutput(taskId)
-    // notified:true was pre-set so no XML notification fires; close the SDK
-    // task_started bookend directly. The in-process runner's own
-    // completion/failure emit guards on status==='running' so it won't
-    // double-emit after seeing status:killed.
+    // notified:true 已预设，不会触发 XML 通知；直接关闭 SDK task_started 事件的书签
+    // 进程内执行器的完成/失败 emit 会检查 status==='running'，不会在 status:killed 后重复 emit
     emitTaskTerminatedSdk(taskId, 'stopped', {
       toolUseId,
       summary: description,
     })
+    // 延迟驱逐任务状态，保证 UI 短暂显示"已停止"状态
     setTimeout(
       evictTerminalTask.bind(null, taskId, setAppState),
       STOPPED_DISPLAY_MS,
     )
   }
 
-  // Release perfetto agent registry entry
+  // 释放 Perfetto Agent 注册项
   if (agentId) {
     unregisterPerfettoAgent(agentId)
   }

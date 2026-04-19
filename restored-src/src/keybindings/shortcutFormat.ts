@@ -1,3 +1,25 @@
+/**
+ * 非 React 环境下的快捷键显示文本工具模块
+ *
+ * 【在 Claude Code 键位绑定系统中的位置与作用】
+ * 本文件提供一个不依赖 React Hook 的快捷键显示文本查询函数，
+ * 供命令行工具、服务层等非 React 上下文使用：
+ *
+ *   loadUserBindings（加载并缓存绑定列表）
+ *   resolver.getBindingDisplayText（根据 action+context 查找显示文本）
+ *     → shortcutFormat（本文件，非 React 的快捷键显示文本封装）
+ *       ← query/stopHooks.ts 等非 React 模块调用此函数
+ *
+ * 与 useShortcutDisplay（React Hook 版本）的区别：
+ *  - 本模块不引入 React，可安全用于任意非 React 上下文，不会污染模块依赖图
+ *  - 使用模块级 Set（LOGGED_FALLBACKS）去重，避免对同一 action+context 重复发送分析事件
+ *
+ * 核心导出：
+ *  - getShortcutDisplay(action, context, fallback)：
+ *    查找指定 action 在指定 context 中的快捷键显示文本；
+ *    若未找到则返回 fallback 并（仅首次）触发 tengu_keybinding_fallback_used 分析日志。
+ */
+
 import {
   type AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
   logEvent,

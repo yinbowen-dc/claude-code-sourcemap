@@ -1,3 +1,12 @@
+/**
+ * Cron 调度器租约锁模块。
+ *
+ * 在 Claude Code 系统中，该模块在同一项目目录下存在多个并发 Claude 会话时，
+ * 通过租约锁确保只有一个会话驱动 cron 调度器：
+ * - 首个获取锁的会话成为调度器
+ * - 其他会话保持被动状态并周期性探测锁状态
+ * - 调度器会话退出时释放锁，允许其他会话接管
+ */
 // Scheduler lease lock for .claude/scheduled_tasks.json.
 //
 // When multiple Claude sessions run in the same project directory, only one

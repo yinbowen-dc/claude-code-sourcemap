@@ -1,4 +1,23 @@
 /**
+ * ANSI 转义文本直接渲染为 PNG 图像模块。
+ *
+ * 在 Claude Code 系统中，该模块用于将终端输出（含 ANSI 颜色转义）
+ * 直接渲染为 PNG 截图，替代了此前的 ansiToSvg → @resvg/resvg-wasm 管线。
+ *
+ * 核心思路：SVG 对于本质上是"(字符, 前景色, 粗体) 格子阵列"的终端输出
+ * 只是一个有损中间格式。本模块跳过 SVG，直接将 24×48 位图字体点阵
+ * blit 到 RGBA Uint8Array，再通过 node:zlib 编码为 PNG。
+ *
+ * 为什么不用 resvg-wasm：
+ * - 内嵌 2.36MB WASM + 2.1MB 运行时字体加载（硬编码系统路径，字体不存在
+ *   时返回空白截图）+ 每次渲染约 224ms。
+ * - 本方案约 5–15ms，无外部依赖，在 mac/linux/windows 上输出一致。
+ *
+ * 字体：Fira Code Regular 以 24×48 像素栅格化，8-bit 抗锯齿 alpha
+ * （SIL OFL 1.1 — 见 scripts/LICENSE-FiraCode）。涵盖可打印 ASCII 及
+ * /stats 输出使用的 Unicode 字符。可通过以下命令重新生成：
+ *   bun scripts/generate-bitmap-font.ts
+ *
  * Render ANSI-escaped terminal text directly to a PNG image.
  *
  * Replaces the previous ansiToSvg → @resvg/resvg-wasm pipeline. The SVG was
@@ -43,6 +62,16 @@ const FONT_B64 =
 // Dotted-box fallback for codepoints outside the bundled set.
 const FALLBACK_GLYPH = makeFallbackGlyph()
 
+/**
+ * 创建兜底字形（fallback glyph）：一个带虚线边框的矩形点阵。
+ * 当待渲染字符的码点不在内嵌字体集中时，以此代替，避免渲染出空白。
+ * 边框使用棋盘格点阵（onBorder && (x+y) % 2 === 0），产生视觉上的虚线效果。
+ */
+/**
+ * 创建兜底字形（fallback glyph）：一个带虚线边框的矩形点阵。
+ * 当待渲染字符的码点不在内嵌字体集中时，以此代替，避免渲染出空白。
+ * 边框使用棋盘格点阵（onBorder && (x+y) % 2 === 0），产生视觉上的虚线效果。
+ */
 function makeFallbackGlyph(): Uint8Array {
   const g = new Uint8Array(GLYPH_BYTES)
   for (let y = 2; y < GLYPH_H - 4; y++) {
@@ -57,6 +86,11 @@ function makeFallbackGlyph(): Uint8Array {
 
 const FONT: Map<number, Uint8Array> = decodeFont()
 
+/**
+ * 解码内嵌的 Base64 字体数据，构建码点→字形 alpha 位图的映射表。
+ * 字体格式：[count:u16le][codepoint:u32le, alpha: GLYPH_W×GLYPH_H 字节]...
+ * 每个字形占 GLYPH_W * GLYPH_H = 1152 字节（24×48），值为 8-bit 抗锯齿 alpha。
+ */
 function decodeFont(): Map<number, Uint8Array> {
   const buf = Buffer.from(FONT_B64, 'base64')
   const count = buf.readUInt16LE(0)
@@ -85,6 +119,16 @@ export type AnsiToPngOptions = {
 }
 
 /**
+ * 将 ANSI 转义文本直接渲染为 PNG 字节缓冲区。
+ *
+ * 流程：
+ * 1. 调用 parseAnsi() 将 ANSI 序列解析为 ParsedLine[]（每个 span 含文本/颜色/粗体）
+ * 2. 修剪末尾空行，确保空输入至少有一行
+ * 3. 根据最宽行（列数）和总行数计算图像宽度/高度（含 padding）
+ * 4. 分配 RGBA Uint8Array，以背景色填充，可选圆角裁切
+ * 5. 逐行逐字符 blit 字形（阴影字符走 blitShade，其余走 blitGlyph）
+ * 6. 调用 encodePng() 输出最终 PNG Buffer
+ *
  * Render ANSI-escaped text directly to a PNG buffer.
  * Returns a Buffer containing a valid PNG (RGBA, 8-bit).
  */
@@ -152,13 +196,17 @@ export function ansiToPng(
   return encodePng(px, width, height)
 }
 
-/** Terminal column width of a parsed line. */
+/** 计算一行解析后终端输出所占用的列宽（字符宽度之和）。 */
 function lineWidthCells(line: ParsedLine): number {
   let w = 0
   for (const span of line) w += stringWidth(span.text)
   return w
 }
 
+/**
+ * 将 RGBA 像素缓冲区中所有像素填充为指定背景色（alpha=255）。
+ * 在 blit 字形之前作为底色初始化。
+ */
 function fillBackground(px: Uint8Array, bg: AnsiColor): void {
   for (let i = 0; i < px.length; i += 4) {
     px[i] = bg.r
@@ -178,6 +226,11 @@ const SHADE_ALPHA: Record<number, number> = {
   0x2588: 1.0, // █
 }
 
+/**
+ * 将阴影字符（░▒▓█，对应 Block Elements Unicode）渲染为前景色与背景色
+ * 以指定透明度 alpha 混合后的纯色块，大小为 GLYPH_W × GLYPH_H（含 scale）。
+ * 仿照现代终端对 Block Elements 的处理方式（不使用 VGA 点阵抖动）。
+ */
 function blitShade(
   px: Uint8Array,
   width: number,
@@ -205,6 +258,11 @@ function blitShade(
 }
 
 /**
+ * 将单个字形 blit（位图复制）到 RGBA 像素缓冲区的指定位置 (x, y)，
+ * 支持 scale 倍最近邻放大。每个源像素映射到 scale×scale 块。
+ * Alpha 合成：前景色按字形 alpha 混合到已有背景上。
+ * Bold 效果：将 alpha 值乘以 1.4（上限 255）模拟加粗，无需第二套字体。
+ *
  * Blit one glyph into the RGBA buffer at (x,y), scaled by `scale`
  * (nearest-neighbor). Alpha-composites over the existing background. Bold is
  * synthesized by boosting alpha toward opaque — a cheap approximation that
@@ -240,6 +298,11 @@ function blitGlyph(
 }
 
 /**
+ * 对 RGBA 像素缓冲区的四个角实施圆角裁切：
+ * 对于位于以角为圆心、半径为 r 的四分之一圆外侧的像素，
+ * 将其 alpha 通道置零（透明），产生圆角矩形视觉效果。
+ * 使用半像素偏移（ox = r - dx - 0.5）使边缘抗锯齿更平滑。
+ *
  * Zero out the alpha channel in the four corner regions outside a
  * quarter-circle of radius `r`. Produces rounded-rect corners.
  */
@@ -269,6 +332,10 @@ function roundCorners(
 const PNG_SIG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
 const CRC_TABLE = makeCrcTable()
 
+/**
+ * 预计算 PNG CRC32 校验所需的查找表（Castagnoli 多项式）。
+ * 在模块初始化时执行一次，后续 crc32() 调用直接查表，无需重复计算。
+ */
 function makeCrcTable(): Uint32Array {
   const t = new Uint32Array(256)
   for (let n = 0; n < 256; n++) {
@@ -281,6 +348,10 @@ function makeCrcTable(): Uint32Array {
   return t
 }
 
+/**
+ * 对数据计算 CRC32 校验值（使用预计算的 CRC_TABLE）。
+ * PNG 规范要求每个 chunk 末尾附带 CRC32（含 chunk 类型+数据）。
+ */
 function crc32(data: Uint8Array): number {
   let c = 0xffffffff
   for (let i = 0; i < data.length; i++) {
@@ -289,6 +360,10 @@ function crc32(data: Uint8Array): number {
   return (c ^ 0xffffffff) >>> 0
 }
 
+/**
+ * 构造一个 PNG chunk：[长度:4字节][类型:4字节][数据:N字节][CRC32:4字节]。
+ * 长度仅对数据部分计算，CRC32 覆盖类型+数据（符合 PNG 规范）。
+ */
 function chunk(type: string, data: Uint8Array): Buffer {
   const body = Buffer.alloc(4 + data.length)
   body.write(type, 0, 'ascii')
@@ -301,6 +376,11 @@ function chunk(type: string, data: Uint8Array): Buffer {
 }
 
 /**
+ * 将 RGBA 像素缓冲区编码为 PNG 字节 Buffer（最简实现）。
+ * 格式：8-bit 深度，RGBA 颜色类型（color type 6），每扫描行使用 filter 0（None）。
+ * 压缩：所有扫描行拼接后用 zlib deflate 一次性压缩为单个 IDAT chunk。
+ * 结构：PNG signature → IHDR → IDAT → IEND。
+ *
  * Encode an RGBA pixel buffer as PNG. Minimal encoder: 8-bit depth,
  * color type 6 (RGBA), filter 0 (none) on every scanline, single IDAT.
  */

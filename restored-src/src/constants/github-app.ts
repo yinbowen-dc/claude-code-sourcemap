@@ -1,5 +1,21 @@
+/**
+ * GitHub App 集成常量
+ *
+ * 本文件集中定义将 Claude Code 安装为 GitHub Actions 工作流时使用的
+ * PR 标题、工作流 YAML 内容以及 PR 描述文本。
+ *
+ * 主要用途：
+ * - 用户执行 /github-app 命令时，Claude Code 自动创建一个 PR 来注入
+ *   GitHub Actions 工作流文件，使代码仓库可以通过 @claude 触发 CI 任务
+ * - WORKFLOW_CONTENT：标准的 Claude Code GitHub Action 工作流 YAML 模板
+ * - CODE_REVIEW_PLUGIN_WORKFLOW_CONTENT：代码审查插件专用工作流模板
+ * - PR_BODY：引导用户理解 Claude Code GitHub App 功能的 PR 说明文本
+ */
+
+// PR 标题：创建 GitHub 工作流时提交的 Pull Request 标题
 export const PR_TITLE = 'Add Claude Code GitHub Workflow'
 
+// GitHub Actions 设置文档链接，用于引导用户完成初始配置
 export const GITHUB_ACTION_SETUP_DOCS_URL =
   'https://github.com/anthropics/claude-code-action/blob/main/docs/setup.md'
 

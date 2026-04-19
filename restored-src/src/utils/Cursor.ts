@@ -1,3 +1,14 @@
+/**
+ * 终端输入光标与文本编辑模块。
+ *
+ * 在 Claude Code 系统中，该模块为 REPL 输入框实现类 Emacs/readline 风格的
+ * 光标移动与文本编辑操作，是终端交互层（Ink UI）的核心输入处理引擎：
+ * - 光标移动：字符级、单词级、行首/行尾跳转（支持 Unicode 字素簇）
+ * - Kill Ring：Emacs 风格的剪切/粘贴环（Ctrl+K/U/W 剪切，Ctrl+Y 粘贴，Alt+Y 循环）
+ * - 文本插入与删除：正向/反向删除字符、单词，自动处理宽字符（CJK 等）
+ * - 行折叠支持：在多行显示环境中正确计算光标的跨行移动
+ * - 依赖 intl.js 的字素分段器（Grapheme Segmenter）处理 Unicode 边界
+ */
 import { stringWidth } from '../ink/stringWidth.js'
 import { wrapAnsi } from '../ink/wrapAnsi.js'
 import {

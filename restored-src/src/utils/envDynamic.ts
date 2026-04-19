@@ -1,3 +1,10 @@
+/**
+ * 动态环境检测模块。
+ *
+ * 在 Claude Code 系统中，该模块提供运行时动态检测的环境信息，
+ * 包括 IDE 集成状态（通过文件系统检测 JetBrains 进程）、
+ * 容器环境检测等不适合在启动时静态缓存的环境属性。
+ */
 import { feature } from 'bun:bundle'
 import { stat } from 'fs/promises'
 import memoize from 'lodash-es/memoize.js'

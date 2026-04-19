@@ -1,3 +1,17 @@
+/**
+ * 代码归属（Attribution）文本生成模块。
+ *
+ * 在 Claude Code 系统中，该模块负责为 git commit 和 Pull Request 生成
+ * 包含 Claude 贡献信息的归属文本。
+ *
+ * 主要功能：
+ * 1. getAttributionTexts()：根据用户设置返回 commit 和 PR 的归属文本，
+ *    处理自定义设置、远程模式（返回 Session URL）及旧版设置兼容
+ * 2. getEnhancedPRAttribution()：生成包含 Claude 贡献百分比、N-shot 次数
+ *    和内存访问次数的增强版 PR 归属文本
+ * 3. countUserPromptsInMessages()：统计消息列表中用户实际输入的提示数量
+ *    （排除工具结果块、终端输出和旁链消息）
+ */
 import { feature } from 'bun:bundle'
 import { stat } from 'fs/promises'
 import { getClientType } from '../bootstrap/state.js'
@@ -42,12 +56,11 @@ export type AttributionTexts = {
 }
 
 /**
+ * 根据用户设置返回 commit 和 PR 的归属文本。
+ * 处理：动态模型名、自定义归属设置、远程模式（返回 Session URL）
+ * 以及旧版 includeCoAuthoredBy 设置的向后兼容。
+ *
  * Returns attribution text for commits and PRs based on user settings.
- * Handles:
- * - Dynamic model name via getPublicModelName()
- * - Custom attribution settings (settings.attribution.commit/pr)
- * - Backward compatibility with deprecated includeCoAuthoredBy setting
- * - Remote mode: returns session URL for attribution
  */
 export function getAttributionTexts(): AttributionTexts {
   if (process.env.USER_TYPE === 'ant' && isUndercover()) {
@@ -98,8 +111,8 @@ export function getAttributionTexts(): AttributionTexts {
 }
 
 /**
- * Check if a message content string is terminal output rather than a user prompt.
- * Terminal output includes bash input/output tags and caveat messages about local commands.
+ * 判断消息内容字符串是否为终端输出（而非用户提示）。
+ * 通过检查是否包含终端输出 XML 标签来判断。
  */
 function isTerminalOutput(content: string): boolean {
   for (const tag of TERMINAL_OUTPUT_TAGS) {
@@ -111,10 +124,10 @@ function isTerminalOutput(content: string): boolean {
 }
 
 /**
- * Count user messages with visible text content in a list of non-sidechain messages.
- * Excludes tool_result blocks, terminal output, and empty messages.
+ * 统计消息列表中用户实际输入的提示数量。
+ * 排除工具结果块、终端输出及空消息。调用方应传入已过滤旁链消息的列表。
  *
- * Callers should pass messages already filtered to exclude sidechain messages.
+ * Count user messages with visible text content in a list of non-sidechain messages.
  */
 export function countUserPromptsInMessages(
   messages: ReadonlyArray<{ type: string; message?: { content?: unknown } }>,
@@ -162,11 +175,8 @@ export function countUserPromptsInMessages(
 }
 
 /**
- * Count non-sidechain user messages in transcript entries.
- * Used to calculate the number of "steers" (user prompts - 1).
- *
- * Counts user messages that contain actual user-typed text,
- * excluding tool_result blocks, sidechain messages, and terminal output.
+ * 统计 transcript 条目中非旁链用户消息中的用户提示数量。
+ * 用于计算"steers"数（用户提示数 - 1）。
  */
 function countUserPromptsFromEntries(entries: ReadonlyArray<Entry>): number {
   const nonSidechain = entries.filter(
@@ -177,10 +187,9 @@ function countUserPromptsFromEntries(entries: ReadonlyArray<Entry>): number {
 }
 
 /**
- * Get full attribution data from the provided AppState's attribution state.
- * Uses ALL tracked files from the attribution state (not just staged files)
- * because for PR attribution, files may not be staged yet.
- * Returns null if no attribution data is available.
+ * 从 AppState 的归属状态中获取完整的归属数据。
+ * 使用所有追踪文件（而非仅暂存文件）以支持 PR 归属（文件可能尚未暂存）。
+ * 无归属数据时返回 null。
  */
 async function getPRAttributionData(
   appState: AppState,
@@ -219,8 +228,8 @@ const MEMORY_ACCESS_TOOL_NAMES = new Set([
 ])
 
 /**
- * Count memory file accesses in transcript entries.
- * Uses the same detection conditions as the PostToolUse session file access hooks.
+ * 统计 transcript 条目中对内存文件的访问次数。
+ * 使用与 PostToolUse session 文件访问钩子相同的检测条件。
  */
 function countMemoryFileAccessFromEntries(
   entries: ReadonlyArray<Entry>,
@@ -243,10 +252,9 @@ function countMemoryFileAccessFromEntries(
 }
 
 /**
- * Read session transcript entries and compute prompt count and memory access
- * count. Pre-compact entries are skipped — the N-shot count and memory-access
- * count should reflect only the current conversation arc, not accumulated
- * prompts from before a compaction boundary.
+ * 读取会话 transcript 条目并统计提示数和内存访问数。
+ * 仅统计最后一次压缩边界（compact_boundary）之后的条目，
+ * 反映当前对话弧而非历史累计数据。
  */
 async function getTranscriptStats(): Promise<{
   promptCount: number
@@ -282,17 +290,12 @@ async function getTranscriptStats(): Promise<{
 }
 
 /**
+ * 生成包含 Claude 贡献统计的增强版 PR 归属文本。
+ * 格式示例："🤖 Generated with Claude Code (93% 3-shotted by claude-opus-4-5, 2 memories recalled)"
+ * 规则：显示 Claude 贡献百分比、N-shot 数、短模型名称及内存访问次数。
+ * 若无法计算统计数据则返回默认归属文本。
+ *
  * Get enhanced PR attribution text with Claude contribution stats.
- *
- * Format: "🤖 Generated with Claude Code (93% 3-shotted by claude-opus-4-5)"
- *
- * Rules:
- * - Shows Claude contribution percentage from commit attribution
- * - Shows N-shotted where N is the prompt count (1-shotted, 2-shotted, etc.)
- * - Shows short model name (e.g., claude-opus-4-5)
- * - Returns default attribution if stats can't be computed
- *
- * @param getAppState Function to get the current AppState (from command context)
  */
 export async function getEnhancedPRAttribution(
   getAppState: () => AppState,

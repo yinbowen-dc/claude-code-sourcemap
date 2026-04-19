@@ -1,12 +1,22 @@
 /**
- * InProcessTeammateTask - Manages in-process teammate lifecycle
+ * 【文件定位】InProcessTeammateTask/InProcessTeammateTask.tsx — 进程内队友任务的操作层
  *
- * This component implements the Task interface for in-process teammates.
- * Unlike LocalAgentTask (background agents), in-process teammates:
- * 1. Run in the same Node.js process using AsyncLocalStorage for isolation
- * 2. Have team-aware identity (agentName@teamName)
- * 3. Support plan mode approval flow
- * 4. Can be idle (waiting for work) or active (processing)
+ * 在 Claude Code 系统流程中的位置：
+ *   Swarm 多智能体架构 → spawnInProcess（派生队友）→ InProcessTeammateTask（生命周期管理）
+ *   → AppState 状态更新 → UI（TeammateSpinnerTree、PromptInput 底部选择器）
+ *
+ * 主要职责：
+ *   实现 Task 接口（kill），并提供对进程内队友任务状态进行操作的工具函数：
+ *   - 请求关闭（requestTeammateShutdown）
+ *   - 追加对话消息（appendTeammateMessage）
+ *   - 注入用户消息到待发队列（injectUserMessageToTeammate）
+ *   - 按 agentId 查找任务（findTeammateTaskByAgentId）
+ *   - 获取全部队友任务（getAllInProcessTeammateTasks）
+ *   - 获取按字母排序的运行中队友列表（getRunningTeammatesSorted）
+ *
+ * 与 LocalAgentTask 的区别：
+ *   进程内队友在同一 Node.js 进程中运行，使用 AsyncLocalStorage 隔离，
+ *   支持计划模式审批，并可处于空闲（idle）状态等待新任务。
  */
 
 import { isTerminalTaskStatus, type SetAppState, type Task, type TaskStateBase } from '../../Task.js';
@@ -19,63 +29,102 @@ import type { InProcessTeammateTaskState } from './types.js';
 import { appendCappedMessage, isInProcessTeammateTask } from './types.js';
 
 /**
- * InProcessTeammateTask - Handles in-process teammate execution.
+ * InProcessTeammateTask — 实现 Task 接口的进程内队友任务对象。
+ *
+ * 注册到全局任务注册表后，框架会通过 kill() 方法在用户或系统中止时调用。
+ * kill 实现委托给 spawnInProcess.ts 中的 killInProcessTeammate，
+ * 后者负责发送中止信号并清理 AsyncLocalStorage 上下文。
  */
 export const InProcessTeammateTask: Task = {
   name: 'InProcessTeammateTask',
   type: 'in_process_teammate',
   async kill(taskId, setAppState) {
+    // 委托给进程内队友的专用 kill 实现
     killInProcessTeammate(taskId, setAppState);
   }
 };
 
 /**
- * Request shutdown for a teammate.
+ * 请求关闭一个进程内队友任务。
+ *
+ * 流程：
+ *   1. 通过 updateTaskState 获取当前任务状态
+ *   2. 若任务不处于 running 状态或已请求关闭，则直接返回（幂等）
+ *   3. 否则将 shutdownRequested 标记为 true
+ *
+ * 注意：此函数只设置标志位，实际关闭逻辑由队友自身的运行循环检查该标志后执行。
+ *
+ * @param taskId      - 目标队友任务 ID
+ * @param setAppState - 全局状态更新函数
  */
 export function requestTeammateShutdown(taskId: string, setAppState: SetAppState): void {
   updateTaskState<InProcessTeammateTaskState>(taskId, setAppState, task => {
+    // 仅在运行中且尚未请求关闭时才修改状态
     if (task.status !== 'running' || task.shutdownRequested) {
       return task;
     }
     return {
       ...task,
-      shutdownRequested: true
+      shutdownRequested: true  // 设置关闭请求标志，队友运行循环将在下一检查点响应
     };
   });
 }
 
 /**
- * Append a message to a teammate's conversation history.
- * Used for zoomed view to show the teammate's conversation.
+ * 向队友的对话历史追加一条消息（用于放大查看模式的实时更新）。
+ *
+ * 流程：
+ *   1. 仅在任务状态为 running 时执行
+ *   2. 调用 appendCappedMessage 追加消息，超过上限时自动丢弃最旧的
+ *
+ * @param taskId      - 目标队友任务 ID
+ * @param message     - 要追加的消息对象
+ * @param setAppState - 全局状态更新函数
  */
 export function appendTeammateMessage(taskId: string, message: Message, setAppState: SetAppState): void {
   updateTaskState<InProcessTeammateTaskState>(taskId, setAppState, task => {
+    // 非运行中状态不追加消息（避免竞态下写入已终止任务）
     if (task.status !== 'running') {
       return task;
     }
     return {
       ...task,
-      messages: appendCappedMessage(task.messages, message)
+      messages: appendCappedMessage(task.messages, message)  // 带容量上限的消息追加
     };
   });
 }
 
 /**
- * Inject a user message to a teammate's pending queue.
- * Used when viewing a teammate's transcript to send typed messages to them.
- * Also adds the message to task.messages so it appears immediately in the transcript.
+ * 向队友的待发消息队列注入一条用户消息。
+ *
+ * 用途：当用户在查看队友转录视图时输入消息，该消息需要被投递给队友处理。
+ * 同时将消息写入 task.messages，使其立即在转录视图中可见。
+ *
+ * 流程：
+ *   1. 检查任务是否处于终止状态（terminal），若是则丢弃消息并记录日志
+ *   2. 将消息追加到 pendingUserMessages 队列（队友运行循环将在下轮工具边界消费）
+ *   3. 同时追加到 messages 供转录视图立即展示
+ *
+ * 注意：允许在 running 和 idle（等待输入）状态下注入，仅终止状态拒绝。
+ *
+ * @param taskId      - 目标队友任务 ID
+ * @param message     - 要注入的用户消息文本
+ * @param setAppState - 全局状态更新函数
  */
 export function injectUserMessageToTeammate(taskId: string, message: string, setAppState: SetAppState): void {
   updateTaskState<InProcessTeammateTaskState>(taskId, setAppState, task => {
     // Allow message injection when teammate is running or idle (waiting for input)
     // Only reject if teammate is in a terminal state
+    // 仅在终止状态时拒绝注入；idle 状态（等待输入）也允许
     if (isTerminalTaskStatus(task.status)) {
       logForDebugging(`Dropping message for teammate task ${taskId}: task status is "${task.status}"`);
-      return task;
+      return task;  // 丢弃消息，返回原任务状态
     }
     return {
       ...task,
+      // 追加到待发队列，队友运行循环将在工具轮次边界消费这些消息
       pendingUserMessages: [...task.pendingUserMessages, message],
+      // 同时追加到对话历史，使转录视图立即可见
       messages: appendCappedMessage(task.messages, createUserMessage({
         content: message
       }))
@@ -84,10 +133,20 @@ export function injectUserMessageToTeammate(taskId: string, message: string, set
 }
 
 /**
- * Get teammate task by agent ID from AppState.
- * Prefers running tasks over killed/completed ones in case multiple tasks
- * with the same agentId exist.
- * Returns undefined if not found.
+ * 在 AppState 的任务列表中按 agentId 查找进程内队友任务。
+ *
+ * 优先返回运行中的任务，以应对同一 agentId 存在多个任务（旧的已终止 + 新的运行中）
+ * 的竞态情况。若无运行中任务，则返回第一个匹配的任务（任何状态）。
+ *
+ * 流程：
+ *   1. 遍历所有任务，筛选类型为 in_process_teammate 且 agentId 匹配的任务
+ *   2. 若找到 running 状态的任务，立即返回
+ *   3. 否则记录第一个匹配任务作为 fallback
+ *   4. 循环结束后返回 fallback（可能为 undefined）
+ *
+ * @param agentId - 要查找的 agent ID
+ * @param tasks   - AppState 中的任务映射表
+ * @returns 找到的任务状态，或 undefined
  */
 export function findTeammateTaskByAgentId(agentId: string, tasks: Record<string, TaskStateBase>): InProcessTeammateTaskState | undefined {
   let fallback: InProcessTeammateTaskState | undefined;
@@ -95,10 +154,12 @@ export function findTeammateTaskByAgentId(agentId: string, tasks: Record<string,
     if (isInProcessTeammateTask(task) && task.identity.agentId === agentId) {
       // Prefer running tasks in case old killed tasks still exist in AppState
       // alongside new running ones with the same agentId
+      // 优先返回运行中的任务，避免返回旧的已终止任务
       if (task.status === 'running') {
         return task;
       }
       // Keep first match as fallback in case no running task exists
+      // 若无运行中任务，保留第一个匹配的任务作为降级返回值
       if (!fallback) {
         fallback = task;
       }
@@ -108,19 +169,30 @@ export function findTeammateTaskByAgentId(agentId: string, tasks: Record<string,
 }
 
 /**
- * Get all in-process teammate tasks from AppState.
+ * 获取 AppState 中所有进程内队友任务（不论状态）。
+ *
+ * 通过 isInProcessTeammateTask 类型守卫过滤任务列表。
+ *
+ * @param tasks - AppState 中的任务映射表
+ * @returns 所有进程内队友任务的数组
  */
 export function getAllInProcessTeammateTasks(tasks: Record<string, TaskStateBase>): InProcessTeammateTaskState[] {
   return Object.values(tasks).filter(isInProcessTeammateTask);
 }
 
 /**
- * Get running in-process teammates sorted alphabetically by agentName.
- * Shared between TeammateSpinnerTree display, PromptInput footer selector,
- * and useBackgroundTaskNavigation — selectedIPAgentIndex maps into this
- * array, so all three must agree on sort order.
+ * 获取按 agentName 字母顺序排序的运行中进程内队友列表。
+ *
+ * 用途：TeammateSpinnerTree 展示、PromptInput 底部选择器、
+ * useBackgroundTaskNavigation 均使用此列表，且 selectedIPAgentIndex
+ * 索引映射到此数组，因此三处必须保持相同的排序顺序。
+ *
+ * @param tasks - AppState 中的任务映射表
+ * @returns 按 agentName 字母升序排列的运行中队友任务数组
  */
 export function getRunningTeammatesSorted(tasks: Record<string, TaskStateBase>): InProcessTeammateTaskState[] {
-  return getAllInProcessTeammateTasks(tasks).filter(t => t.status === 'running').sort((a, b) => a.identity.agentName.localeCompare(b.identity.agentName));
+  return getAllInProcessTeammateTasks(tasks)
+    .filter(t => t.status === 'running')  // 仅保留运行中的队友
+    .sort((a, b) => a.identity.agentName.localeCompare(b.identity.agentName));  // 按 agentName 字母升序排序
 }
 //# sourceMappingURL=data:application/json;charset=utf-8;base64,eyJ2ZXJzaW9uIjozLCJuYW1lcyI6WyJpc1Rlcm1pbmFsVGFza1N0YXR1cyIsIlNldEFwcFN0YXRlIiwiVGFzayIsIlRhc2tTdGF0ZUJhc2UiLCJNZXNzYWdlIiwibG9nRm9yRGVidWdnaW5nIiwiY3JlYXRlVXNlck1lc3NhZ2UiLCJraWxsSW5Qcm9jZXNzVGVhbW1hdGUiLCJ1cGRhdGVUYXNrU3RhdGUiLCJJblByb2Nlc3NUZWFtbWF0ZVRhc2tTdGF0ZSIsImFwcGVuZENhcHBlZE1lc3NhZ2UiLCJpc0luUHJvY2Vzc1RlYW1tYXRlVGFzayIsIkluUHJvY2Vzc1RlYW1tYXRlVGFzayIsIm5hbWUiLCJ0eXBlIiwia2lsbCIsInRhc2tJZCIsInNldEFwcFN0YXRlIiwicmVxdWVzdFRlYW1tYXRlU2h1dGRvd24iLCJ0YXNrIiwic3RhdHVzIiwic2h1dGRvd25SZXF1ZXN0ZWQiLCJhcHBlbmRUZWFtbWF0ZU1lc3NhZ2UiLCJtZXNzYWdlIiwibWVzc2FnZXMiLCJpbmplY3RVc2VyTWVzc2FnZVRvVGVhbW1hdGUiLCJwZW5kaW5nVXNlck1lc3NhZ2VzIiwiY29udGVudCIsImZpbmRUZWFtbWF0ZVRhc2tCeUFnZW50SWQiLCJhZ2VudElkIiwidGFza3MiLCJSZWNvcmQiLCJmYWxsYmFjayIsIk9iamVjdCIsInZhbHVlcyIsImlkZW50aXR5IiwiZ2V0QWxsSW5Qcm9jZXNzVGVhbW1hdGVUYXNrcyIsImZpbHRlciIsImdldFJ1bm5pbmdUZWFtbWF0ZXNTb3J0ZWQiLCJ0Iiwic29ydCIsImEiLCJiIiwiYWdlbnROYW1lIiwibG9jYWxlQ29tcGFyZSJdLCJzb3VyY2VzIjpbIkluUHJvY2Vzc1RlYW1tYXRlVGFzay50c3giXSwic291cmNlc0NvbnRlbnQiOlsiLyoqXG4gKiBJblByb2Nlc3NUZWFtbWF0ZVRhc2sgLSBNYW5hZ2VzIGluLXByb2Nlc3MgdGVhbW1hdGUgbGlmZWN5Y2xlXG4gKlxuICogVGhpcyBjb21wb25lbnQgaW1wbGVtZW50cyB0aGUgVGFzayBpbnRlcmZhY2UgZm9yIGluLXByb2Nlc3MgdGVhbW1hdGVzLlxuICogVW5saWtlIExvY2FsQWdlbnRUYXNrIChiYWNrZ3JvdW5kIGFnZW50cyksIGluLXByb2Nlc3MgdGVhbW1hdGVzOlxuICogMS4gUnVuIGluIHRoZSBzYW1lIE5vZGUuanMgcHJvY2VzcyB1c2luZyBBc3luY0xvY2FsU3RvcmFnZSBmb3IgaXNvbGF0aW9uXG4gKiAyLiBIYXZlIHRlYW0tYXdhcmUgaWRlbnRpdHkgKGFnZW50TmFtZUB0ZWFtTmFtZSlcbiAqIDMuIFN1cHBvcnQgcGxhbiBtb2RlIGFwcHJvdmFsIGZsb3dcbiAqIDQuIENhbiBiZSBpZGxlICh3YWl0aW5nIGZvciB3b3JrKSBvciBhY3RpdmUgKHByb2Nlc3NpbmcpXG4gKi9cblxuaW1wb3J0IHtcbiAgaXNUZXJtaW5hbFRhc2tTdGF0dXMsXG4gIHR5cGUgU2V0QXBwU3RhdGUsXG4gIHR5cGUgVGFzayxcbiAgdHlwZSBUYXNrU3RhdGVCYXNlLFxufSBmcm9tICcuLi8uLi9UYXNrLmpzJ1xuaW1wb3J0IHR5cGUgeyBNZXNzYWdlIH0gZnJvbSAnLi4vLi4vdHlwZXMvbWVzc2FnZS5qcydcbmltcG9ydCB7IGxvZ0ZvckRlYnVnZ2luZyB9IGZyb20gJy4uLy4uL3V0aWxzL2RlYnVnLmpzJ1xuaW1wb3J0IHsgY3JlYXRlVXNlck1lc3NhZ2UgfSBmcm9tICcuLi8uLi91dGlscy9tZXNzYWdlcy5qcydcbmltcG9ydCB7IGtpbGxJblByb2Nlc3NUZWFtbWF0ZSB9IGZyb20gJy4uLy4uL3V0aWxzL3N3YXJtL3NwYXduSW5Qcm9jZXNzLmpzJ1xuaW1wb3J0IHsgdXBkYXRlVGFza1N0YXRlIH0gZnJvbSAnLi4vLi4vdXRpbHMvdGFzay9mcmFtZXdvcmsuanMnXG5pbXBvcnQgdHlwZSB7IEluUHJvY2Vzc1RlYW1tYXRlVGFza1N0YXRlIH0gZnJvbSAnLi90eXBlcy5qcydcbmltcG9ydCB7IGFwcGVuZENhcHBlZE1lc3NhZ2UsIGlzSW5Qcm9jZXNzVGVhbW1hdGVUYXNrIH0gZnJvbSAnLi90eXBlcy5qcydcblxuLyoqXG4gKiBJblByb2Nlc3NUZWFtbWF0ZVRhc2sgLSBIYW5kbGVzIGluLXByb2Nlc3MgdGVhbW1hdGUgZXhlY3V0aW9uLlxuICovXG5leHBvcnQgY29uc3QgSW5Qcm9jZXNzVGVhbW1hdGVUYXNrOiBUYXNrID0ge1xuICBuYW1lOiAnSW5Qcm9jZXNzVGVhbW1hdGVUYXNrJyxcbiAgdHlwZTogJ2luX3Byb2Nlc3NfdGVhbW1hdGUnLFxuICBhc3luYyBraWxsKHRhc2tJZCwgc2V0QXBwU3RhdGUpIHtcbiAgICBraWxsSW5Qcm9jZXNzVGVhbW1hdGUodGFza0lkLCBzZXRBcHBTdGF0ZSlcbiAgfSxcbn1cblxuLyoqXG4gKiBSZXF1ZXN0IHNodXRkb3duIGZvciBhIHRlYW1tYXRlLlxuICovXG5leHBvcnQgZnVuY3Rpb24gcmVxdWVzdFRlYW1tYXRlU2h1dGRvd24oXG4gIHRhc2tJZDogc3RyaW5nLFxuICBzZXRBcHBTdGF0ZTogU2V0QXBwU3RhdGUsXG4pOiB2b2lkIHtcbiAgdXBkYXRlVGFza1N0YXRlPEluUHJvY2Vzc1RlYW1tYXRlVGFza1N0YXRlPih0YXNrSWQsIHNldEFwcFN0YXRlLCB0YXNrID0+IHtcbiAgICBpZiAodGFzay5zdGF0dXMgIT09ICdydW5uaW5nJyB8fCB0YXNrLnNodXRkb3duUmVxdWVzdGVkKSB7XG4gICAgICByZXR1cm4gdGFza1xuICAgIH1cblxuICAgIHJldHVybiB7XG4gICAgICAuLi50YXNrLFxuICAgICAgc2h1dGRvd25SZXF1ZXN0ZWQ6IHRydWUsXG4gICAgfVxuICB9KVxufVxuXG4vKipcbiAqIEFwcGVuZCBhIG1lc3NhZ2UgdG8gYSB0ZWFtbWF0ZSdzIGNvbnZlcnNhdGlvbiBoaXN0b3J5LlxuICogVXNlZCBmb3Igem9vbWVkIHZpZXcgdG8gc2hvdyB0aGUgdGVhbW1hdGUncyBjb252ZXJzYXRpb24uXG4gKi9cbmV4cG9ydCBmdW5jdGlvbiBhcHBlbmRUZWFtbWF0ZU1lc3NhZ2UoXG4gIHRhc2tJZDogc3RyaW5nLFxuICBtZXNzYWdlOiBNZXNzYWdlLFxuICBzZXRBcHBTdGF0ZTogU2V0QXBwU3RhdGUsXG4pOiB2b2lkIHtcbiAgdXBkYXRlVGFza1N0YXRlPEluUHJvY2Vzc1RlYW1tYXRlVGFza1N0YXRlPih0YXNrSWQsIHNldEFwcFN0YXRlLCB0YXNrID0+IHtcbiAgICBpZiAodGFzay5zdGF0dXMgIT09ICdydW5uaW5nJykge1xuICAgICAgcmV0dXJuIHRhc2tcbiAgICB9XG5cbiAgICByZXR1cm4ge1xuICAgICAgLi4udGFzayxcbiAgICAgIG1lc3NhZ2VzOiBhcHBlbmRDYXBwZWRNZXNzYWdlKHRhc2subWVzc2FnZXMsIG1lc3NhZ2UpLFxuICAgIH1cbiAgfSlcbn1cblxuLyoqXG4gKiBJbmplY3QgYSB1c2VyIG1lc3NhZ2UgdG8gYSB0ZWFtbWF0ZSdzIHBlbmRpbmcgcXVldWUuXG4gKiBVc2VkIHdoZW4gdmlld2luZyBhIHRlYW1tYXRlJ3MgdHJhbnNjcmlwdCB0byBzZW5kIHR5cGVkIG1lc3NhZ2VzIHRvIHRoZW0uXG4gKiBBbHNvIGFkZHMgdGhlIG1lc3NhZ2UgdG8gdGFzay5tZXNzYWdlcyBzbyBpdCBhcHBlYXJzIGltbWVkaWF0ZWx5IGluIHRoZSB0cmFuc2NyaXB0LlxuICovXG5leHBvcnQgZnVuY3Rpb24gaW5qZWN0VXNlck1lc3NhZ2VUb1RlYW1tYXRlKFxuICB0YXNrSWQ6IHN0cmluZyxcbiAgbWVzc2FnZTogc3RyaW5nLFxuICBzZXRBcHBTdGF0ZTogU2V0QXBwU3RhdGUsXG4pOiB2b2lkIHtcbiAgdXBkYXRlVGFza1N0YXRlPEluUHJvY2Vzc1RlYW1tYXRlVGFza1N0YXRlPih0YXNrSWQsIHNldEFwcFN0YXRlLCB0YXNrID0+IHtcbiAgICAvLyBBbGxvdyBtZXNzYWdlIGluamVjdGlvbiB3aGVuIHRlYW1tYXRlIGlzIHJ1bm5pbmcgb3IgaWRsZSAod2FpdGluZyBmb3IgaW5wdXQpXG4gICAgLy8gT25seSByZWplY3QgaWYgdGVhbW1hdGUgaXMgaW4gYSB0ZXJtaW5hbCBzdGF0ZVxuICAgIGlmIChpc1Rlcm1pbmFsVGFza1N0YXR1cyh0YXNrLnN0YXR1cykpIHtcbiAgICAgIGxvZ0ZvckRlYnVnZ2luZyhcbiAgICAgICAgYERyb3BwaW5nIG1lc3NhZ2UgZm9yIHRlYW1tYXRlIHRhc2sgJHt0YXNrSWR9OiB0YXNrIHN0YXR1cyBpcyBcIiR7dGFzay5zdGF0dXN9XCJgLFxuICAgICAgKVxuICAgICAgcmV0dXJuIHRhc2tcbiAgICB9XG5cbiAgICByZXR1cm4ge1xuICAgICAgLi4udGFzayxcbiAgICAgIHBlbmRpbmdVc2VyTWVzc2FnZXM6IFsuLi50YXNrLnBlbmRpbmdVc2VyTWVzc2FnZXMsIG1lc3NhZ2VdLFxuICAgICAgbWVzc2FnZXM6IGFwcGVuZENhcHBlZE1lc3NhZ2UoXG4gICAgICAgIHRhc2subWVzc2FnZXMsXG4gICAgICAgIGNyZWF0ZVVzZXJNZXNzYWdlKHsgY29udGVudDogbWVzc2FnZSB9KSxcbiAgICAgICksXG4gICAgfVxuICB9KVxufVxuXG4vKipcbiAqIEdldCB0ZWFtbWF0ZSB0YXNrIGJ5IGFnZW50IElEIGZyb20gQXBwU3RhdGUuXG4gKiBQcmVmZXJzIHJ1bm5pbmcgdGFza3Mgb3ZlciBraWxsZWQvY29tcGxldGVkIG9uZXMgaW4gY2FzZSBtdWx0aXBsZSB0YXNrc1xuICogd2l0aCB0aGUgc2FtZSBhZ2VudElkIGV4aXN0LlxuICogUmV0dXJucyB1bmRlZmluZWQgaWYgbm90IGZvdW5kLlxuICovXG5leHBvcnQgZnVuY3Rpb24gZmluZFRlYW1tYXRlVGFza0J5QWdlbnRJZChcbiAgYWdlbnRJZDogc3RyaW5nLFxuICB0YXNrczogUmVjb3JkPHN0cmluZywgVGFza1N0YXRlQmFzZT4sXG4pOiBJblByb2Nlc3NUZWFtbWF0ZVRhc2tTdGF0ZSB8IHVuZGVmaW5lZCB7XG4gIGxldCBmYWxsYmFjazogSW5Qcm9jZXNzVGVhbW1hdGVUYXNrU3RhdGUgfCB1bmRlZmluZWRcbiAgZm9yIChjb25zdCB0YXNrIG9mIE9iamVjdC52YWx1ZXModGFza3MpKSB7XG4gICAgaWYgKGlzSW5Qcm9jZXNzVGVhbW1hdGVUYXNrKHRhc2spICYmIHRhc2suaWRlbnRpdHkuYWdlbnRJZCA9PT0gYWdlbnRJZCkge1xuICAgICAgLy8gUHJlZmVyIHJ1bm5pbmcgdGFza3MgaW4gY2FzZSBvbGQga2lsbGVkIHRhc2tzIHN0aWxsIGV4aXN0IGluIEFwcFN0YXRlXG4gICAgICAvLyBhbG9uZ3NpZGUgbmV3IHJ1bm5pbmcgb25lcyB3aXRoIHRoZSBzYW1lIGFnZW50SWRcbiAgICAgIGlmICh0YXNrLnN0YXR1cyA9PT0gJ3J1bm5pbmcnKSB7XG4gICAgICAgIHJldHVybiB0YXNrXG4gICAgICB9XG4gICAgICAvLyBLZWVwIGZpcnN0IG1hdGNoIGFzIGZhbGxiYWNrIGluIGNhc2Ugbm8gcnVubmluZyB0YXNrIGV4aXN0c1xuICAgICAgaWYgKCFmYWxsYmFjaykge1xuICAgICAgICBmYWxsYmFjayA9IHRhc2tcbiAgICAgIH1cbiAgICB9XG4gIH1cbiAgcmV0dXJuIGZhbGxiYWNrXG59XG5cbi8qKlxuICogR2V0IGFsbCBpbi1wcm9jZXNzIHRlYW1tYXRlIHRhc2tzIGZyb20gQXBwU3RhdGUuXG4gKi9cbmV4cG9ydCBmdW5jdGlvbiBnZXRBbGxJblByb2Nlc3NUZWFtbWF0ZVRhc2tzKFxuICB0YXNrczogUmVjb3JkPHN0cmluZywgVGFza1N0YXRlQmFzZT4sXG4pOiBJblByb2Nlc3NUZWFtbWF0ZVRhc2tTdGF0ZVtdIHtcbiAgcmV0dXJuIE9iamVjdC52YWx1ZXModGFza3MpLmZpbHRlcihpc0luUHJvY2Vzc1RlYW1tYXRlVGFzaylcbn1cblxuLyoqXG4gKiBHZXQgcnVubmluZyBpbi1wcm9jZXNzIHRlYW1tYXRlcyBzb3J0ZWQgYWxwaGFiZXRpY2FsbHkgYnkgYWdlbnROYW1lLlxuICogU2hhcmVkIGJldHdlZW4gVGVhbW1hdGVTcGlubmVyVHJlZSBkaXNwbGF5LCBQcm9tcHRJbnB1dCBmb290ZXIgc2VsZWN0b3IsXG4gKiBhbmQgdXNlQmFja2dyb3VuZFRhc2tOYXZpZ2F0aW9uIOKAlCBzZWxlY3RlZElQQWdlbnRJbmRleCBtYXBzIGludG8gdGhpc1xuICogYXJyYXksIHNvIGFsbCB0aHJlZSBtdXN0IGFncmVlIG9uIHNvcnQgb3JkZXIuXG4gKi9cbmV4cG9ydCBmdW5jdGlvbiBnZXRSdW5uaW5nVGVhbW1hdGVzU29ydGVkKFxuICB0YXNrczogUmVjb3JkPHN0cmluZywgVGFza1N0YXRlQmFzZT4sXG4pOiBJblByb2Nlc3NUZWFtbWF0ZVRhc2tTdGF0ZVtdIHtcbiAgcmV0dXJuIGdldEFsbEluUHJvY2Vzc1RlYW1tYXRlVGFza3ModGFza3MpXG4gICAgLmZpbHRlcih0ID0+IHQuc3RhdHVzID09PSAncnVubmluZycpXG4gICAgLnNvcnQoKGEsIGIpID0+IGEuaWRlbnRpdHkuYWdlbnROYW1lLmxvY2FsZUNvbXBhcmUoYi5pZGVudGl0eS5hZ2VudE5hbWUpKVxufVxuIl0sIm1hcHBpbmdzIjoiQUFBQTtBQUNBO0FBQ0E7QUFDQTtBQUNBO0FBQ0E7QUFDQTtBQUNBO0FBQ0E7QUFDQTs7QUFFQSxTQUNFQSxvQkFBb0IsRUFDcEIsS0FBS0MsV0FBVyxFQUNoQixLQUFLQyxJQUFJLEVBQ1QsS0FBS0MsYUFBYSxRQUNiLGVBQWU7QUFDdEIsY0FBY0MsT0FBTyxRQUFRLHdCQUF3QjtBQUNyRCxTQUFTQyxlQUFlLFFBQVEsc0JBQXNCO0FBQ3RELFNBQVNDLGlCQUFpQixRQUFRLHlCQUF5QjtBQUMzRCxTQUFTQyxxQkFBcUIsUUFBUSxxQ0FBcUM7QUFDM0UsU0FBU0MsZUFBZSxRQUFRLCtCQUErQjtBQUMvRCxjQUFjQywwQkFBMEIsUUFBUSxZQUFZO0FBQzVELFNBQVNDLG1CQUFtQixFQUFFQyx1QkFBdUIsUUFBUSxZQUFZOztBQUV6RTtBQUNBO0FBQ0E7QUFDQSxPQUFPLE1BQU1DLHFCQUFxQixFQUFFVixJQUFJLEdBQUc7RUFDekNXLElBQUksRUFBRSx1QkFBdUI7RUFDN0JDLElBQUksRUFBRSxxQkFBcUI7RUFDM0IsTUFBTUMsSUFBSUEsQ0FBQ0MsTUFBTSxFQUFFQyxXQUFXLEVBQUU7SUFDOUJWLHFCQUFxQixDQUFDUyxNQUFNLEVBQUVDLFdBQVcsQ0FBQztFQUM1QztBQUNGLENBQUM7O0FBRUQ7QUFD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

@@ -1,9 +1,9 @@
 /**
- * Terminal preference capture for deep link handling.
+ * Deep Link 终端偏好设置模块。
  *
- * Separate from terminalLauncher.ts so interactiveHelpers.tsx can import
- * this without pulling the full launcher module into the startup path
- * (which would defeat LODESTONE tree-shaking).
+ * 在 Claude Code 系统中，该模块独立于 terminalLauncher.ts 存在，
+ * 供 interactiveHelpers.tsx 在不引入完整启动器模块（避免影响 LODESTONE tree-shaking）的情况下
+ * 读写用户的终端偏好配置。
  */
 
 import { getGlobalConfig, saveGlobalConfig } from '../config.js'

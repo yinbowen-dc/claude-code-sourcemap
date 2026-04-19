@@ -1,3 +1,26 @@
+/**
+ * DiffFileList.tsx — 差异文件列表组件
+ *
+ * 在 Claude Code 系统流程中的位置：
+ *   工具响应层 → 差异展示 → 文件列表视图（DiffDialog list 模式下的内容区）
+ *
+ * 主要功能：
+ *   1. DiffFileList：React 组件，渲染可滚动的文件变更列表。
+ *      - 最多同时显示 5 个文件（MAX_VISIBLE_FILES），多余时显示"↑N more"/"↓N more"提示
+ *      - 使用 bb0 标记块计算虚拟化滚动窗口（startIndex/endIndex），保持选中项居中
+ *      - 使用 truncateStartToWidth 从路径头部截断，确保文件名（尾部）始终可见
+ *   2. FileItem：单行文件条目组件，包含指针符号（▶）、文件路径和右对齐的 FileStats
+ *   3. FileStats：文件统计信息组件，根据文件类型显示不同内容：
+ *      - isUntracked → "untracked"（斜体）
+ *      - isBinary → "Binary file"（斜体）
+ *      - isLargeFile → "Large file modified"（斜体）
+ *      - 普通文件 → "+N -M (truncated)" 格式
+ *
+ * React Compiler 缓存槽分配：
+ *   DiffFileList：_c(36) — $[0]-$[4] 滚动窗口；$[5] 空列表文本；$[6]-$[29] 内容区各元素；$[30]-$[35] 最终 JSX
+ *   FileItem：_c(14) — $[0]-$[2] displayPath；$[3]-$[6] 文件行文本；$[7] 弹性空格；$[8]-$[13] 完整行 JSX
+ *   FileStats：_c(20) — 特殊状态各 2 槽；普通统计 4+1 槽
+ */
 import { c as _c } from "react/compiler-runtime";
 import figures from 'figures';
 import React, { useMemo } from 'react';
@@ -6,11 +29,34 @@ import { useTerminalSize } from '../../hooks/useTerminalSize.js';
 import { Box, Text } from '../../ink.js';
 import { truncateStartToWidth } from '../../utils/format.js';
 import { plural } from '../../utils/stringUtils.js';
+
+// 同时显示的最大文件数，超出时启用虚拟化滚动
 const MAX_VISIBLE_FILES = 5;
+
+// Props 类型：files 为文件列表，selectedIndex 为当前高亮行的索引
 type Props = {
   files: DiffFile[];
   selectedIndex: number;
 };
+
+/**
+ * DiffFileList 组件
+ *
+ * 整体流程：
+ *   1. 通过 bb0 标记块计算可见窗口（startIndex/endIndex）：
+ *      - 文件数 ≤ 5：显示全部（startIndex=0, endIndex=files.length）
+ *      - 文件数 > 5：以 selectedIndex 为中心，窗口大小为 5，边界时向上/向下调整
+ *   2. 文件列表为空时返回静态"No changed files"文本（sentinel 缓存）
+ *   3. 计算 visibleFiles、hasMoreAbove、hasMoreBelow、needsPagination、maxPathWidth
+ *   4. 渲染：
+ *      - 有更多文件在上方时：显示 "↑ N more files" 提示
+ *      - 可见文件列表：逐行渲染 FileItem
+ *      - 有更多文件在下方时：显示 "↓ N more files" 提示
+ *
+ * 在系统中的角色：
+ *   提供 DiffDialog list 模式下的文件选择界面，
+ *   支持超长列表的虚拟化显示，避免终端溢出。
+ */
 export function DiffFileList(t0) {
   const $ = _c(36);
   const {

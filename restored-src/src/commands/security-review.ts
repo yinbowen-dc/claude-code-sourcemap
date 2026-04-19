@@ -1,8 +1,41 @@
+/**
+ * security-review 命令实现（commands/security-review.ts）
+ *
+ * 本文件实现 /security-review 命令，为当前 git 分支上的代码变更提供专项安全审查。
+ * 它通过内嵌一个详尽的 Markdown 格式 prompt（含 frontmatter 工具白名单配置）来驱动
+ * Claude 扮演资深安全工程师角色，对 PR diff 进行三阶段深度安全分析。
+ *
+ * 在 Claude Code 整体流程中的位置：
+ *   用户输入 /security-review → createMovedToPluginCommand 路由 →
+ *   若 marketplace 未上线则调用 getPromptWhileMarketplaceIsPrivate() →
+ *   解析 frontmatter（工具白名单）→ 执行 Shell 命令填充 git 信息 →
+ *   将完整 prompt 注入对话 → Claude 分三步（识别漏洞 → 并行验证 → 过滤误报）输出报告。
+ *
+ * 安全审查的三个阶段（由 prompt 驱动）：
+ *   Phase 1：仓库上下文调研（理解现有安全框架和编码规范）；
+ *   Phase 2：对比分析（新代码 vs 已有安全模式，找出偏差）；
+ *   Phase 3：漏洞评估（追踪数据流、识别注入点）。
+ *
+ * 分析策略：主任务发现漏洞 → 并行子任务过滤误报 → 置信度 < 8 的结果自动丢弃。
+ */
+
 import { parseFrontmatter } from '../utils/frontmatterParser.js'
 import { parseSlashCommandToolsFromFrontmatter } from '../utils/markdownConfigLoader.js'
 import { executeShellCommandsInPrompt } from '../utils/promptShellExecution.js'
 import { createMovedToPluginCommand } from './createMovedToPluginCommand.js'
 
+/**
+ * 内嵌的安全审查 prompt 模板（Markdown + frontmatter 格式）。
+ *
+ * frontmatter 中的 allowed-tools 定义了此命令可调用的工具白名单：
+ *   仅允许只读的 git/文件系统命令，严禁写操作（防止审查过程中意外修改代码）。
+ *
+ * prompt 正文包含：
+ *   - Shell 命令占位符（!`...`），在注入前由 executeShellCommandsInPrompt 填充实际输出；
+ *   - 详细的安全分析指令，涵盖输入验证、认证授权、加密、代码注入、数据暴露等类别；
+ *   - 严格的误报过滤规则（16 条硬性排除 + 12 条先例），确保报告质量；
+ *   - 必须使用并行子任务架构进行双重验证，置信度阈值 >= 8 才输出。
+ */
 const SECURITY_REVIEW_MARKDOWN = `---
 allowed-tools: Bash(git diff:*), Bash(git status:*), Bash(git log:*), Bash(git show:*), Bash(git remote show:*), Read, Glob, Grep, LS, Task
 description: Complete a security review of the pending changes on the current branch
@@ -195,6 +228,19 @@ Begin your analysis now. Do this in 3 steps:
 
 Your final reply must contain the markdown report and nothing else.`
 
+/**
+ * 导出 /security-review 命令对象。
+ * 使用 createMovedToPluginCommand 工厂函数包装，支持未来迁移到插件 marketplace 后的无缝切换：
+ *   - 当 marketplace 上线后，命令自动路由到同名插件（security-review）执行；
+ *   - 当前阶段（marketplace 仍为私有）调用 getPromptWhileMarketplaceIsPrivate() 生成 prompt。
+ *
+ * getPromptWhileMarketplaceIsPrivate 执行步骤：
+ *   1. parseFrontmatter：从 SECURITY_REVIEW_MARKDOWN 提取 YAML frontmatter 配置；
+ *   2. parseSlashCommandToolsFromFrontmatter：将 allowed-tools 字符串解析为工具白名单数组；
+ *   3. executeShellCommandsInPrompt：将 prompt 中的 !`cmd` 占位符替换为实际命令输出
+ *      （git status、git diff 等），同时在执行上下文中注入工具白名单以限制可用工具；
+ *   4. 返回标准内容块格式，供命令系统注入对话。
+ */
 export default createMovedToPluginCommand({
   name: 'security-review',
   description:
@@ -204,14 +250,17 @@ export default createMovedToPluginCommand({
   pluginCommand: 'security-review',
   async getPromptWhileMarketplaceIsPrivate(_args, context) {
     // Parse frontmatter from the markdown
+    // 从内嵌 Markdown 中提取 YAML frontmatter（工具白名单配置）和正文内容
     const parsed = parseFrontmatter(SECURITY_REVIEW_MARKDOWN)
 
     // Parse allowed tools from frontmatter
+    // 将 frontmatter 中的 allowed-tools 字符串解析为结构化工具权限列表
     const allowedTools = parseSlashCommandToolsFromFrontmatter(
       parsed.frontmatter['allowed-tools'],
     )
 
     // Execute bash commands in the prompt
+    // 将 prompt 中的 !`cmd` Shell 命令占位符展开为实际输出，并注入工具权限限制
     const processedContent = await executeShellCommandsInPrompt(
       parsed.content,
       {
@@ -224,6 +273,7 @@ export default createMovedToPluginCommand({
               ...appState.toolPermissionContext,
               alwaysAllowRules: {
                 ...appState.toolPermissionContext.alwaysAllowRules,
+                // 将 frontmatter 工具白名单注入 alwaysAllowRules，覆盖默认权限控制
                 command: allowedTools,
               },
             },
@@ -236,7 +286,7 @@ export default createMovedToPluginCommand({
     return [
       {
         type: 'text',
-        text: processedContent,
+        text: processedContent,  // 返回已展开 Shell 输出的完整 prompt 文本
       },
     ]
   },

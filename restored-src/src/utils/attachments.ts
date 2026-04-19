@@ -1,3 +1,17 @@
+/**
+ * 消息附件构建模块（系统提示与用户消息注入）。
+ *
+ * 在 Claude Code 系统中，该模块是 API 请求构建的核心，负责将各类上下文信息
+ * 组装为 Claude API 消息中的附件内容，包括：
+ * - 内存文件（CLAUDE.md 及条件规则）读取与注入
+ * - IDE 诊断信息、文件状态缓存（diff 预览）
+ * - Plan 模式、Auto 模式的状态注入
+ * - 图片粘贴内容（含自动裁剪/压缩）
+ * - MCP 工具资源、技能工具命令列表
+ * - Agent 定义列表（swarm 场景）
+ * - Task 附件（任务框架输出）
+ * - todo 列表与任务状态注入
+ */
 // biome-ignore-all assist/source/organizeImports: ANT-ONLY import markers must not be reordered
 import {
   logEvent,
@@ -737,7 +751,16 @@ export type TeamContextAttachment = {
 }
 
 /**
- * This is janky
+ * 主附件收集函数，汇总所有上下文附件并返回给模型。
+ *
+ * 执行流程：
+ * 1. 若设置了 CLAUDE_CODE_DISABLE_ATTACHMENTS 或 CLAUDE_CODE_SIMPLE，仅返回排队命令附件
+ * 2. 并发处理用户输入附件（@提及文件、MCP 资源、代理提及、技能发现）
+ * 3. 等待用户输入附件完成后（确保 nestedMemoryAttachmentTriggers 已填充），再并发处理线程附件
+ * 4. 主线程额外处理记忆、技能列表、LSP 诊断、规划模式等附件
+ * 5. 汇总并过滤掉 undefined/null 值后返回
+ *
+ * 注意：附件生成有 1 秒超时，防止阻塞用户提交。
  * TODO: Generate attachments when we create messages
  */
 export async function getAttachments(
@@ -1002,6 +1025,13 @@ export async function getAttachments(
   ].filter(a => a !== undefined && a !== null)
 }
 
+/**
+ * 附件生成器的错误隔离与计时包装器。
+ *
+ * 调用附件生成函数 f()，捕获所有异常（避免单个附件失败影响全局），
+ * 并以 5% 的概率上报耗时和附件大小事件（控制日志量）。
+ * 出错时返回空数组，确保附件流程继续运行。
+ */
 async function maybe<A>(label: string, f: () => Promise<A[]>): Promise<A[]> {
   const startTime = Date.now()
   try {
@@ -1043,6 +1073,14 @@ async function maybe<A>(label: string, f: () => Promise<A[]>): Promise<A[]> {
 
 const INLINE_NOTIFICATION_MODES = new Set(['prompt', 'task-notification'])
 
+/**
+ * 将排队命令转换为 queued_command 类型的附件列表。
+ *
+ * 仅处理 mode 为 'prompt' 或 'task-notification' 的命令。
+ * task-notification 命令在代理主动循环中不能通过 useQueueProcessor 消费，
+ * 必须通过此函数注入附件才能防止 Sleep 无限唤醒。
+ * 若命令携带粘贴图片，将文本和图片合并为 ContentBlockParam 数组。
+ */
 export async function getQueuedCommandAttachments(
   queuedCommands: QueuedCommand[],
 ): Promise<Attachment[]> {
@@ -1082,6 +1120,13 @@ export async function getQueuedCommandAttachments(
   )
 }
 
+/**
+ * 获取子代理待处理消息并转换为 queued_command 附件。
+ *
+ * 从 AppState 中排空当前代理 ID 的待处理消息队列，
+ * 每条消息包装为 origin.kind='coordinator'、isMeta=true 的附件，
+ * 供协调者向子代理传递带外通知。主线程（无 agentId）直接返回空数组。
+ */
 export function getAgentPendingMessageAttachments(
   toolUseContext: ToolUseContext,
 ): Attachment[] {
@@ -1100,6 +1145,12 @@ export function getAgentPendingMessageAttachments(
   }))
 }
 
+/**
+ * 将粘贴内容记录中的有效图片转换为 ImageBlockParam 数组。
+ *
+ * 过滤出合法的图片粘贴（isValidImagePaste），并行读取各图片数据，
+ * 处理失败时记录错误并跳过，最终返回可嵌入消息的图片内容块列表。
+ */
 async function buildImageContentBlocks(
   pastedContents: Record<number, PastedContent> | undefined,
 ): Promise<ImageBlockParam[]> {
@@ -1128,6 +1179,13 @@ async function buildImageContentBlocks(
   return results
 }
 
+/**
+ * 统计距上次 plan_mode 附件以来经过的人类轮次数，并判断是否已发送过 plan_mode 附件。
+ *
+ * 从消息列表末尾向前遍历，计数非 meta、非工具结果的用户消息轮次，
+ * 直到遇到 plan_mode 或 plan_mode_reentry 附件时停止。
+ * 返回 turnCount（用于节流判断）和 foundPlanModeAttachment（是否已初始化过）。
+ */
 function getPlanModeAttachmentTurnCount(messages: Message[]): {
   turnCount: number
   foundPlanModeAttachment: boolean
@@ -1163,8 +1221,9 @@ function getPlanModeAttachmentTurnCount(messages: Message[]): {
 }
 
 /**
- * Count plan_mode attachments since the last plan_mode_exit (or from start if no exit).
- * This ensures the full/sparse cycle resets when re-entering plan mode.
+ * 统计自上次 plan_mode_exit 以来的 plan_mode 附件数量。
+ * 用于确定当前是第几次提醒，决定使用完整（full）还是简略（sparse）提醒格式。
+ * 重新进入规划模式时，计数从 plan_mode_exit 后重置，保证 full/sparse 周期正确。
  */
 function countPlanModeAttachmentsSinceLastExit(messages: Message[]): number {
   let count = 0
@@ -1183,6 +1242,16 @@ function countPlanModeAttachmentsSinceLastExit(messages: Message[]): number {
   return count
 }
 
+/**
+ * 生成规划模式（plan mode）提醒附件列表。
+ *
+ * 流程：
+ * 1. 若当前不在 plan 模式，直接返回空数组
+ * 2. 根据轮次计数节流，避免每轮都提醒（首次必附）
+ * 3. 若本会话中曾退出规划模式且计划文件仍存在，附加 plan_mode_reentry 附件
+ * 4. 根据 attachmentCount 决定是完整提醒（full）还是简略提醒（sparse）
+ * 5. 将 plan_mode 主附件加入列表并返回
+ */
 async function getPlanModeAttachments(
   messages: Message[] | undefined,
   toolUseContext: ToolUseContext,
@@ -1242,8 +1311,11 @@ async function getPlanModeAttachments(
 }
 
 /**
- * Returns a plan_mode_exit attachment if we just exited plan mode.
- * This is a one-time notification to tell the model it's no longer in plan mode.
+ * 生成退出规划模式的一次性通知附件。
+ *
+ * 当 needsPlanModeExitAttachment() 标志为 true 且当前不在 plan 模式时，
+ * 清除标志并返回 plan_mode_exit 附件，告知模型已退出规划模式。
+ * 若标志未设置或当前仍在 plan 模式，返回空数组。
  */
 async function getPlanModeExitAttachment(
   toolUseContext: ToolUseContext,
@@ -1272,6 +1344,14 @@ async function getPlanModeExitAttachment(
   return [{ type: 'plan_mode_exit', planFilePath, planExists }]
 }
 
+/**
+ * 统计距上次 auto_mode 附件以来经过的人类轮次数，并判断是否已发送过 auto_mode 附件。
+ *
+ * 从消息列表末尾向前遍历，计数非 meta、非工具结果的用户消息，
+ * 遇到 auto_mode 附件时停止并标记 foundAutoModeAttachment=true，
+ * 遇到 auto_mode_exit 时中断（退出重置节流计数器）。
+ * 用于判断当前是否需要再次附加自动模式提醒。
+ */
 function getAutoModeAttachmentTurnCount(messages: Message[]): {
   turnCount: number
   foundAutoModeAttachment: boolean
@@ -1313,8 +1393,9 @@ function getAutoModeAttachmentTurnCount(messages: Message[]): {
 }
 
 /**
- * Count auto_mode attachments since the last auto_mode_exit (or from start if no exit).
- * This ensures the full/sparse cycle resets when re-entering auto mode.
+ * 统计自上次 auto_mode_exit 以来的 auto_mode 附件数量。
+ * 用于确定当前是第几次提醒，决定使用完整（full）还是简略（sparse）提醒格式。
+ * 重新进入自动模式时，计数从 auto_mode_exit 后重置，保证 full/sparse 周期正确。
  */
 function countAutoModeAttachmentsSinceLastExit(messages: Message[]): number {
   let count = 0
@@ -1332,6 +1413,13 @@ function countAutoModeAttachmentsSinceLastExit(messages: Message[]): number {
   return count
 }
 
+/**
+ * 生成自动模式（auto mode）提醒附件列表。
+ *
+ * 在 mode==='auto' 或 plan-with-auto-active 时触发。
+ * 根据轮次计数节流（首次必附），并依据 attachmentCount 决定 full/sparse 格式。
+ * 返回包含 reminderType 的 auto_mode 附件数组。
+ */
 async function getAutoModeAttachments(
   messages: Message[] | undefined,
   toolUseContext: ToolUseContext,
@@ -1374,8 +1462,11 @@ async function getAutoModeAttachments(
 }
 
 /**
- * Returns an auto_mode_exit attachment if we just exited auto mode.
- * This is a one-time notification to tell the model it's no longer in auto mode.
+ * 生成退出自动模式的一次性通知附件。
+ *
+ * 当 needsAutoModeExitAttachment() 为 true 且当前确实不在自动模式时，
+ * 清除标志并返回 auto_mode_exit 附件，告知模型已退出自动模式。
+ * 若自动模式仍处于活跃状态（包括 plan-with-auto），则清除标志并返回空数组。
  */
 async function getAutoModeExitAttachment(
   toolUseContext: ToolUseContext,
@@ -1400,15 +1491,15 @@ async function getAutoModeExitAttachment(
 }
 
 /**
+ * 检测本地日期是否跨越午夜，并在变更时发出 date_change 附件通知模型。
+ *
+ * 首次调用时仅记录日期，不生成附件。
+ * 日期发生变化时更新缓存日期并返回附件；未变化时返回空数组。
+ * 注意：有意保留 messages[0] 中的旧日期，避免清除缓存前缀导致大量 cache_creation tokens。
+ * 若 KAIROS 功能启用且处于活跃状态，还会触发跨日 transcript 片段落盘。
+ *
  * Detects when the local date has changed since the last turn (user coding
  * past midnight) and emits an attachment to notify the model.
- *
- * The date_change attachment is appended at the tail of the conversation,
- * so the model learns the new date without mutating the cached prefix.
- * messages[0] (from getUserContext → prependUserContext) intentionally
- * keeps the stale date — clearing that cache would regenerate the prefix
- * and turn the entire conversation into cache_creation on the next turn
- * (~920K effective tokens per midnight crossing per overnight session).
  *
  * Exported for testing — regression guard for the cache-clear removal.
  */
@@ -1443,6 +1534,10 @@ export function getDateChangeAttachments(
   return [{ type: 'date_change', newDate: currentDate }]
 }
 
+/**
+ * 若用户输入中包含 ultrathink 关键词且该功能已启用，返回高强度思考附件。
+ * 用于提示模型在当前回合使用更深度的推理。
+ */
 function getUltrathinkEffortAttachment(input: string | null): Attachment[] {
   if (!isUltrathinkEnabled() || !input || !hasUltrathinkKeyword(input)) {
     return []
@@ -1451,6 +1546,13 @@ function getUltrathinkEffortAttachment(input: string | null): Attachment[] {
   return [{ type: 'ultrathink_effort', level: 'high' }]
 }
 
+/**
+ * 生成延迟工具增量（deferred_tools_delta）附件。
+ *
+ * 当 ToolSearch 功能启用、模型支持工具引用且工具列表中存在 ToolSearch 工具时，
+ * 计算当前工具集与消息历史中已宣告工具集之间的差异（增量），
+ * 仅在有变化时返回附件。同时导出供 compact.ts 使用，保持两处逻辑一致。
+ */
 // Exported for compact.ts — the gate must be identical at both call sites.
 export function getDeferredToolsDeltaAttachment(
   tools: Tools,
@@ -1475,14 +1577,18 @@ export function getDeferredToolsDeltaAttachment(
 }
 
 /**
+ * 生成代理列表增量（agent_listing_delta）附件。
+ *
+ * 将当前过滤后的代理池（经 MCP 要求、拒绝规则、allowedAgentTypes 筛选）
+ * 与消息历史中已宣告的代理集合进行差异比较，仅在有新增或移除时返回附件。
+ * 导出供 compact.ts 在压缩后重新宣告完整代理列表使用。
+ *
+ * 背景：代理列表原本嵌入 AgentTool 的 description 中，导致 ~10.2% 的 cache_creation，
+ * 改为此附件形式后 tool schema 保持静态，大幅减少缓存失效。
+ *
  * Diff the current filtered agent pool against what's already been announced
  * in this conversation (reconstructed from prior agent_listing_delta
  * attachments). Returns [] if nothing changed or the gate is off.
- *
- * The agent list was embedded in AgentTool's description, causing ~10.2% of
- * fleet cache_creation: MCP async connect, /reload-plugins, or
- * permission-mode change → description changes → full tool-schema cache bust.
- * Moving the list here keeps the tool description static.
  *
  * Exported for compact.ts — re-announces the full set after compaction eats
  * prior deltas.
@@ -1555,6 +1661,13 @@ export function getAgentListingDeltaAttachment(
   ]
 }
 
+/**
+ * 生成 MCP 服务器指令增量（mcp_instructions_delta）附件。
+ *
+ * 比较当前 MCP 服务器指令集合（含 ToolSearch chrome 提示）与消息历史中已宣告的内容，
+ * 仅在有变更时返回附件，避免重复注入相同指令。
+ * 导出供 compact.ts 和 reactiveCompact.ts 使用，作为统一的开关判断入口。
+ */
 // Exported for compact.ts / reactiveCompact.ts — single source of truth for the gate.
 export function getMcpInstructionsDeltaAttachment(
   mcpClients: MCPServerConnection[],
@@ -1584,6 +1697,10 @@ export function getMcpInstructionsDeltaAttachment(
   return [{ type: 'mcp_instructions_delta', ...delta }]
 }
 
+/**
+ * 若 toolUseContext 中携带了 criticalSystemReminder_EXPERIMENTAL，
+ * 将其包装为 critical_system_reminder 附件返回，否则返回空数组。
+ */
 function getCriticalSystemReminderAttachment(
   toolUseContext: ToolUseContext,
 ): Attachment[] {
@@ -1594,6 +1711,10 @@ function getCriticalSystemReminderAttachment(
   return [{ type: 'critical_system_reminder', content: reminder }]
 }
 
+/**
+ * 若设置中配置了非默认的输出样式（outputStyle），返回 output_style 附件。
+ * 用于告知模型当前会话期望的响应格式（如 concise、verbose 等）。
+ */
 function getOutputStyleAttachment(): Attachment[] {
   const settings = getSettings_DEPRECATED()
   const outputStyle = settings?.outputStyle || 'default'
@@ -1611,6 +1732,13 @@ function getOutputStyleAttachment(): Attachment[] {
   ]
 }
 
+/**
+ * 获取 IDE 中用户选中行的内容并生成 selected_lines_in_ide 附件。
+ *
+ * 仅当 IDE 已连接、存在有效选区（含行号、文本和文件路径）
+ * 且文件未被权限策略拒绝时，才生成附件。
+ * 附件包含 IDE 名称、起止行号、文件名及选中文本内容。
+ */
 async function getSelectedLinesFromIDE(
   ideSelection: IDESelection | null,
   toolUseContext: ToolUseContext,
@@ -1644,6 +1772,12 @@ async function getSelectedLinesFromIDE(
 }
 
 /**
+ * 计算嵌套内存文件加载所需处理的目录列表。
+ *
+ * 返回两个列表（均从父级到子级排序）：
+ * - nestedDirs：从 CWD 到 targetPath 目录之间的各层目录（处理 CLAUDE.md 及所有规则）
+ * - cwdLevelDirs：从根目录到 CWD 的各层目录（仅处理条件规则）
+ *
  * Computes the directories to process for nested memory file loading.
  * Returns two lists:
  * - nestedDirs: Directories between CWD and targetPath (processed for CLAUDE.md + all rules)
@@ -1695,6 +1829,10 @@ export function getDirectoriesToProcess(
  * @param toolUseContext The tool use context (for tracking loaded files)
  * @returns Array of nested memory attachments
  */
+/**
+ * 判断内存文件类型是否属于"指令"类型（User/Project/Local/Managed）。
+ * 用于区分 CLAUDE.md 系列指令文件与其他类型的内存文件。
+ */
 function isInstructionsMemoryType(
   type: MemoryFileInfo['type'],
 ): type is InstructionsMemoryType {
@@ -1706,7 +1844,17 @@ function isInstructionsMemoryType(
   )
 }
 
-/** Exported for testing — regression guard for LRU-eviction re-injection. */
+/**
+ * 将内存文件列表转换为 nested_memory 附件列表，过滤已加载文件。
+ *
+ * 使用两级去重策略：
+ * - loadedNestedMemoryPaths（非 LRU Set）：会话级永久去重
+ * - readFileState（100 条 LRU）：在繁忙会话中可能驱逐条目
+ * 两者都通过检查后才跳过，确保 LRU 驱逐时不会重复注入。
+ * 新文件同时加入 readFileState，并可选触发 InstructionsLoaded 钩子。
+ *
+ * Exported for testing — regression guard for LRU-eviction re-injection.
+ */
 export function memoryFilesToAttachments(
   memoryFiles: MemoryFileInfo[],
   toolUseContext: ToolUseContext,
@@ -1775,14 +1923,19 @@ export function memoryFilesToAttachments(
 }
 
 /**
+ * 为指定文件路径加载嵌套内存文件并生成附件列表。
+ *
+ * 处理顺序（必须保持）：
+ * 1. Managed/User 条件规则（匹配 targetPath）
+ * 2. 嵌套目录（CWD → target）：CLAUDE.md + 无条件规则 + 条件规则
+ * 3. CWD 级别目录（root → CWD）：仅条件规则
+ *
+ * 若 targetPath 不在允许的工作路径内，直接返回空数组。
+ * 通过 processedPaths Set 防止重复处理同一文件。
+ *
  * Loads nested memory files for a given file path and returns them as attachments.
  * This function performs directory traversal to find CLAUDE.md files and conditional rules
  * that apply to the target file path.
- *
- * Processing order (must be preserved):
- * 1. Managed/User conditional rules matching targetPath
- * 2. Nested directories (CWD → target): CLAUDE.md + unconditional + conditional rules
- * 3. CWD-level directories (root → CWD): conditional rules only
  *
  * @param filePath The file path to get nested memory files for
  * @param toolUseContext The tool use context
@@ -1861,6 +2014,12 @@ async function getNestedMemoryAttachmentsForFile(
   return attachments
 }
 
+/**
+ * 获取 IDE 中当前打开文件的附件（无选中文本时触发）。
+ *
+ * 仅当 IDE 有打开文件路径且未选中任何文本，且文件未被权限策略拒绝时才处理。
+ * 先加载该文件对应的嵌套内存附件（CLAUDE.md 等），再返回 opened_file_in_ide 附件。
+ */
 async function getOpenedFileFromIDE(
   ideSelection: IDESelection | null,
   toolUseContext: ToolUseContext,
@@ -1891,6 +2050,15 @@ async function getOpenedFileFromIDE(
   ]
 }
 
+/**
+ * 处理用户输入中的 @提及文件，生成对应的文件内容附件。
+ *
+ * 从输入中提取所有 @文件引用，并行处理每个引用：
+ * - 权限检查（isFileReadDenied）
+ * - 目录：读取条目列表（最多 1000 条），生成 directory 附件
+ * - 普通文件：调用 generateFileAttachment（支持行号范围）
+ * 任何错误均记录日志并跳过，最终过滤 null 值。
+ */
 async function processAtMentionedFiles(
   input: string,
   toolUseContext: ToolUseContext,
@@ -1963,6 +2131,12 @@ async function processAtMentionedFiles(
   return results.filter(Boolean) as Attachment[]
 }
 
+/**
+ * 处理用户输入中的 @代理提及，生成 agent_mention 附件列表。
+ *
+ * 提取输入中的代理引用（如 @agent-xxx），查找匹配的代理定义，
+ * 未找到时记录事件并跳过，成功时返回包含 agentType 的附件。
+ */
 function processAgentMentions(
   input: string,
   agents: AgentDefinition[],
@@ -1992,6 +2166,12 @@ function processAgentMentions(
   )
 }
 
+/**
+ * 处理用户输入中的 @MCP 资源提及，生成 mcp_resource 附件列表。
+ *
+ * 提取输入中的 MCP 资源引用（格式为 server:uri），并行调用对应 MCP 客户端读取资源内容，
+ * 客户端不存在、未连接或读取失败时均记录事件并跳过，成功时返回资源内容附件。
+ */
 async function processMcpResourceAttachments(
   input: string,
   toolUseContext: ToolUseContext,
@@ -2060,6 +2240,16 @@ async function processMcpResourceAttachments(
   ) as Attachment[]
 }
 
+/**
+ * 检测已读取文件的磁盘变更并生成相应的文件变更附件。
+ *
+ * 遍历 readFileState 缓存中的所有文件路径，检查修改时间：
+ * - 文本文件：生成差异片段（edited_text_file）
+ * - 图片文件：重新读取并压缩（edited_image_file）
+ * - 其他类型（notebook/pdf）：跳过
+ * 权限拒绝或文件已删除（ENOENT）时从缓存移除条目；
+ * 其他瞬时错误（原子保存竞态、权限抖动）不驱逐，避免误判文件缺失。
+ */
 export async function getChangedFiles(
   toolUseContext: ToolUseContext,
 ): Promise<Attachment[]> {
@@ -2161,6 +2351,12 @@ export async function getChangedFiles(
 }
 
 /**
+ * 处理 nestedMemoryAttachmentTriggers 中的路径，为每个触发路径加载嵌套内存附件。
+ *
+ * 优先检查触发集合是否为空（避免不必要的 getAppState 调用）。
+ * 依次处理每个触发路径，调用 getNestedMemoryAttachmentsForFile 收集附件，
+ * 完成后清空触发集合，防止重复加载。
+ *
  * Processes paths that need nested memory attachments and checks for nested CLAUDE.md files
  * Uses nestedMemoryAttachmentTriggers field from ToolUseContext
  */
@@ -2193,6 +2389,20 @@ async function getNestedMemoryAttachments(
   return attachments
 }
 
+/**
+ * 根据用户输入检索与当前上下文相关的内存文件并生成 relevant_memories 附件。
+ *
+ * 若有 @代理提及，仅在该代理的内存目录中搜索（隔离原则）。
+ * 否则扫描全局内存目录，结合近期工具使用记录和已展示路径集合过滤结果，
+ * 返回相关性最高的内存文件附件列表。
+ */
+/**
+ * 查找并返回与当前用户输入最相关的内存文件附件。
+ *
+ * 若用户输入中提及了代理（@agent-xxx），仅搜索该代理的专属内存目录；
+ * 否则搜索通用自动内存目录（auto-memory dir）。支持多目录并行搜索，
+ * 最终合并结果、过滤已浮现过的文件及已读文件，限制最多返回 5 条记录。
+ */
 async function getRelevantMemoryAttachments(
   input: string,
   agents: AgentDefinition[],
@@ -2242,11 +2452,15 @@ async function getRelevantMemoryAttachments(
 }
 
 /**
+ * 扫描消息历史中已展示的内存文件路径及累计字节数。
+ *
+ * 遍历消息列表中的 relevant_memories 附件，收集所有已展示路径（用于选择器去重）
+ * 和累计字节数（用于会话级限额节流）。
+ * 通过扫描消息而非跟踪上下文状态，使压缩（compact）自然重置去重状态。
+ *
  * Scan messages for past relevant_memories attachments.  Returns both the
  * set of surfaced paths (for selector de-dup) and cumulative byte count
- * (for session-total throttle).  Scanning messages rather than tracking
- * in toolUseContext means compact naturally resets both — old attachments
- * are gone from the compacted transcript, so re-surfacing is valid again.
+ * (for session-total throttle).
  */
 export function collectSurfacedMemories(messages: ReadonlyArray<Message>): {
   paths: Set<string>
@@ -2266,13 +2480,14 @@ export function collectSurfacedMemories(messages: ReadonlyArray<Message>): {
 }
 
 /**
+ * 并行读取一批相关内存文件用于注入 `<system-reminder>` 附件。
+ *
+ * 对每个文件应用 MAX_MEMORY_LINES 和 MAX_MEMORY_BYTES 双重限制。
+ * 截断时附加说明提示（保留文件头部上下文，而非整体丢弃），
+ * 读取失败则返回 null 并过滤，确保部分失败不影响其余文件。
+ *
  * Reads a set of relevance-ranked memory files for injection as
- * <system-reminder> attachments. Enforces both MAX_MEMORY_LINES and
- * MAX_MEMORY_BYTES via readFileInRange's truncateOnByteLimit option.
- * Truncation surfaces partial
- * content with a note rather than dropping the file — findRelevantMemories
- * already picked this as most-relevant, so the frontmatter + opening context
- * is worth surfacing even if later lines are cut.
+ * <system-reminder> attachments.
  *
  * Exported for direct testing without mocking the ranker + GB gates.
  */
@@ -2321,6 +2536,12 @@ export async function readMemoriesForSurfacing(
 }
 
 /**
+ * 生成相关内存块的标题字符串（包含新鲜度信息）。
+ *
+ * 若文件有新鲜度文本（如"刚更新"），格式为 "{freshness}\n\nMemory: {path}:"；
+ * 否则格式为 "Memory (saved {age}): {path}:"。
+ * 导出供 messages.ts 在会话恢复时补充缺失的 header 字段。
+ *
  * Header string for a relevant-memory block.  Exported so messages.ts
  * can fall back for resumed sessions where the stored header is missing.
  */
@@ -2332,16 +2553,12 @@ export function memoryHeader(path: string, mtimeMs: number): string {
 }
 
 /**
- * A memory relevance-selector prefetch handle. The promise is started once
- * per user turn and runs while the main model streams and tools execute.
- * At the collect point (post-tools), the caller reads settledAt to
- * consume-if-ready or skip-and-retry-next-iteration — the prefetch never
- * blocks the turn.
- *
- * Disposable: query.ts binds with `using`, so [Symbol.dispose] fires on all
- * generator exit paths (return, throw, .return() closure) — aborting the
- * in-flight request and emitting terminal telemetry without instrumenting
- * each of the ~13 return sites inside the while loop.
+ * 内存相关性预取句柄类型。
+ * promise 在每个用户轮次启动一次，在主模型流式输出和工具执行期间并发运行。
+ * settledAt 由 promise.finally() 设置（完成前为 null）；
+ * consumedOnIteration 由 query.ts 的收集点设置（消费前为 -1）。
+ * 通过 `using` 绑定，[Symbol.dispose] 在所有退出路径（return/throw/.return()）触发，
+ * 中止飞行中的请求并上报遥测，无需在循环内 ~13 个返回点逐一埋点。
  */
 export type MemoryPrefetch = {
   promise: Promise<Attachment[]>
@@ -2353,10 +2570,16 @@ export type MemoryPrefetch = {
 }
 
 /**
+ * 启动相关内存检索的异步预取，返回可处置的 MemoryPrefetch 句柄。
+ *
+ * 从消息历史中提取最后一条真实用户提示（排除 isMeta 消息），
+ * 检查会话字节总量是否超限，满足条件后异步发起 getRelevantMemoryAttachments。
+ * 返回的句柄包含 promise、settledAt（完成时间戳）和 consumedOnIteration（消费轮次）；
+ * 通过 `using` 绑定，确保查询循环退出时中止飞行中的请求并上报遥测。
+ * 单词输入或配置未启用时返回 undefined。
+ *
  * Starts the relevant memory search as an async prefetch.
- * Extracts the last real user prompt from messages (skipping isMeta system
- * injections) and kicks off a non-blocking search. Returns a Disposable
- * handle with settlement tracking. Bound with `using` in query.ts.
+ * Bound with `using` in query.ts.
  */
 export function startRelevantMemoryPrefetch(
   messages: ReadonlyArray<Message>,
@@ -2429,6 +2652,10 @@ type ToolResultBlock = {
   is_error?: boolean
 }
 
+/**
+ * 类型守卫：判断给定对象是否为 ToolResultBlock。
+ * 用于在消息内容数组中识别工具调用结果块，区分普通文本与工具结果。
+ */
 function isToolResultBlock(b: unknown): b is ToolResultBlock {
   return (
     typeof b === 'object' &&
@@ -2439,28 +2666,26 @@ function isToolResultBlock(b: unknown): b is ToolResultBlock {
 }
 
 /**
+ * 检查用户消息内容中是否包含 tool_result 块。
+ *
+ * 比通过 toolUseResult === undefined 检查更可靠，
+ * 因为子代理工具结果消息在 preserveToolUseResults=false 时会显式将 toolUseResult 置为 undefined。
+ *
  * Check whether a user message's content contains tool_result blocks.
- * This is more reliable than checking `toolUseResult === undefined` because
- * sub-agent tool result messages explicitly set `toolUseResult` to `undefined`
- * when `preserveToolUseResults` is false (the default for Explore agents).
  */
 function hasToolResultContent(content: unknown): boolean {
   return Array.isArray(content) && content.some(isToolResultBlock)
 }
 
 /**
- * Tools that succeeded (and never errored) since the previous real turn
- * boundary.  The memory selector uses this to suppress docs about tools
- * that are working — surfacing reference material for a tool the model
- * is already calling successfully is noise.
+ * 收集上一个真实轮次边界以来成功执行过（且从未出错）的工具名称列表。
  *
- * Any error → tool excluded (model is struggling, docs stay available).
- * No result yet → also excluded (outcome unknown).
+ * 内存选择器用此结果抑制"已在正常工作的工具"的参考文档，避免噪声。
+ * 从消息末尾向前扫描：tool_use 在助手内容中，tool_result 在用户内容中；
+ * 反向扫描先收集结果再匹配名称，最终返回成功且未曾报错的工具名集合。
  *
- * tool_use lives in assistant content; tool_result in user content
- * (toolUseResult set, isMeta undefined).  Both are within the scan window.
- * Backward scan sees results before uses so we collect both by id and
- * resolve after.
+ * Tools that succeeded (and never errored) since the previous real turn boundary.
+ * Any error → tool excluded. No result yet → also excluded.
  */
 export function collectRecentSuccessfulTools(
   messages: ReadonlyArray<Message>,
@@ -2504,18 +2729,13 @@ export function collectRecentSuccessfulTools(
 
 
 /**
- * Filters prefetched memory attachments to exclude memories the model already
- * has in context via FileRead/Write/Edit tool calls (any iteration this turn)
- * or a previous turn's memory surfacing — both tracked in the cumulative
- * readFileState. Survivors are then marked in readFileState so subsequent
- * turns won't re-surface them.
+ * 过滤预取内存附件中与上下文重复的条目，并将幸存者写入 readFileState。
  *
- * The mark-after-filter ordering is load-bearing: readMemoriesForSurfacing
- * used to write to readFileState during the prefetch, which meant the filter
- * saw every prefetch-selected path as "already in context" and dropped them
- * all (self-referential filter). Deferring the write to here, after the
- * filter runs, breaks that cycle while still deduping against tool calls
- * from any iteration.
+ * 过滤逻辑：排除已通过 FileRead/Write/Edit 工具读取或已在前轮展示的文件（均记录在 readFileState 中）。
+ * 过滤后再写入 readFileState（顺序关键）：若在预取时写入，自引用过滤会将所有路径误判为"已在上下文中"。
+ *
+ * Filters prefetched memory attachments to exclude memories the model already
+ * has in context, and marks survivors in readFileState for dedup on subsequent turns.
  */
 export function filterDuplicateMemoryAttachments(
   attachments: Attachment[],
@@ -2541,7 +2761,10 @@ export function filterDuplicateMemoryAttachments(
 }
 
 /**
- * Processes skill directories that were discovered during file operations.
+ * 处理文件操作期间发现的技能目录，生成 dynamic_skill 附件列表。
+ *
+ * 遍历 dynamicSkillDirTriggers 中的目录，并发检查各子目录是否包含 SKILL.md，
+ * 有效技能目录生成附件后清空触发集合。
  * Uses dynamicSkillDirTriggers field from ToolUseContext
  */
 async function getDynamicSkillAttachments(
@@ -2609,26 +2832,24 @@ const sentSkillNames = new Map<string, Set<string>>()
 // Called when the skill set genuinely changes (plugin reload, skill file
 // change on disk) so new skills get announced. NOT called on compact —
 // post-compact re-injection costs ~4K tokens/event for marginal benefit.
+/**
+ * 重置已发送技能名称的跟踪集合，并清除下一次列表压制标志。
+ * 当技能集合发生真实变更（插件重载、技能文件修改）时调用，
+ * 使后续轮次能重新宣告新增技能；compact 后不调用，避免高昂的重注入成本。
+ */
 export function resetSentSkillNames(): void {
   sentSkillNames.clear()
   suppressNext = false
 }
 
 /**
+ * 压制下一次技能列表注入。
+ *
+ * 在 --resume 时由 conversationRecovery 调用，因为技能列表附件已存在于历史 transcript 中，
+ * 无需再次注入。通过标记 sentSkillNames 为"已全部发送"来跳过本次宣告。
+ *
  * Suppress the next skill-listing injection. Called by conversationRecovery
- * on --resume when a skill_listing attachment already exists in the
- * transcript.
- *
- * `sentSkillNames` is module-scope — process-local. Each `claude -p` spawn
- * starts with an empty Map, so without this every resume re-injects the
- * full ~600-token listing even though it's already in the conversation from
- * the prior process. Shows up on every --resume; particularly loud for
- * daemons that respawn frequently.
- *
- * Trade-off: skills added between sessions won't be announced until the
- * next non-resume session. Acceptable — skill_listing was never meant to
- * cover cross-process deltas, and the agent can still call them (they're
- * in the Skill tool's runtime registry regardless).
+ * on --resume when a skill_listing attachment already exists in the transcript.
  */
 export function suppressNextSkillListing(): void {
   suppressNext = true
@@ -2641,11 +2862,13 @@ let suppressNext = false
 const FILTERED_LISTING_MAX = 30
 
 /**
- * Filter skills to bundled (Anthropic-curated) + MCP (user-connected) only.
- * Used when skill-search is enabled to resolve the turn-0 gap for subagents:
- * these sources are small, intent-signaled, and won't hit the truncation budget.
- * User/project/plugin skills (the long tail — 200+) go through discovery instead.
+ * 将技能列表过滤为 bundled（Anthropic 内置）和 MCP（用户连接）两类。
  *
+ * 当 skill-search 功能启用时使用，解决子代理的第 0 轮技能发现缺口。
+ * 若 bundled+MCP 总数超过 FILTERED_LISTING_MAX，则进一步缩减为仅 bundled，
+ * 保护 MCP 重度用户（100+ 服务器）免于截断。
+ *
+ * Filter skills to bundled (Anthropic-curated) + MCP (user-connected) only.
  * Falls back to bundled-only if bundled+mcp exceeds FILTERED_LISTING_MAX.
  */
 export function filterToBundledAndMcp(commands: Command[]): Command[] {
@@ -2658,6 +2881,14 @@ export function filterToBundledAndMcp(commands: Command[]): Command[] {
   return filtered
 }
 
+/**
+ * 生成技能列表（skill_listing）附件，告知模型当前可调用的技能集合。
+ *
+ * 仅在 Skill 工具存在于工具列表时触发；--resume 后通过 suppressNext
+ * 跳过重注入（已在历史 transcript 中）；
+ * 启用 EXPERIMENTAL_SKILL_SEARCH 时仅宣告 bundled + MCP 技能，减少 token 占用。
+ * 将新技能名称记入 sentSkillNames，后续轮次只追加增量。
+ */
 async function getSkillListingAttachments(
   toolUseContext: ToolUseContext,
 ): Promise<Attachment[]> {
@@ -2754,6 +2985,11 @@ async function getSkillListingAttachments(
 // getTurnZeroSkillDiscovery — keeps the 'skill_discovery' string literal inside
 // a feature-gated module so it doesn't leak into external builds.
 
+/**
+ * 从用户输入文本中提取所有 @文件引用，支持普通路径和含空格的引号路径。
+ * 支持行号范围语法（@file.txt#L10-20），过滤代理提及（以 "(agent)" 结尾的引号提及）。
+ * 返回去重后的文件路径列表。
+ */
 export function extractAtMentionedFiles(content: string): string[] {
   // Extract filenames mentioned with @ symbol, including line range syntax: @file.txt#L10-20
   // Also supports quoted paths for files with spaces: @"my/file with spaces.txt"
@@ -2789,6 +3025,10 @@ export function extractAtMentionedFiles(content: string): string[] {
   return uniq([...quotedMatches, ...regularMatches])
 }
 
+/**
+ * 从用户输入文本中提取所有 @MCP 资源引用，格式为 @server:uri。
+ * 仅匹配包含冒号的复合引用（区别于普通文件路径），去重后返回资源 URI 列表。
+ */
 export function extractMcpResourceMentions(content: string): string[] {
   // Extract MCP resources mentioned with @ symbol in format @server:uri
   // Example: "@server1:resource/path" would extract "server1:resource/path"
@@ -2799,6 +3039,19 @@ export function extractMcpResourceMentions(content: string): string[] {
   return uniq(matches.map(match => match.slice(match.indexOf('@') + 1)))
 }
 
+/**
+ * 从用户输入文本中提取所有代理（agent）提及，支持两种格式：
+ * - 传统格式：@agent-<type>（如 @agent-code-elegance-refiner）
+ * - 自动补全格式：@"<type> (agent)"（如 @"code-reviewer (agent)"）
+ * 返回代理类型名称列表（去除前缀和括号后缀）。
+ */
+/**
+ * 从用户输入文本中提取代理提及，支持两种格式：
+ * 1. 旧版/手动输入：@agent-<type>（如 @agent-code-elegance-refiner）
+ * 2. 自动补全选择：@"<type> (agent)"（如 @"code-reviewer (agent)"）
+ * 支持含冒号、点号、at 符号的插件作用域代理名称（如 @agent-asana:project-status-updater）。
+ * 返回去重后的代理类型名称列表。
+ */
 export function extractAgentMentions(content: string): string[] {
   // Extract agent mentions in two formats:
   // 1. @agent-<agent-type> (legacy/manual typing)
@@ -2833,6 +3086,11 @@ interface AtMentionedFileLines {
   lineEnd?: number
 }
 
+/**
+ * 解析 @提及字符串中的文件名和行号范围。
+ * 支持格式：file.txt、file.txt#L10、file.txt#L10-20、file.txt#heading。
+ * 非行号片段（如 #heading）会被忽略，只提取 L 前缀的数字行号范围。
+ */
 export function parseAtMentionedFileLines(
   mention: string,
 ): AtMentionedFileLines {
@@ -2851,6 +3109,11 @@ export function parseAtMentionedFileLines(
   return { filename: filename ?? mention, lineStart, lineEnd }
 }
 
+/**
+ * 收集 IDE 诊断（LSP 错误/警告）和终端诊断附件。
+ * 仅当工具列表包含 Bash 工具时才注入（无执行能力时诊断无意义）。
+ * 合并 LSP 诊断附件与通用诊断附件，返回所有诊断 Attachment 列表。
+ */
 async function getDiagnosticAttachments(
   toolUseContext: ToolUseContext,
 ): Promise<Attachment[]> {
@@ -2877,6 +3140,10 @@ async function getDiagnosticAttachments(
 }
 
 /**
+ * 从被动 LSP 服务器获取诊断附件。
+ * 仅当工具列表包含 Bash 工具时才处理（无执行能力时 LSP 诊断无意义）。
+ * 获取后清空注册表中已交付的诊断，防止内存泄漏，遵循 AsyncHookRegistry 模式。
+ *
  * Get LSP diagnostic attachments from passive LSP servers.
  * Follows the AsyncHookRegistry pattern for consistent async attachment delivery.
  */
@@ -2934,6 +3201,15 @@ async function getLSPDiagnosticAttachments(
   }
 }
 
+/**
+ * 异步生成器：将所有附件批量转换为消息，逐步 yield 给调用方（query.ts 工具循环）。
+ *
+ * 工作流程：先通过 getAttachments() 并发收集所有附件，然后对每个 Attachment
+ * 调用 createAttachmentMessage() 生成带 cache-control 的用户消息块，
+ * 最终 yield 消息列表供主循环注入到对话历史。
+ *
+ * 每次工具调用后均会调用本函数，以在对话历史中追加最新上下文。
+ */
 export async function* getAttachmentMessages(
   input: string | null,
   toolUseContext: ToolUseContext,
@@ -2979,6 +3255,11 @@ export async function* getAttachmentMessages(
  * @returns A new_file attachment or null if the file couldn't be read
  */
 /**
+ * 检查 PDF 文件是否应返回轻量引用而非内联。
+ * 当页数超过 PDF_AT_MENTION_INLINE_THRESHOLD 时返回 PDFReferenceAttachment，
+ * 否则返回 null（表示应正常内联读取）。
+ * 页数通过 pdfinfo 获取，失败时按文件大小（100KB/页）估算。
+ *
  * Check if a PDF file should be represented as a lightweight reference
  * instead of being inlined. Returns a PDFReferenceAttachment for large PDFs
  * (more than PDF_AT_MENTION_INLINE_THRESHOLD pages), or null otherwise.
@@ -3017,6 +3298,16 @@ export async function tryGetPDFReference(
   return null
 }
 
+/**
+ * 读取文件并生成文件附件，是 @提及文件 和 compact 后恢复文件 的共享核心逻辑。
+ *
+ * 执行流程：
+ * 1. 检查文件是否被 deny 规则拒绝
+ * 2. at-mention 模式下检查文件大小限制（超限的非 PDF 直接返回 null）
+ * 3. 大 PDF 返回 PDFReferenceAttachment 轻量引用而非内联
+ * 4. 检查文件是否已在上下文中且未修改（返回 already_read_file）
+ * 5. 通过 FileReadTool 读取文件，超长时调用内部 readTruncatedFile 截断
+ */
 export async function generateFileAttachment(
   filename: string,
   toolUseContext: ToolUseContext,
@@ -3198,6 +3489,10 @@ export async function generateFileAttachment(
   }
 }
 
+/**
+ * 将单个 Attachment 对象包装为带时间戳的 AttachmentMessage。
+ * 所有附件在注入对话历史前均通过本函数转换，时间戳用于追踪附件注入时机。
+ */
 export function createAttachmentMessage(
   attachment: Attachment,
 ): AttachmentMessage {
@@ -3209,6 +3504,12 @@ export function createAttachmentMessage(
   }
 }
 
+/**
+ * 统计消息历史中距最后一次 TodoWrite 操作和距最后一次提醒的助手轮次数。
+ * 从消息列表末尾向前遍历，跳过 thinking 消息，
+ * 分别记录 lastTodoWriteIndex 和 lastReminderIndex，
+ * 并累计各自之前的助手轮数，用于判断是否应触发 todo 提醒。
+ */
 function getTodoReminderTurnCounts(messages: Message[]): {
   turnsSinceLastTodoWrite: number
   turnsSinceLastReminder: number
@@ -3263,6 +3564,12 @@ function getTodoReminderTurnCounts(messages: Message[]): {
   }
 }
 
+/**
+ * 根据 todo 提醒策略决定是否生成 todo_reminder 附件。
+ * 当 TodoWrite 工具不可用、Brief 工具存在（精简工作流）、消息为空、
+ * 或距上次写 Todo/提醒的轮次未达阈值时，返回空数组；
+ * 否则返回包含当前会话 todo 列表的 todo_reminder 附件。
+ */
 async function getTodoReminderAttachments(
   messages: Message[] | undefined,
   toolUseContext: ToolUseContext,
@@ -3316,6 +3623,11 @@ async function getTodoReminderAttachments(
   return []
 }
 
+/**
+ * 统计消息历史中距最后一次任务管理操作（TaskCreate/TaskUpdate）和距最后一次提醒的助手轮次数。
+ * 与 getTodoReminderTurnCounts 逻辑相同，但检测的工具为 TaskCreate/TaskUpdate，
+ * 用于驱动 V2 任务提醒的节奏控制。
+ */
 function getTaskReminderTurnCounts(messages: Message[]): {
   turnsSinceLastTaskManagement: number
   turnsSinceLastReminder: number
@@ -3372,6 +3684,12 @@ function getTaskReminderTurnCounts(messages: Message[]): {
   }
 }
 
+/**
+ * 根据 TodoV2 任务提醒策略决定是否生成 task_reminder 附件。
+ * TodoV2 未启用、ant 用户、Brief 工具存在、TaskUpdate 工具不可用、
+ * 消息为空或轮次未达阈值时均返回空数组；
+ * 否则查询当前任务列表并返回 task_reminder 附件。
+ */
 async function getTaskReminderAttachments(
   messages: Message[] | undefined,
   toolUseContext: ToolUseContext,
@@ -3432,6 +3750,10 @@ async function getTaskReminderAttachments(
 }
 
 /**
+ * 使用统一 Task 框架获取所有后台任务的附件（替代旧版 Shell/RemoteSession/AsyncAgent 三个函数）。
+ * 调用 generateTaskAttachments() 生成任务增量摘要，更新偏移量并驱逐已完成任务，
+ * 最终将 TaskAttachment 转换为 task_status 类型 Attachment 返回。
+ *
  * Get attachments for all unified tasks using the Task framework.
  * Replaces the old getBackgroundShellAttachments, getBackgroundRemoteSessionAttachments,
  * and getAsyncAgentAttachments functions.
@@ -3461,6 +3783,11 @@ async function getUnifiedTaskAttachments(
   }))
 }
 
+/**
+ * 收集所有异步 Hook 回调响应并转换为 Attachment 列表。
+ * Hook 脚本在后台异步执行完毕后，将响应写入临时队列；
+ * 本函数在每轮对话开始前读取并清空队列，将响应注入到上下文中供模型感知。
+ */
 async function getAsyncHookResponseAttachments(): Promise<Attachment[]> {
   const responses = await checkForAsyncHookResponses()
 
@@ -3518,6 +3845,16 @@ async function getAsyncHookResponseAttachments(): Promise<Attachment[]> {
 }
 
 /**
+ * 获取代理群（swarm）通信中队友邮箱的消息附件。
+ * 队友是并行运行的独立 Claude Code 会话（非父子子代理关系）。
+ *
+ * 消息来源：
+ * 1. 文件邮箱（轮询间隙收到的消息）
+ * 2. AppState.inbox（useInboxPoller 在对话轮次中间排队的消息）
+ *
+ * 重复消息通过 from+timestamp+text 前缀去重，
+ * 空闲通知每个代理只保留最新一条，消息交付后标记已读。
+ *
  * Get teammate mailbox attachments for agent swarm communication
  * Teammates are independent Claude Code sessions running in parallel (swarms),
  * not parent-child subagent relationships.
@@ -3769,6 +4106,11 @@ async function getTeammateMailboxAttachments(
 }
 
 /**
+ * 为代理群（swarm）中的队友注入团队上下文附件。
+ * 仅在对话第一轮（尚无助手消息）且当前会话属于某团队时注入，
+ * 包含代理 ID、代理名称、团队名称及团队配置/任务列表路径，
+ * 为队友提供初始协调上下文。
+ *
  * Get team context attachment for teammates in a swarm.
  * Only injected on the first turn to provide team coordination instructions.
  */
@@ -3804,6 +4146,11 @@ function getTeamContextAttachment(messages: Message[]): Attachment[] {
   ]
 }
 
+/**
+ * 生成输入 token 使用量附件，告知模型当前上下文窗口的已用和剩余 token 数。
+ * 计算所有消息的 token 总量与模型上下文窗口大小，
+ * 当使用量超过阈值时返回 context_window_usage 附件，否则返回空数组。
+ */
 function getTokenUsageAttachment(
   messages: Message[],
   model: string,
@@ -3825,6 +4172,11 @@ function getTokenUsageAttachment(
   ]
 }
 
+/**
+ * 生成输出 token 预算使用量附件（仅在 TOKEN_BUDGET 功能启用时生效）。
+ * 若当前轮次存在有效的 token 预算，返回包含本轮/累计输出 token 数及预算上限的 output_token_usage 附件；
+ * 预算为 null 或 ≤0 时返回空数组。
+ */
 function getOutputTokenUsageAttachment(): Attachment[] {
   if (feature('TOKEN_BUDGET')) {
     const budget = getCurrentTurnTokenBudget()
@@ -3843,6 +4195,11 @@ function getOutputTokenUsageAttachment(): Attachment[] {
   return []
 }
 
+/**
+ * 生成 USD 预算使用量附件。
+ * 若传入了 maxBudgetUsd，则计算累计 API 花费和剩余预算，
+ * 返回 budget_usd 附件供模型感知花费限制；未设置预算时返回空数组。
+ */
 function getMaxBudgetUsdAttachment(maxBudgetUsd?: number): Attachment[] {
   if (maxBudgetUsd === undefined) {
     return []
@@ -3862,6 +4219,11 @@ function getMaxBudgetUsdAttachment(maxBudgetUsd?: number): Attachment[] {
 }
 
 /**
+ * 统计自规划模式退出（plan_mode_exit 附件）后的人工输入轮次数。
+ * 若未找到 plan_mode_exit 则返回 0。
+ * 注意：tool_result 消息的 type 为 'user' 但不含 isMeta，
+ * 需通过 isHumanTurn 过滤，避免将工具结果误计为人工轮次。
+ *
  * Count human turns since plan mode exit (plan_mode_exit attachment).
  * Returns 0 if no plan_mode_exit attachment found.
  *
@@ -3889,6 +4251,11 @@ export function getVerifyPlanReminderTurnCount(messages: Message[]): number {
 }
 
 /**
+ * 若模型尚未调用 VerifyPlanExecution 工具，则注入 verify_plan_reminder 附件。
+ * 仅在 ant 用户且 CLAUDE_CODE_VERIFY_PLAN=1 时生效；
+ * pendingPlanVerification 不存在或已开始/完成验证时跳过；
+ * 每隔 VERIFY_PLAN_REMINDER_CONFIG.TURNS_BETWEEN_REMINDERS 人工轮次提醒一次。
+ *
  * Get verify plan reminder attachment if the model hasn't called VerifyPlanExecution yet.
  */
 async function getVerifyPlanReminderAttachment(
@@ -3928,6 +4295,12 @@ async function getVerifyPlanReminderAttachment(
   return [{ type: 'verify_plan_reminder' }]
 }
 
+/**
+ * 生成上下文压缩提醒附件（compaction_reminder）。
+ * 仅在 tengu_marble_fox feature 开启、auto compact 已启用、
+ * 且模型上下文窗口 ≥ 1M token 且已使用超过有效窗口 25% 时触发。
+ * 提醒模型即将发生自动压缩，帮助模型在压缩前完成关键推理。
+ */
 export function getCompactionReminderAttachment(
   messages: Message[],
   model: string,
@@ -3955,6 +4328,11 @@ export function getCompactionReminderAttachment(
 }
 
 /**
+ * 上下文效率提示附件（context_efficiency）。
+ * 每隔 N 个 token 增长（没有 snip 操作时）注入一次，引导模型使用 SnipTool 压缩历史。
+ * 节奏由 shouldNudgeForSnips 控制：在前一次提示、snip 标记、snip 边界或 compact 边界时重置计数器。
+ * 通过 lazy require 引入 snipCompact 模块，避免循环依赖。
+ *
  * Context-efficiency nudge. Injected after every N tokens of growth without
  * a snip. Pacing is handled entirely by shouldNudgeForSnips — the 10k
  * interval resets on prior nudges, snip markers, snip boundaries, and
@@ -3983,6 +4361,11 @@ export function getContextEfficiencyAttachment(
 }
 
 
+/**
+ * 检查文件路径是否被工具权限上下文中的 deny 规则拒绝读取。
+ * 通过 matchingRuleForInput 查找 'read'+'deny' 类型的规则，
+ * 用于在生成文件附件前拦截被禁止的文件。
+ */
 function isFileReadDenied(
   filePath: string,
   toolPermissionContext: ToolPermissionContext,

@@ -1,25 +1,66 @@
+/**
+ * RejectedPlanMessage.tsx
+ *
+ * 【在 Claude Code 系统流中的位置】
+ * 属于工具结果消息渲染层，由 UserToolErrorMessage 路由分发。
+ * 当用户拒绝 Claude 的计划时（错误内容以 PLAN_REJECTION_PREFIX 开头），
+ * 由 UserToolErrorMessage 提取计划内容后调用本组件，
+ * 在终端 UI 中展示被拒绝的计划及静态提示文本。
+ *
+ * 【主要功能】
+ * RejectedPlanMessage：
+ * - 渲染固定提示语 "User rejected Claude's plan:"（subtle 颜色）
+ * - 将计划内容以 Markdown 格式在圆角 planMode 颜色边框中展示
+ * - 整体包裹在 MessageResponse 中，提供连接线样式
+ * - overflow="hidden" 确保在 Windows Terminal 中正确渲染
+ */
 import { c as _c } from "react/compiler-runtime";
 import * as React from 'react';
 import { Markdown } from 'src/components/Markdown.js';
 import { MessageResponse } from 'src/components/MessageResponse.js';
 import { Box, Text } from '../../../ink.js';
+
+// 组件 Props 类型定义
 type Props = {
-  plan: string;
+  plan: string; // 计划内容（Markdown 格式文本）
 };
+
+/**
+ * RejectedPlanMessage — 被拒绝计划的渲染组件
+ *
+ * 流程：
+ * 1. 通过 memo_cache_sentinel 一次性初始化静态提示文本节点（$[0]）
+ * 2. 当 plan 变更时，重新构建完整 MessageResponse 节点（$[1]/$[2]）
+ * 3. 返回包含静态提示语和 Markdown 计划内容的嵌套 Box 布局
+ *
+ * React 编译器优化：_c(3)
+ * - $[0]：静态 Text 节点（memo_cache_sentinel 一次性初始化）
+ * - $[1]：plan 依赖缓存键
+ * - $[2]：完整 MessageResponse JSX 节点
+ */
 export function RejectedPlanMessage(t0) {
+  // React 编译器注入的缓存数组，共 3 个槽位
   const $ = _c(3);
   const {
     plan
   } = t0;
+
+  // 静态提示文本：一次性初始化（memo_cache_sentinel），组件生命周期内不变
   let t1;
   if ($[0] === Symbol.for("react.memo_cache_sentinel")) {
+    // subtle 颜色渲染提示语，告知用户已拒绝 Claude 的计划
     t1 = <Text color="subtle">User rejected Claude's plan:</Text>;
     $[0] = t1;
   } else {
     t1 = $[0];
   }
+
+  // 完整节点：依赖 plan；plan 变化时重新构建
   let t2;
   if ($[1] !== plan) {
+    // MessageResponse 提供左侧连接线；Box 纵向排列静态提示和计划内容
+    // borderStyle="round" 圆角边框，borderColor="planMode" 使用计划模式颜色
+    // paddingX={1} 左右内边距，overflow="hidden" 确保 Windows Terminal 正确渲染
     t2 = <MessageResponse><Box flexDirection="column">{t1}<Box borderStyle="round" borderColor="planMode" paddingX={1} overflow="hidden"><Markdown>{plan}</Markdown></Box></Box></MessageResponse>;
     $[1] = plan;
     $[2] = t2;

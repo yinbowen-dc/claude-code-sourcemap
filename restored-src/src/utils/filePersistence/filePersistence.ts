@@ -1,10 +1,12 @@
 /**
- * File persistence orchestrator
+ * 文件持久化编排模块。
  *
- * This module provides the main orchestration logic for persisting files
- * at the end of each turn:
- * - BYOC mode: Upload files to Files API and collect file IDs
- * - 1P/Cloud mode: Query Files API listDirectory for file IDs (rclone handles sync)
+ * 在 Claude Code 系统中，该模块提供每轮对话结束时的文件持久化主编排逻辑，
+ * 将会话内产生的文件同步至云端存储：
+ * - BYOC 模式（自带云）：将文件上传至 Files API 并收集文件 ID
+ * - 1P/Cloud 模式：查询 Files API 的 listDirectory 获取文件 ID（由 rclone 处理同步）
+ * - 通过 feature flag 控制持久化行为，支持不同部署模式
+ * - 上报文件持久化相关分析事件，追踪上传成功率与错误
  */
 
 import { feature } from 'bun:bundle'

@@ -1,3 +1,27 @@
+/**
+ * FileEditToolDiff.tsx — 文件编辑工具差异预览组件
+ *
+ * 在 Claude Code 系统流程中的位置：
+ *   FileEditTool（文件编辑工具）→ FileEditToolDiff → 渲染文件变更的差异视图
+ *
+ * 主要功能：
+ *   FileEditToolDiff：顶层导出组件，通过 React Suspense + useState 快照模式
+ *   加载并展示文件编辑操作的结构化差异（diff）。
+ *   内部包含三个辅助单元：
+ *   - DiffBody：解包 Promise 数据并渲染 StructuredDiffList
+ *   - DiffFrame：提供统一的边框容器（加载中显示省略号占位符）
+ *   - loadDiffData：异步加载差异数据，支持单编辑/多编辑/空 old_string 三条路径
+ *
+ * 设计要点：
+ *   - 挂载时快照：通过 useState 初始化函数确保 diff 数据在组件挂载时固定，
+ *     防止文件在对话框打开期间发生变化导致 diff 重新渲染
+ *   - 分块扫描：对单编辑且 old_string 较短的情况，仅扫描文件中的上下文窗口
+ *     （scanForContext），避免读取整个大文件
+ *   - 大 needle 保护：当 old_string.length >= CHUNK_SIZE 时，直接用工具输入
+ *     进行差异计算（diffToolInputsOnly），避免 O(needle) 的重叠缓冲区分配
+ *   - React Compiler 优化：使用 _c(N) 缓存数组避免 JSX 重复创建；
+ *     Symbol.for("react.memo_cache_sentinel") 作为哨兵值检测缓存未命中
+ */
 import { c as _c } from "react/compiler-runtime";
 import type { StructuredPatchHunk } from 'diff';
 import * as React from 'react';
@@ -15,14 +39,31 @@ type Props = {
   file_path: string;
   edits: FileEdit[];
 };
+// 差异数据结构：包含结构化 patch 块、文件首行（用于显示文件名）和文件内容（用于上下文）
 type DiffData = {
   patch: StructuredPatchHunk[];
   firstLine: string | null;
   fileContent: string | undefined;
 };
+
+/**
+ * FileEditToolDiff
+ *
+ * 整体流程：
+ *   1. 通过 useState 初始化函数在挂载时固定 loadDiffData Promise（快照模式）
+ *      - React Compiler：若 props.edits/file_path 未变化，复用缓存的 t0 工厂函数
+ *   2. 通过 React Suspense 包裹 DiffBody，加载期间显示 DiffFrame 占位符（省略号）
+ *      - React Compiler：DiffFrame placeholder 只创建一次（哨兵值检测缓存未命中）
+ *   3. DiffBody resolve 后渲染真实 diff 内容
+ *
+ * 在系统中的角色：
+ *   是文件编辑工具的 diff 预览入口，由上层工具组件在用户确认编辑时调用。
+ */
 export function FileEditToolDiff(props) {
+  // React Compiler：_c(7) 分配 7 个插槽的记忆化缓存数组
   const $ = _c(7);
   let t0;
+  // 缓存检查：若 edits 或 file_path 变化，则重建 loadDiffData 工厂函数
   if ($[0] !== props.edits || $[1] !== props.file_path) {
     t0 = () => loadDiffData(props.file_path, props.edits);
     $[0] = props.edits;
@@ -31,8 +72,10 @@ export function FileEditToolDiff(props) {
   } else {
     t0 = $[2];
   }
+  // 挂载时快照：useState 的初始化函数只在挂载时执行一次，保证 diff 数据稳定
   const [dataPromise] = useState(t0);
   let t1;
+  // 哨兵值检测：DiffFrame 占位符（加载中显示的省略号）只创建一次
   if ($[3] === Symbol.for("react.memo_cache_sentinel")) {
     t1 = <DiffFrame placeholder={true} />;
     $[3] = t1;
@@ -40,6 +83,7 @@ export function FileEditToolDiff(props) {
     t1 = $[3];
   }
   let t2;
+  // 缓存检查：dataPromise 或 file_path 变化时重新创建 Suspense 树
   if ($[4] !== dataPromise || $[5] !== props.file_path) {
     t2 = <Suspense fallback={t1}><DiffBody promise={dataPromise} file_path={props.file_path} /></Suspense>;
     $[4] = dataPromise;
@@ -50,21 +94,37 @@ export function FileEditToolDiff(props) {
   }
   return t2;
 }
+/**
+ * DiffBody
+ *
+ * 整体流程：
+ *   1. 通过 React 的 use(promise) Hook 解包 loadDiffData 返回的 Promise
+ *      （若 Promise 未 resolve，Suspense 会捕获并展示 fallback）
+ *   2. 读取终端宽度（useTerminalSize），传递给 StructuredDiffList 控制显示宽度
+ *   3. 在 DiffFrame 容器内渲染 StructuredDiffList 展示结构化差异
+ *
+ * 在系统中的角色：
+ *   是 Suspense 内部的数据消费者，负责将异步差异数据渲染为 diff 视图。
+ */
 function DiffBody(t0) {
+  // React Compiler：_c(6) 分配 6 个插槽的记忆化缓存数组
   const $ = _c(6);
   const {
     promise,
     file_path
   } = t0;
+  // 通过 use() 解包 Promise：若 Promise pending，Suspense fallback 被激活
   const {
     patch,
     firstLine,
     fileContent
   } = use(promise);
+  // 读取终端当前列数，用于控制 diff 渲染宽度
   const {
     columns
   } = useTerminalSize();
   let t1;
+  // 缓存检查：任意依赖变化时重新渲染 DiffFrame 及其子树
   if ($[0] !== columns || $[1] !== fileContent || $[2] !== file_path || $[3] !== firstLine || $[4] !== patch) {
     t1 = <DiffFrame><StructuredDiffList hunks={patch} dim={false} width={columns} filePath={file_path} firstLine={firstLine} fileContent={fileContent} /></DiffFrame>;
     $[0] = columns;
@@ -78,14 +138,30 @@ function DiffBody(t0) {
   }
   return t1;
 }
+
+/**
+ * DiffFrame
+ *
+ * 整体流程：
+ *   1. 若 placeholder=true，渲染一个灰色省略号（加载占位符）
+ *   2. 否则渲染 children（实际 diff 内容）
+ *   3. 外层 Box 提供虚线上下边框的统一容器样式
+ *
+ * 在系统中的角色：
+ *   是 diff 视图的容器组件，统一控制边框样式，
+ *   在 Suspense 加载期间和加载完成后提供一致的视觉框架。
+ */
 function DiffFrame(t0) {
+  // React Compiler：_c(5) 分配 5 个插槽的记忆化缓存数组
   const $ = _c(5);
   const {
     children,
     placeholder
   } = t0;
   let t1;
+  // 缓存检查：children 或 placeholder 变化时重新计算内容节点
   if ($[0] !== children || $[1] !== placeholder) {
+    // placeholder 模式：显示灰色省略号；否则显示实际 diff 内容
     t1 = placeholder ? <Text dimColor={true}>…</Text> : children;
     $[0] = children;
     $[1] = placeholder;
@@ -94,7 +170,9 @@ function DiffFrame(t0) {
     t1 = $[2];
   }
   let t2;
+  // 缓存检查：内容节点变化时重新创建外层容器
   if ($[3] !== t1) {
+    // 外层 Box：column 方向布局，内层 Box 提供虚线上下边框（左右无边框）
     t2 = <Box flexDirection="column"><Box borderColor="subtle" borderStyle="dashed" flexDirection="column" borderLeft={false} borderRight={false}>{t1}</Box></Box>;
     $[3] = t1;
     $[4] = t2;
@@ -103,17 +181,39 @@ function DiffFrame(t0) {
   }
   return t2;
 }
+/**
+ * loadDiffData
+ *
+ * 整体流程：
+ *   0. 过滤出 old_string/new_string 均非 null 的有效编辑项
+ *   1. 大 needle 保护：single 编辑且 old_string >= CHUNK_SIZE → diffToolInputsOnly（跳过文件读取）
+ *   2. openForScan：以只读方式打开文件；若文件不存在 → diffToolInputsOnly
+ *   3. 多编辑或空 old_string 路径：readCapped 读取整个文件（带大小上限保护）
+ *      → normalizeEdit 归一化 → getPatchForDisplay 生成完整 patch
+ *   4. 单编辑路径：scanForContext 仅扫描包含 old_string 的上下文窗口
+ *      → 若扫描结果被截断或为空 → diffToolInputsOnly（降级）
+ *      → 否则 normalizeEdit + getPatchForDisplay，再通过 adjustHunkLineNumbers 修正行号偏移
+ *   5. 任何异常均记录日志并降级到 diffToolInputsOnly
+ *
+ * 在系统中的角色：
+ *   是 diff 数据的异步数据源，通过多级策略在准确性（文件上下文）与性能
+ *   （避免读取超大文件）之间取得平衡。
+ */
 async function loadDiffData(file_path: string, edits: FileEdit[]): Promise<DiffData> {
+  // 过滤有效编辑项（old_string/new_string 均不为 null）
   const valid = edits.filter(e => e.old_string != null && e.new_string != null);
+  // single：若只有一个有效编辑，直接引用；否则为 undefined（触发全文读取路径）
   const single = valid.length === 1 ? valid[0]! : undefined;
 
   // SedEditPermissionRequest passes the entire file as old_string. Scanning for
   // a needle ≥ CHUNK_SIZE allocates O(needle) for the overlap buffer — skip the
   // file read entirely and diff the inputs we already have.
+  // 大 needle 保护：old_string 过长时跳过文件读取，直接对工具输入进行 diff
   if (single && single.old_string.length >= CHUNK_SIZE) {
     return diffToolInputsOnly(file_path, [single]);
   }
   try {
+    // 打开文件句柄（只读扫描模式）；若文件不存在则降级
     const handle = await openForScan(file_path);
     if (handle === null) return diffToolInputsOnly(file_path, valid);
     try {
@@ -121,9 +221,12 @@ async function loadDiffData(file_path: string, edits: FileEdit[]): Promise<DiffD
       // replacements — structuredPatch needs before/after strings. replace_all
       // routes through the chunked path below (shows first-occurrence window;
       // matches within the slice still replace via edit.replace_all).
+      // 多编辑或空 old_string：需要完整文件内容进行顺序替换
       if (!single || single.old_string === '') {
+        // readCapped：带大小上限的全文读取，防止 OOM；返回 null 则降级
         const file = await readCapped(handle);
         if (file === null) return diffToolInputsOnly(file_path, valid);
+        // 归一化所有编辑项（处理引号风格等差异）
         const normalized = valid.map(e => normalizeEdit(file, e));
         return {
           patch: getPatchForDisplay({
@@ -131,14 +234,17 @@ async function loadDiffData(file_path: string, edits: FileEdit[]): Promise<DiffD
             fileContents: file,
             edits: normalized
           }),
-          firstLine: firstLineOf(file),
+          firstLine: firstLineOf(file), // 提取文件首行用于显示文件名
           fileContent: file
         };
       }
+      // 单编辑路径：仅扫描包含 old_string 的上下文窗口，避免读取整个大文件
       const ctx = await scanForContext(handle, single.old_string, CONTEXT_LINES);
       if (ctx.truncated || ctx.content === '') {
+        // 扫描被截断或未找到 → 降级到工具输入 diff
         return diffToolInputsOnly(file_path, [single]);
       }
+      // 在上下文窗口内归一化并生成 patch
       const normalized = normalizeEdit(ctx.content, single);
       const hunks = getPatchForDisplay({
         filePath: file_path,
@@ -146,31 +252,62 @@ async function loadDiffData(file_path: string, edits: FileEdit[]): Promise<DiffD
         edits: [normalized]
       });
       return {
+        // 修正行号偏移：ctx.lineOffset-1 使 hunk 行号对应原始文件中的实际行号
         patch: adjustHunkLineNumbers(hunks, ctx.lineOffset - 1),
+        // 仅当上下文从文件第 1 行开始时才提供 firstLine（否则无法确定文件名）
         firstLine: ctx.lineOffset === 1 ? firstLineOf(ctx.content) : null,
         fileContent: ctx.content
       };
     } finally {
+      // 确保文件句柄始终关闭，防止文件描述符泄漏
       await handle.close();
     }
   } catch (e) {
+    // 任何异常（权限错误、I/O 错误等）→ 记录日志并降级
     logError(e as Error);
     return diffToolInputsOnly(file_path, valid);
   }
 }
+
+/**
+ * diffToolInputsOnly
+ *
+ * 整体流程：
+ *   直接对工具传入的 old_string 和 new_string 进行 diff，
+ *   不读取磁盘上的实际文件内容。
+ *
+ * 在系统中的角色：
+ *   是所有读取失败/降级路径的统一兜底，确保始终能返回一个有效的 DiffData。
+ */
 function diffToolInputsOnly(filePath: string, edits: FileEdit[]): DiffData {
   return {
+    // 对每个编辑项分别生成 patch，并展平为一个 hunk 数组
     patch: edits.flatMap(e => getPatchForDisplay({
       filePath,
-      fileContents: e.old_string,
+      fileContents: e.old_string, // 以工具输入的 old_string 作为"文件内容"
       edits: [e]
     })),
-    firstLine: null,
-    fileContent: undefined
+    firstLine: null,      // 无法从工具输入中提取真实文件名
+    fileContent: undefined // 无实际文件内容
   };
 }
+
+/**
+ * normalizeEdit
+ *
+ * 整体流程：
+ *   1. findActualString：在实际文件内容中查找与 old_string 最匹配的真实字符串
+ *      （处理引号风格等细微差异），若未找到则回退到原始 old_string
+ *   2. preserveQuoteStyle：根据 actualOld 中的引号风格调整 new_string，
+ *      保证替换后的代码风格与原文件一致
+ *
+ * 在系统中的角色：
+ *   是 diff 数据归一化的核心辅助函数，确保 diff 视图与实际文件内容精确对应。
+ */
 function normalizeEdit(fileContent: string, edit: FileEdit): FileEdit {
+  // 在文件内容中查找最匹配的旧字符串（处理引号/空白等细微差异）
   const actualOld = findActualString(fileContent, edit.old_string) || edit.old_string;
+  // 根据 actualOld 的引号风格调整新字符串，保持代码一致性
   const actualNew = preserveQuoteStyle(edit.old_string, actualOld, edit.new_string);
   return {
     ...edit,

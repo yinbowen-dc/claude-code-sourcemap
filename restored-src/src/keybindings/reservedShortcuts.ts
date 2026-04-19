@@ -1,8 +1,30 @@
+/**
+ * 保留快捷键定义与规范化模块
+ *
+ * 【在 Claude Code 键位绑定系统中的位置与作用】
+ * 本文件定义了系统中"不可重绑定"和"终端/OS 保留"的快捷键列表，
+ * 并提供按键字符串的规范化工具函数，是键位验证流程的基础数据源：
+ *
+ *   reservedShortcuts（本文件，定义保留键列表 + 提供规范化函数）
+ *     → validate（加载保留键列表，对用户绑定做冲突检查）
+ *     → template（过滤保留键，生成干净的模板文件）
+ *
+ * 核心导出：
+ *  - NON_REBINDABLE：Claude Code 内部硬编码、用户不可覆盖的快捷键（ctrl+c / ctrl+d / ctrl+m）
+ *  - TERMINAL_RESERVED：终端/OS 级别拦截的快捷键（ctrl+z / ctrl+\）
+ *  - MACOS_RESERVED：macOS 专属系统快捷键（cmd+c / cmd+v / cmd+space 等）
+ *  - getReservedShortcuts：根据当前平台返回合并后的完整保留键列表
+ *  - normalizeKeyForComparison：将快捷键字符串规范化（统一小写、修饰键排序），
+ *    用于不区分别名的比较（如 "ctrl+k" vs "control+k" 视为相同）
+ */
+
 import { getPlatform } from '../utils/platform.js'
 
 /**
  * Shortcuts that are typically intercepted by the OS, terminal, or shell
  * and will likely never reach the application.
+ *
+ * 通常被操作系统、终端或 Shell 拦截、永远无法到达应用程序的快捷键类型定义。
  */
 export type ReservedShortcut = {
   key: string

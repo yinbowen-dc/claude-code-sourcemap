@@ -1,3 +1,13 @@
+/**
+ * 智能会话搜索模块（Agentic Session Search）。
+ *
+ * 在 Claude Code 系统中，该模块实现了一种两阶段会话搜索策略：
+ * 1. 关键词预过滤：在本地快速筛选包含查询词的会话，减少 API 调用量
+ * 2. 语义搜索：将候选会话的元数据和对话摘要发送给小型快速模型，
+ *    利用 LLM 的语义理解能力返回最相关的会话列表
+ *
+ * 这比纯关键词搜索更智能，可以处理同义词、相关概念等语义匹配场景。
+ */
 import type { LogOption, SerializedMessage } from '../types/logs.js'
 import { count } from './array.js'
 import { logForDebugging } from './debug.js'
@@ -7,11 +17,14 @@ import { isLiteLog, loadFullLog } from './sessionStorage.js'
 import { sideQuery } from './sideQuery.js'
 import { jsonParse } from './slowOperations.js'
 
-// Limits for transcript extraction
+// 每个会话的最大文本摘录字符数
 const MAX_TRANSCRIPT_CHARS = 2000 // Max chars of transcript per session
+// 从会话头尾各扫描的最大消息数
 const MAX_MESSAGES_TO_SCAN = 100 // Max messages to scan from start/end
+// 发送给 API 的最大会话数
 const MAX_SESSIONS_TO_SEARCH = 100 // Max sessions to send to the API
 
+/** 发送给 LLM 的系统提示词：指导模型根据查询找出最相关会话 */
 const SESSION_SEARCH_SYSTEM_PROMPT = `Your goal is to find relevant sessions based on a user's search query.
 
 You will be given a list of sessions with their metadata and a search query. Identify which sessions are most relevant to the query.
@@ -47,12 +60,14 @@ Return sessions ordered by relevance (most relevant first). If truly no sessions
 Respond with ONLY the JSON object, no markdown formatting:
 {"relevant_indices": [2, 5, 0]}`
 
+/** 语义搜索结果结构：包含相关会话的索引数组 */
 type AgenticSearchResult = {
   relevant_indices: number[]
 }
 
 /**
- * Extracts searchable text content from a message.
+ * 从单条消息中提取可搜索的文本内容。
+ * 支持字符串内容和内容块数组（ContentBlock[]）两种格式。
  */
 function extractMessageText(message: SerializedMessage): string {
   if (message.type !== 'user' && message.type !== 'assistant') {
@@ -81,7 +96,8 @@ function extractMessageText(message: SerializedMessage): string {
 }
 
 /**
- * Extracts a truncated transcript from session messages.
+ * 从会话消息列表中提取截断后的对话摘录。
+ * 取会话头尾各一半的消息以获取上下文，超出字符限制时截断并加省略号。
  */
 function extractTranscript(messages: SerializedMessage[]): string {
   if (messages.length === 0) return ''
@@ -95,6 +111,7 @@ function extractTranscript(messages: SerializedMessage[]): string {
           ...messages.slice(-MAX_MESSAGES_TO_SCAN / 2),
         ]
 
+  // 提取每条消息的文本并合并为单一字符串
   const text = messagesToScan
     .map(extractMessageText)
     .filter(Boolean)
@@ -108,7 +125,8 @@ function extractTranscript(messages: SerializedMessage[]): string {
 }
 
 /**
- * Checks if a log contains the query term in any searchable field.
+ * 检查单个会话记录是否包含查询词（在标题、标签、分支、摘要、首条消息或摘录中）。
+ * 用于第一阶段的本地关键词预过滤。
  */
 function logContainsQuery(log: LogOption, queryLower: string): boolean {
   // Check title
@@ -140,8 +158,15 @@ function logContainsQuery(log: LogOption, queryLower: string): boolean {
 }
 
 /**
- * Performs an agentic search using Claude to find relevant sessions
- * based on semantic understanding of the query.
+ * 使用 Claude 的语义理解能力搜索相关会话。
+ *
+ * 完整流程：
+ * 1. 本地关键词预过滤，筛选包含查询词的候选会话
+ * 2. 对 lite 日志加载完整内容以获取对话摘录
+ * 3. 将会话元数据构建成结构化文本发送给小模型
+ * 4. 解析模型返回的 JSON，映射回原始 LogOption 列表
+ *
+ * Performs an agentic search using Claude to find relevant sessions.
  */
 export async function agenticSessionSearch(
   query: string,
@@ -154,12 +179,10 @@ export async function agenticSessionSearch(
 
   const queryLower = query.toLowerCase()
 
-  // Pre-filter: find sessions that contain the query term
-  // This ensures we search relevant sessions, not just recent ones
+  // 第一阶段：本地关键词预过滤
   const matchingLogs = logs.filter(log => logContainsQuery(log, queryLower))
 
-  // Take up to MAX_SESSIONS_TO_SEARCH matching logs
-  // If fewer matches, fill remaining slots with recent non-matching logs for context
+  // 若关键词匹配数不足 MAX_SESSIONS_TO_SEARCH，用最近的非匹配会话补充
   let logsToSearch: LogOption[]
   if (matchingLogs.length >= MAX_SESSIONS_TO_SEARCH) {
     logsToSearch = matchingLogs.slice(0, MAX_SESSIONS_TO_SEARCH)
@@ -180,7 +203,7 @@ export async function agenticSessionSearch(
       `matching: ${matchingLogs.length}, with messages: ${count(logsToSearch, l => l.messages?.length > 0)}`,
   )
 
-  // Load full logs for lite logs to get transcript content
+  // 对精简日志（lite log）加载完整内容以获取对话摘录
   const logsWithTranscriptsPromises = logsToSearch.map(async log => {
     if (isLiteLog(log)) {
       try {
@@ -199,7 +222,7 @@ export async function agenticSessionSearch(
     `Agentic search: loaded ${count(logsWithTranscripts, l => l.messages?.length > 0)}/${logsToSearch.length} logs with transcripts`,
   )
 
-  // Build session list for the prompt with all searchable metadata
+  // 将会话列表构建为结构化文本，发送给 LLM 进行语义排序
   const sessionList = logsWithTranscripts
     .map((log, index) => {
       const parts: string[] = [`${index}:`]
@@ -258,6 +281,7 @@ Find the sessions that are most relevant to this query.`
   )
 
   try {
+    // 使用小型快速模型进行语义搜索
     const model = getSmallFastModel()
     logForDebugging(`Agentic search using model: ${model}`)
 
@@ -269,7 +293,7 @@ Find the sessions that are most relevant to this query.`
       querySource: 'session_search',
     })
 
-    // Extract the text content from the response
+    // 从响应中提取文本内容块
     const textContent = response.content.find(block => block.type === 'text')
     if (!textContent || textContent.type !== 'text') {
       logForDebugging('No text content in agentic search response')
@@ -279,7 +303,7 @@ Find the sessions that are most relevant to this query.`
     // Debug: log the response
     logForDebugging(`Agentic search response: ${textContent.text}`)
 
-    // Parse the JSON response
+    // 从响应文本中提取 JSON 对象
     const jsonMatch = textContent.text.match(/\{[\s\S]*\}/)
     if (!jsonMatch) {
       logForDebugging('Could not find JSON in agentic search response')
@@ -289,7 +313,7 @@ Find the sessions that are most relevant to this query.`
     const result: AgenticSearchResult = jsonParse(jsonMatch[0])
     const relevantIndices = result.relevant_indices || []
 
-    // Map indices back to logs (indices are relative to logsWithTranscripts)
+    // 将模型返回的索引映射回原始 LogOption 列表
     const relevantLogs = relevantIndices
       .filter(index => index >= 0 && index < logsWithTranscripts.length)
       .map(index => logsWithTranscripts[index]!)

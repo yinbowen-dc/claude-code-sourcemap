@@ -1,3 +1,22 @@
+/**
+ * insights 命令模块
+ *
+ * 本文件实现 `/insights` 命令，是 Claude Code 会话数据分析与洞察报告的核心模块。
+ * 该命令读取本地（及远程 Coder 工作区）的所有历史会话日志（.jsonl 文件），
+ * 经过以下流水线处理后生成一份叙述性的个人使用洞察报告：
+ *
+ *   1. 远程数据采集（仅 Anthropic 内部员工）：通过 SSH/SCP 将 Coder 工作区的
+ *      会话文件同步至本地临时目录，支持多工作区并行拉取
+ *   2. 会话元数据提取：从每条 .jsonl 记录中统计消息数、工具调用次数、
+ *      Token 用量、代码改动行数、Git 操作等指标，生成 SessionMeta 结构
+ *   3. Facet 提取（AI 分析层）：使用 Opus 模型分析每个会话的深层维度，
+ *      包括用户目标、结果、满意度、摩擦点等，生成 SessionFacets 结构
+ *   4. 数据聚合：将所有 SessionMeta 和 SessionFacets 汇总为 AggregatedData
+ *   5. 叙述生成：基于聚合数据，再次调用 Opus 生成可读性高的 Markdown 洞察报告
+ *
+ * 生成的报告缓存至 ~/.claude/ 目录，支持增量更新（仅处理新会话）。
+ * 该命令仅对 Anthropic 内部员工（USER_TYPE === 'ant'）启用。
+ */
 import { execFileSync } from 'child_process'
 import { diffLines } from 'diff'
 import { constants as fsConstants } from 'fs'
@@ -37,18 +56,19 @@ import { countCharInString } from '../utils/stringUtils.js'
 import { asSystemPrompt } from '../utils/systemPromptType.js'
 import { escapeXmlAttr as escapeHtml } from '../utils/xml.js'
 
-// Model for facet extraction and summarization (Opus - best quality)
+// 用于 Facet 提取和摘要生成的模型（Opus，最高质量）
 function getAnalysisModel(): string {
   return getDefaultOpusModel()
 }
 
-// Model for narrative insights (Opus - best quality)
+// 用于最终叙述性洞察报告生成的模型（Opus，最高质量）
 function getInsightsModel(): string {
   return getDefaultOpusModel()
 }
 
 // ============================================================================
-// Homespace Data Collection
+// 远程工作区数据采集（仅 Anthropic 内部员工）
+// 通过 Coder CLI 枚举运行中的远程工作区，并经由 SSH/SCP 将会话文件拉取至本地
 // ============================================================================
 
 type RemoteHostInfo = {
@@ -222,7 +242,7 @@ const collectAllRemoteHostData: (destDir: string) => Promise<{
 /* eslint-enable custom-rules/no-process-env-top-level */
 
 // ============================================================================
-// Types
+// 核心数据类型定义
 // ============================================================================
 
 type SessionMeta = {

@@ -1,6 +1,23 @@
 /**
- * Plugin and marketplace subcommand handlers — extracted from main.tsx for lazy loading.
- * These are dynamically imported only when `claude plugin *` or `claude plugin marketplace *` runs.
+ * 插件与市场子命令处理器 — 从 main.tsx 中抽出以实现懒加载。
+ *
+ * 在整个 Claude Code 系统中的位置：
+ * 本文件包含所有 `claude plugin *` 和 `claude plugin marketplace *` 子命令的执行逻辑。
+ * 它们通过动态 import 懒加载，只有当用户实际运行插件相关命令时才会被加载，
+ * 从而避免在 CLI 启动时引入不必要的依赖开销。
+ *
+ * 包含的命令组：
+ *   - plugin validate  — 验证插件清单文件格式与内容
+ *   - plugin list      — 列出已安装及（可选）可用插件
+ *   - plugin install   — 在指定作用域安装插件
+ *   - plugin uninstall — 卸载插件
+ *   - plugin enable    — 启用插件
+ *   - plugin disable   — 禁用单个或所有插件
+ *   - plugin update    — 更新插件至最新版本
+ *   - marketplace add    — 添加插件市场源
+ *   - marketplace list   — 列出已配置的市场
+ *   - marketplace remove — 移除市场源
+ *   - marketplace update — 刷新市场缓存
  */
 /* eslint-disable custom-rules/no-process-exit -- CLI subcommand handlers intentionally exit */
 import figures from 'figures'
@@ -59,17 +76,28 @@ import { jsonStringify } from '../../utils/slowOperations.js'
 import { plural } from '../../utils/stringUtils.js'
 import { cliError, cliOk } from '../exit.js'
 
-// Re-export for main.tsx to reference in option definitions
+// 重新导出供 main.tsx 在选项定义（--scope 等枚举值）中直接引用
 export { VALID_INSTALLABLE_SCOPES, VALID_UPDATE_SCOPES }
 
 /**
- * Helper function to handle marketplace command errors consistently.
+ * 统一处理市场命令执行失败的工具函数。
+ *
+ * 将错误写入日志后调用 cliError() 展示友好提示并退出进程（never 返回）。
+ * 所有 marketplace 子命令的 catch 块均通过此函数汇聚，确保错误格式一致。
  */
 export function handleMarketplaceError(error: unknown, action: string): never {
   logError(error)
   cliError(`${figures.cross} Failed to ${action}: ${errorMessage(error)}`)
 }
 
+/**
+ * 将 ValidationResult 中的错误与警告逐条打印到 stdout。
+ *
+ * 分两组输出：
+ *   - errors（错误）：以 ✖ 前缀汇总数量，逐条展示 path + message
+ *   - warnings（警告）：以 ⚠ 前缀汇总数量，逐条展示 path + message
+ * 调用方（pluginValidateHandler）根据此函数的输出决定最终退出码。
+ */
 function printValidationResult(result: ValidationResult): void {
   if (result.errors.length > 0) {
     // biome-ignore lint/suspicious/noConsole:: intentional console output
@@ -98,6 +126,17 @@ function printValidationResult(result: ValidationResult): void {
 }
 
 // plugin validate
+/**
+ * `claude plugin validate` 命令处理器：验证插件清单文件的格式与内容。
+ *
+ * 流程：
+ * 1. 若 --cowork 标志，切换到 cowork 插件集。
+ * 2. 调用 validateManifest() 解析并校验 plugin.json / skill.json 等清单文件。
+ * 3. 若清单位于 .claude-plugin 目录内（插件根目录结构），
+ *    额外调用 validatePluginContents() 校验 skills/agents/commands/hooks 等内容文件。
+ * 4. 汇总所有验证结果：全部通过则 cliOk（有警告时注明），否则 process.exit(1)。
+ * 5. 捕获意外异常以 process.exit(2) 退出。
+ */
 export async function pluginValidateHandler(
   manifestPath: string,
   options: { cowork?: boolean },
@@ -117,7 +156,9 @@ export async function pluginValidateHandler(
     let contentResults: ValidationResult[] = []
     if (result.fileType === 'plugin') {
       const manifestDir = dirname(result.filePath)
+      // 仅在清单文件位于 .claude-plugin 目录时才验证内容文件
       if (basename(manifestDir) === '.claude-plugin') {
+        // validatePluginContents 的参数是插件的外层目录（.claude-plugin 的父目录）
         contentResults = await validatePluginContents(dirname(manifestDir))
         for (const r of contentResults) {
           // biome-ignore lint/suspicious/noConsole:: intentional console output
@@ -154,6 +195,18 @@ export async function pluginValidateHandler(
 }
 
 // plugin list (lines 5217–5416)
+/**
+ * `claude plugin list` 命令处理器：列出已安装及（可选）可用插件。
+ *
+ * 流程：
+ * 1. 从 installedData 读取所有已安装插件的 bookkeeping 记录。
+ * 2. 调用 loadAllPlugins() 实际加载所有插件，获取加载错误和 inline 插件信息。
+ * 3. 若 --json，以 JSON 格式输出（含 installed 列表，--available 时额外含 available 列表）；
+ *    否则以人类可读格式逐条展示插件 ID、版本、作用域、启用状态、加载错误。
+ * 4. 特殊处理 session-only（--plugin-dir）插件：它们不在 installedData 中，
+ *    由 inlinePlugins 和 inlineLoadErrors 单独列出。
+ * 5. 若 --available，并发加载已配置市场中未安装的插件，追加到输出。
+ */
 export async function pluginListHandler(options: {
   json?: boolean
   available?: boolean
@@ -175,6 +228,7 @@ export async function pluginListHandler(options: {
   //  - inline plugins (session-only via --plugin-dir, source='name@inline')
   //    which are NOT in installedData.plugins (V2 bookkeeping) — they must
   //    be surfaced separately or `plugin list` silently ignores --plugin-dir.
+  // 同时加载已启用和已禁用插件，合并后用于 inline 插件过滤
   const {
     enabled: loadedEnabled,
     disabled: loadedDisabled,
@@ -188,6 +242,8 @@ export async function pluginListHandler(options: {
   // manifest is read) use source='inline[N]'. Plugin-level errors after
   // manifest read use source='name@inline'. Collect both for the session
   // section — these are otherwise invisible since they have no pluginId.
+  // 同时收集路径级（inline[N]）和插件级（name@inline）的加载失败，
+  // 避免因 --plugin-dir 指向不存在路径时静默无输出
   const inlineLoadErrors = loadErrors.filter(
     e => e.source.endsWith('@inline') || e.source.startsWith('inline['),
   )
@@ -444,6 +500,17 @@ export async function pluginListHandler(options: {
 }
 
 // marketplace add (lines 5433–5487)
+/**
+ * `claude plugin marketplace add` 命令处理器：解析并添加新的插件市场源。
+ *
+ * 流程：
+ * 1. 调用 parseMarketplaceInput() 将用户输入（owner/repo、https://...、./path）解析为结构化源。
+ * 2. 验证 scope 合法性（user/project/local），转换为 SettingSource。
+ * 3. 若提供了 --sparse，将稀疏路径合并进 marketplaceSource（仅 github/git 支持）。
+ * 4. 调用 addMarketplaceSource() 实际拉取/物化市场数据（含进度回调）。
+ * 5. 将市场源声明写入指定作用域的配置文件（saveMarketplaceToSettings）。
+ * 6. 清空所有插件缓存，记录分析事件。
+ */
 export async function marketplaceAddHandler(
   source: string,
   options: { cowork?: boolean; sparse?: string[]; scope?: string },
@@ -463,6 +530,7 @@ export async function marketplaceAddHandler(
     }
 
     // Validate scope
+    // 验证并转换 --scope 参数为 SettingSource（user/project/local → 对应配置文件）
     const scope = options.scope ?? 'user'
     if (scope !== 'user' && scope !== 'project' && scope !== 'local') {
       cliError(
@@ -499,6 +567,7 @@ export async function marketplaceAddHandler(
       })
 
     // Write intent to settings at the requested scope
+    // 将市场源声明持久化到对应作用域的设置文件（此时市场数据已物化到磁盘）
     saveMarketplaceToSettings(name, { source: resolvedSource }, settingSource)
 
     clearAllCaches()
@@ -524,6 +593,13 @@ export async function marketplaceAddHandler(
 }
 
 // marketplace list (lines 5497–5565)
+/**
+ * `claude plugin marketplace list` 命令处理器：列出所有已配置的插件市场。
+ *
+ * 从 loadKnownMarketplacesConfig() 读取当前生效的市场配置，
+ * 以 --json 模式输出结构化 JSON（含 source 类型、repo/url/path 等字段），
+ * 或以人类可读格式逐条展示市场名称和来源详情。
+ */
 export async function marketplaceListHandler(options: {
   json?: boolean
   cowork?: boolean
@@ -592,6 +668,12 @@ export async function marketplaceListHandler(options: {
 }
 
 // marketplace remove (lines 5576–5598)
+/**
+ * `claude plugin marketplace remove` 命令处理器：移除指定的插件市场源。
+ *
+ * 调用 removeMarketplaceSource() 从所有作用域的配置中删除该市场，
+ * 随后清空所有插件缓存（避免使用已失效的市场数据），并记录分析事件。
+ */
 export async function marketplaceRemoveHandler(
   name: string,
   options: { cowork?: boolean },
@@ -613,6 +695,13 @@ export async function marketplaceRemoveHandler(
 }
 
 // marketplace update (lines 5609–5672)
+/**
+ * `claude plugin marketplace update [name]` 命令处理器：刷新市场缓存。
+ *
+ * 若提供了市场名称，仅刷新该市场；
+ * 若未提供名称，并发刷新所有已配置市场（refreshAllMarketplaces）。
+ * 刷新后清空插件缓存，记录分析事件（单个或 all 两种事件类型）。
+ */
 export async function marketplaceUpdateHandler(
   name: string | undefined,
   options: { cowork?: boolean },
@@ -665,6 +754,15 @@ export async function marketplaceUpdateHandler(
 }
 
 // plugin install (lines 5690–5721)
+/**
+ * `claude plugin install` 命令处理器：在指定作用域安装插件。
+ *
+ * 流程：
+ * 1. 验证 scope 合法性（user/project/local），--cowork 时强制 user scope。
+ * 2. 解析插件标识符，将插件名和市场名通过 PII 标记列写入分析日志
+ *    （旧的 additional_metadata 明文记录方式已废弃，改用特权 BQ 列）。
+ * 3. 调用 installPlugin() 实际完成安装（下载、解压、写入 bookkeeping）。
+ */
 export async function pluginInstallHandler(
   plugin: string,
   options: { scope?: string; cowork?: boolean },
@@ -687,6 +785,7 @@ export async function pluginInstallHandler(
   // Unredacted plugin arg was previously logged to general-access
   // additional_metadata for all users — dropped in favor of the privileged
   // column route. marketplace may be undefined (fires before resolution).
+  // _PROTO_* 前缀表示该字段走特权 BigQuery 列（PII 标记），不进入通用访问的 additional_metadata
   const { name, marketplace } = parsePluginIdentifier(plugin)
   logEvent('tengu_plugin_install_command', {
     _PROTO_plugin_name: name as AnalyticsMetadata_I_VERIFIED_THIS_IS_PII_TAGGED,
@@ -701,6 +800,12 @@ export async function pluginInstallHandler(
 }
 
 // plugin uninstall (lines 5738–5769)
+/**
+ * `claude plugin uninstall` 命令处理器：卸载指定插件。
+ *
+ * 验证 scope 合法性后记录 PII 标记的分析事件，
+ * 再调用 uninstallPlugin() 完成卸载（可选 --keepData 保留插件数据目录）。
+ */
 export async function pluginUninstallHandler(
   plugin: string,
   options: { scope?: string; cowork?: boolean; keepData?: boolean },
@@ -737,6 +842,15 @@ export async function pluginUninstallHandler(
 }
 
 // plugin enable (lines 5783–5818)
+/**
+ * `claude plugin enable` 命令处理器：在指定作用域启用插件。
+ *
+ * 作用域解析规则：
+ *   - --cowork 且未指定 scope → 默认 user scope
+ *   - --cowork 且 scope 非 user → 报错
+ *   - 未指定 scope → 由 enablePlugin() 自动推断最佳作用域
+ * 记录 PII 标记的分析事件后委托 enablePlugin() 执行。
+ */
 export async function pluginEnableHandler(
   plugin: string,
   options: { scope?: string; cowork?: boolean },
@@ -760,12 +874,8 @@ export async function pluginEnableHandler(
   }
 
   // --cowork always operates at user scope
+  // --cowork 未指定 scope 时，默认使用 user scope（cowork 插件仅支持用户级作用域）
   if (options.cowork && scope === undefined) {
-    scope = 'user'
-  }
-
-  const { name, marketplace } = parsePluginIdentifier(plugin)
-  logEvent('tengu_plugin_enable_command', {
     _PROTO_plugin_name: name as AnalyticsMetadata_I_VERIFIED_THIS_IS_PII_TAGGED,
     ...(marketplace && {
       _PROTO_marketplace_name:
@@ -779,6 +889,16 @@ export async function pluginEnableHandler(
 }
 
 // plugin disable (lines 5833–5902)
+/**
+ * `claude plugin disable [plugin]` 命令处理器：禁用单个或所有插件。
+ *
+ * 两种模式：
+ *   - --all：忽略 scope 参数，调用 disableAllPlugins() 禁用全部已启用插件；
+ *     此模式下分析事件中 plugin_name 为 NULL（由空 logEvent 体标识）。
+ *   - 指定 plugin 名称：验证 scope，记录 PII 标记的分析事件，
+ *     调用 disablePlugin() 在指定作用域禁用该插件。
+ * --cowork 与 --all 不兼容（scope 概念在 all 模式下无意义）。
+ */
 export async function pluginDisableHandler(
   plugin: string | undefined,
   options: { scope?: string; cowork?: boolean; all?: boolean },
@@ -800,6 +920,7 @@ export async function pluginDisableHandler(
 
     // No _PROTO_plugin_name here — --all disables all plugins.
     // Distinguishable from the specific-plugin branch by plugin_name IS NULL.
+    // --all 模式不上报具体插件名（BQ 中 plugin_name IS NULL 即为全量禁用事件）
     logEvent('tengu_plugin_disable_command', {})
 
     await disableAllPlugins()
@@ -824,6 +945,7 @@ export async function pluginDisableHandler(
   }
 
   // --cowork always operates at user scope
+  // --cowork 未指定 scope 时，默认使用 user scope
   if (options.cowork && scope === undefined) {
     scope = 'user'
   }
@@ -843,6 +965,13 @@ export async function pluginDisableHandler(
 }
 
 // plugin update (lines 5918–5948)
+/**
+ * `claude plugin update` 命令处理器：将插件更新至最新版本。
+ *
+ * 在记录 PII 标记的分析事件后，验证 scope 合法性（使用 VALID_UPDATE_SCOPES
+ * 而非 VALID_INSTALLABLE_SCOPES，两者包含的作用域略有差异），
+ * 最终委托 updatePluginCli() 执行实际更新操作。
+ */
 export async function pluginUpdateHandler(
   plugin: string,
   options: { scope?: string; cowork?: boolean },

@@ -1,3 +1,23 @@
+/**
+ * ThemedText.tsx — 主题感知文本组件
+ *
+ * 在 Claude Code 系统流程中的位置：
+ *   设计系统（design-system）层 → UI 基础原语 → 文本渲染
+ *
+ * 主要功能：
+ *   1. 对 Ink 框架的 Text 组件进行封装，支持以主题键（keyof Theme）或原始颜色值
+ *      作为 color / backgroundColor，自动解析为实际颜色码。
+ *   2. 导出 TextHoverColorContext：跨越 Box 边界的悬停颜色上下文。
+ *      Ink 的样式层叠不穿透 Box，通过 Context 可以将悬停色传递给子树中的
+ *      ThemedText，优先级：显式 color > 悬停色 > dimColor。
+ *   3. dimColor 模式使用主题的 inactive 色（而非 ANSI dim 指令），
+ *      兼容 bold 加粗显示。
+ *   4. 利用 React Compiler 记忆化缓存（_c(10)）避免不必要的重新渲染。
+ *
+ * 使用场景：
+ *   整个 Claude Code 终端 UI 中所有需要跟随主题切换颜色的文本内容，
+ *   替代直接使用 Ink 的 Text 组件。
+ */
 import { c as _c } from "react/compiler-runtime";
 import type { ReactNode } from 'react';
 import React, { useContext } from 'react';
@@ -6,8 +26,10 @@ import type { Color, Styles } from '../../ink/styles.js';
 import { getTheme, type Theme } from '../../utils/theme.js';
 import { useTheme } from './ThemeProvider.js';
 
-/** Colors uncolored ThemedText in the subtree. Precedence: explicit `color` >
- *  this > dimColor. Crosses Box boundaries (Ink's style cascade doesn't). */
+/** 跨 Box 边界的悬停颜色上下文。
+ * 为子树中没有显式 color 的 ThemedText 着色。
+ * 优先级：显式 color > 此上下文 > dimColor。
+ * 之所以用 Context 而非 Ink 样式层叠，是因为 Ink 的样式不穿透 Box 边界。*/
 export const TextHoverColorContext = React.createContext<keyof Theme | undefined>(undefined);
 export type Props = {
   /**
@@ -61,36 +83,61 @@ export type Props = {
 };
 
 /**
- * Resolves a color value that may be a theme key to a raw Color.
+ * resolveColor — 将颜色值（主题键或原始颜色）解析为实际颜色码
+ *
+ * 整体流程：
+ *   1. 若 color 为空则返回 undefined
+ *   2. 若 color 以 rgb(/# /ansi256(/ansi: 开头，视为原始颜色直接返回
+ *   3. 否则视为主题键，从 theme 对象查找并返回实际颜色值
+ *
+ * 在文件中的作用：供 ThemedText 组件统一解析颜色 props。
  */
 function resolveColor(color: keyof Theme | Color | undefined, theme: Theme): Color | undefined {
+  // 空值快速返回
   if (!color) return undefined;
-  // Check if it's a raw color (starts with rgb(, #, ansi256(, or ansi:)
+  // 判断是否为原始颜色格式（rgb(、#、ansi256(、ansi:）
   if (color.startsWith('rgb(') || color.startsWith('#') || color.startsWith('ansi256(') || color.startsWith('ansi:')) {
+    // 原始颜色直接返回，无需主题查找
     return color as Color;
   }
-  // It's a theme key - resolve it
+  // 主题键：从当前主题对象取出实际颜色码
   return theme[color as keyof Theme] as Color;
 }
 
 /**
- * Theme-aware Text component that resolves theme color keys to raw colors.
- * This wraps the base Text component with theme resolution.
+ * ThemedText — 主题感知的 Ink Text 包装组件
+ *
+ * 整体流程：
+ *   1. 解构所有 props，对布尔 props 提供默认值（false），wrap 默认 'wrap'
+ *   2. 通过 useTheme() 获取当前主题名称，getTheme() 取出主题配色对象
+ *   3. 通过 useContext(TextHoverColorContext) 获取悬停色（由祖先注入）
+ *   4. 按优先级计算 resolvedColor：
+ *      - 若无显式 color 且有悬停色 → 用悬停色
+ *      - 否则若 dimColor=true → 用 theme.inactive
+ *      - 否则用 resolveColor(color, theme)（可能是主题键或原始颜色）
+ *   5. resolvedBackgroundColor：直接从 theme 查 backgroundColor 键
+ *   6. React Compiler 记忆化（$[0]~$[9]）：任一输出 prop 变化时重建 JSX，否则复用
+ *
+ * 在系统中的作用：
+ *   Claude Code 终端 UI 中所有需主题感知的文本节点，
+ *   同时充当悬停色层叠的接收端。
  */
 export default function ThemedText(t0) {
+  // 初始化大小为 10 的 React 编译器记忆缓存槽数组
   const $ = _c(10);
   const {
     color,
     backgroundColor,
-    dimColor: t1,
-    bold: t2,
-    italic: t3,
-    underline: t4,
-    strikethrough: t5,
-    inverse: t6,
-    wrap: t7,
+    dimColor: t1,   // dimColor 默认 false
+    bold: t2,       // bold 默认 false
+    italic: t3,     // italic 默认 false
+    underline: t4,  // underline 默认 false
+    strikethrough: t5, // strikethrough 默认 false
+    inverse: t6,    // inverse 默认 false
+    wrap: t7,       // wrap 默认 'wrap'
     children
   } = t0;
+  // 为各布尔 prop 应用默认值（编译器将默认参数展开为三元表达式）
   const dimColor = t1 === undefined ? false : t1;
   const bold = t2 === undefined ? false : t2;
   const italic = t3 === undefined ? false : t3;
@@ -98,13 +145,19 @@ export default function ThemedText(t0) {
   const strikethrough = t5 === undefined ? false : t5;
   const inverse = t6 === undefined ? false : t6;
   const wrap = t7 === undefined ? "wrap" : t7;
+  // 获取当前主题名称及对应配色对象
   const [themeName] = useTheme();
   const theme = getTheme(themeName);
+  // 读取祖先注入的悬停颜色（跨 Box 边界传递）
   const hoverColor = useContext(TextHoverColorContext);
+  // 按优先级解析最终前景色：悬停色 > dimColor（inactive） > 显式 color
   const resolvedColor = !color && hoverColor ? resolveColor(hoverColor, theme) : dimColor ? theme.inactive as Color : resolveColor(color, theme);
+  // 解析背景色（只接受主题键，直接查主题对象）
   const resolvedBackgroundColor = backgroundColor ? theme[backgroundColor] as Color : undefined;
   let t8;
+  // 记忆化：仅当任一 prop 发生变化时重新创建 JSX
   if ($[0] !== bold || $[1] !== children || $[2] !== inverse || $[3] !== italic || $[4] !== resolvedBackgroundColor || $[5] !== resolvedColor || $[6] !== strikethrough || $[7] !== underline || $[8] !== wrap) {
+    // 将解析后的颜色和样式 props 传给 Ink Text 组件
     t8 = <Text color={resolvedColor} backgroundColor={resolvedBackgroundColor} bold={bold} italic={italic} underline={underline} strikethrough={strikethrough} inverse={inverse} wrap={wrap}>{children}</Text>;
     $[0] = bold;
     $[1] = children;
@@ -117,6 +170,7 @@ export default function ThemedText(t0) {
     $[8] = wrap;
     $[9] = t8;
   } else {
+    // 缓存命中：复用上次渲染结果
     t8 = $[9];
   }
   return t8;

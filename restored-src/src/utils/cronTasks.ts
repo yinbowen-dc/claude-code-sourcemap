@@ -1,3 +1,11 @@
+/**
+ * 计划任务存储模块。
+ *
+ * 在 Claude Code 系统中，该模块定义和管理存储在 <project>/.claude/scheduled_tasks.json 的计划任务：
+ * - 一次性任务（recurring: false）：触发后自动删除
+ * - 周期性任务（recurring: true）：按 cron 表达式触发后从当前时间重新调度
+ * - 提供任务的增删改查操作及 JSON 序列化/反序列化
+ */
 // Scheduled prompts, stored in <project>/.claude/scheduled_tasks.json.
 //
 // Tasks come in two flavors:

@@ -1,3 +1,16 @@
+/**
+ * FilesystemPermissionRequest/FilesystemPermissionRequest.tsx
+ *
+ * 【在 Claude Code 权限系统中的位置】
+ * 本文件是文件系统类工具（Read、Glob、Grep 等）权限请求的统一入口组件。
+ * 当 Claude 使用任意文件系统工具时，权限系统会渲染此组件向用户确认操作。
+ * 它通过 tool.getPath() 提取目标路径，然后交由 FilePermissionDialog 处理；
+ * 若工具不支持 getPath，则回退到通用的 FallbackPermissionRequest。
+ *
+ * 【主要功能】
+ * - pathFromToolUse：从任意 ToolUseConfirm 中安全提取文件路径
+ * - FilesystemPermissionRequest：根据路径可用性分发到专用对话框或通用兜底
+ */
 import { c as _c } from "react/compiler-runtime";
 import React from 'react';
 import { Box, Text, useTheme } from '../../../ink.js';
@@ -5,17 +18,39 @@ import { FallbackPermissionRequest } from '../FallbackPermissionRequest.js';
 import { FilePermissionDialog } from '../FilePermissionDialog/FilePermissionDialog.js';
 import type { ToolInput } from '../FilePermissionDialog/useFilePermissionDialog.js';
 import type { PermissionRequestProps, ToolUseConfirm } from '../PermissionRequest.js';
+
+/**
+ * pathFromToolUse — 从 ToolUseConfirm 安全提取目标路径
+ *
+ * 【执行流程】
+ * 1. 检查 tool 对象是否含有 getPath 方法（鸭子类型检查）
+ * 2. 调用 tool.getPath(input) 提取路径，失败时捕获异常返回 null
+ * 3. 若工具不支持 getPath，直接返回 null
+ */
 function pathFromToolUse(toolUseConfirm: ToolUseConfirm): string | null {
   const tool = toolUseConfirm.tool;
+  // 鸭子类型检查：确认 tool 含有 getPath 方法才调用
   if ('getPath' in tool && typeof tool.getPath === 'function') {
     try {
       return tool.getPath(toolUseConfirm.input);
     } catch {
+      // getPath 解析失败时静默返回 null，不抛出异常
       return null;
     }
   }
+  // 工具不支持 getPath 时直接返回 null
   return null;
 }
+
+/**
+ * FilesystemPermissionRequest — 文件系统权限请求分发组件
+ *
+ * 【执行流程】
+ * 1. 调用 pathFromToolUse 提取路径；若失败则渲染 FallbackPermissionRequest
+ * 2. 判断工具是否只读（isReadOnly），决定标题为"Read file"还是"Edit file"
+ * 3. 渲染 renderToolUseMessage 生成工具调用说明文本
+ * 4. 将所有信息传入 FilePermissionDialog，展示专用权限确认对话框
+ */
 export function FilesystemPermissionRequest(t0) {
   const $ = _c(30);
   const {
@@ -28,6 +63,7 @@ export function FilesystemPermissionRequest(t0) {
   } = t0;
   const [theme] = useTheme();
   let t1;
+  // React Compiler 缓存：仅在 toolUseConfirm 变化时重新提取路径
   if ($[0] !== toolUseConfirm) {
     t1 = pathFromToolUse(toolUseConfirm);
     $[0] = toolUseConfirm;
@@ -37,6 +73,7 @@ export function FilesystemPermissionRequest(t0) {
   }
   const path = t1;
   let t2;
+  // React Compiler 缓存：仅在 input 或 tool 变化时重新获取用户可见名称
   if ($[2] !== toolUseConfirm.input || $[3] !== toolUseConfirm.tool) {
     t2 = toolUseConfirm.tool.userFacingName(toolUseConfirm.input as never);
     $[2] = toolUseConfirm.input;
@@ -46,10 +83,13 @@ export function FilesystemPermissionRequest(t0) {
     t2 = $[4];
   }
   const userFacingName = t2;
+  // 判断是否只读，决定对话框标题
   const isReadOnly = toolUseConfirm.tool.isReadOnly(toolUseConfirm.input);
   const userFacingReadOrEdit = isReadOnly ? "Read" : "Edit";
   const title = `${userFacingReadOrEdit} file`;
+  // parseInput 是简单透传函数，由 React Compiler 提取为模块级引用
   const parseInput = _temp;
+  // 无法提取路径时，回退到通用权限请求组件
   if (!path) {
     let t3;
     if ($[5] !== onDone || $[6] !== onReject || $[7] !== toolUseConfirm || $[8] !== toolUseContext || $[9] !== verbose || $[10] !== workerBadge) {
@@ -92,7 +132,9 @@ export function FilesystemPermissionRequest(t0) {
   const content = t4;
   const t5 = isReadOnly ? "read" : "write";
   let t6;
+  // React Compiler 缓存：所有 FilePermissionDialog props 均有变化检测
   if ($[20] !== content || $[21] !== onDone || $[22] !== onReject || $[23] !== path || $[24] !== t5 || $[25] !== title || $[26] !== toolUseConfirm || $[27] !== toolUseContext || $[28] !== workerBadge) {
+    // operationType 传 "read"/"write" 用于权限规则分类
     t6 = <FilePermissionDialog toolUseConfirm={toolUseConfirm} toolUseContext={toolUseContext} onDone={onDone} onReject={onReject} workerBadge={workerBadge} title={title} content={content} path={path} parseInput={parseInput} operationType={t5} completionType="tool_use_single" />;
     $[20] = content;
     $[21] = onDone;
@@ -109,6 +151,7 @@ export function FilesystemPermissionRequest(t0) {
   }
   return t6;
 }
+// React Compiler 提取的辅助函数：简单透传 input，不作任何转换
 function _temp(input) {
   return input as ToolInput;
 }

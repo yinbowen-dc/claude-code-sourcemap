@@ -1,3 +1,12 @@
+/**
+ * Computer Use MCP 工具渲染覆盖模块。
+ *
+ * 在 Claude Code 系统中，该模块为 `mcp__computer-use__*` 系列工具提供 UI 渲染覆盖：
+ * - getComputerUseMCPRenderingOverrides()：返回工具渲染覆盖配置，包括：
+ *   - userFacingName()：用户友好的工具名称
+ *   - renderToolUseMessage()：工具调用时的 React 组件渲染
+ *   - renderToolResultMessage()：工具结果的 React 组件渲染（含截图展示）
+ */
 import * as React from 'react';
 import { MessageResponse } from '../../components/MessageResponse.js';
 import { Text } from '../../ink.js';
@@ -36,9 +45,9 @@ const RESULT_SUMMARY: Readonly<Partial<Record<string, string>>> = {
 };
 
 /**
- * Rendering overrides for `mcp__computer-use__*` tools. Spread into the MCP
- * tool object in `client.ts` after the default `userFacingName`, so these win.
- * Mirror of `getClaudeInChromeMCPToolOverrides`.
+ * `mcp__computer-use__*` 系列工具的渲染覆盖配置。
+ * 在 `client.ts` 中于默认 `userFacingName` 之后展开合并，因此此处配置优先生效。
+ * 镜像自 `getClaudeInChromeMCPToolOverrides`。
  */
 export function getComputerUseMCPRenderingOverrides(toolName: string): {
   userFacingName: () => string;
@@ -53,9 +62,8 @@ export function getComputerUseMCPRenderingOverrides(toolName: string): {
     userFacingName() {
       return `Computer Use[${toolName}]`;
     },
-    // AssistantToolUseMessage.tsx contract: null hides the ENTIRE row, '' shows
-    // the tool name without "(args)". Every path below returns '' when there's
-    // nothing to show — never null.
+    // AssistantToolUseMessage.tsx 约定：null 隐藏整行，'' 仅显示工具名（不含参数）。
+    // 以下所有路径在无内容时均返回 '' —— 绝不返回 null。
     renderToolUseMessage(input: CuToolInput) {
       switch (toolName) {
         case 'screenshot':
@@ -113,7 +121,7 @@ export function getComputerUseMCPRenderingOverrides(toolName: string): {
     }) {
       if (verbose || typeof output !== 'object' || output === null) return null;
 
-      // Non-verbose: one-line dim summary, like Chrome's pattern.
+      // 非详细模式：显示单行灰显摘要，与 Chrome 的渲染模式一致。
       const summary = RESULT_SUMMARY[toolName];
       if (!summary) return null;
       return <MessageResponse height={1}>

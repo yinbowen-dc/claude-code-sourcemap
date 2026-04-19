@@ -1,33 +1,35 @@
 /**
+ * Anthropic API 预连接模块（TCP+TLS 握手预热）。
+ *
+ * 在 Claude Code 系统中，该模块在初始化阶段以 fire-and-forget 方式向
+ * Anthropic API 发起 HEAD 请求，将 TCP+TLS 握手（约 100-200ms）与启动
+ * 工作并行化，从而减少第一次真实 API 调用的延迟。
+ *
+ * 原理：Bun 的 fetch 在全局共享一个 keep-alive 连接池，因此此处预热的
+ * 连接可直接被后续 API 请求复用。
+ *
+ * 调用时机：在 init.ts 中于 applyExtraCACertsFromConfig() 和
+ * configureGlobalAgents() 之后调用，确保 settings.json 中的环境变量已
+ * 加载、TLS 证书存储已就绪。
+ *
+ * 跳过条件：
+ * - 使用 Bedrock/Vertex/Foundry（不同端点与认证方式）
+ * - 配置了代理（proxy）、mTLS 或 Unix socket（SDK 使用自定义 dispatcher，
+ *   不共享全局连接池，预连接无效甚至有害）
+ *
  * Preconnect to the Anthropic API to overlap TCP+TLS handshake with startup.
- *
- * The TCP+TLS handshake is ~100-200ms that normally blocks inside the first
- * API call. Kicking a fire-and-forget fetch during init lets the handshake
- * happen in parallel with action-handler work (~100ms of setup/commands/mcp
- * before the API request in -p mode; unbounded "user is typing" window in
- * interactive mode).
- *
- * Bun's fetch shares a keep-alive connection pool globally, so the real API
- * request reuses the warmed connection.
- *
- * Called from init.ts AFTER applyExtraCACertsFromConfig() + configureGlobalAgents()
- * so settings.json env vars are applied and the TLS cert store is finalized.
- * The early cli.tsx call site was removed — it ran before settings.json loaded,
- * so ANTHROPIC_BASE_URL/proxy/mTLS in settings would be invisible and preconnect
- * would warm the wrong pool (or worse, lock BoringSSL's cert store before
- * NODE_EXTRA_CA_CERTS was applied).
- *
- * Skipped when:
- * - proxy/mTLS/unix socket configured (preconnect would use wrong transport —
- *   the SDK passes a custom dispatcher/agent that doesn't share the global pool)
- * - Bedrock/Vertex/Foundry (different endpoints, different auth)
  */
 
 import { getOauthConfig } from '../constants/oauth.js'
 import { isEnvTruthy } from './envUtils.js'
 
+// 幂等标志，确保同一进程中只触发一次预连接
 let fired = false
 
+/**
+ * 触发一次 fire-and-forget 的 HEAD 请求以预热 API 连接池。
+ * 已触发过、使用云厂商端点或配置了代理/mTLS/unix socket 时直接跳过。
+ */
 export function preconnectAnthropicApi(): void {
   if (fired) return
   fired = true

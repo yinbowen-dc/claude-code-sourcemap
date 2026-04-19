@@ -1,3 +1,23 @@
+/**
+ * 文件状态缓存模块。
+ *
+ * 在 Claude Code 系统中，该模块使用 LRU 缓存维护文件状态快照，
+ * 记录每个文件在某一时刻的内容、mtime 等元信息，
+ * 供编辑工具（Edit/Write）在执行前后进行状态比对与冲突检测：
+ * - 基于 lru-cache 实现有界缓存，防止内存无限增长
+ * - 路径经过规范化处理以保证跨平台一致性
+ * - 与 fileHistory.ts 配合，支持多轮会话内的文件状态追踪
+ */
+/**
+ * 文件状态缓存模块。
+ *
+ * 在 Claude Code 系统中，该模块使用 LRU 缓存维护文件状态快照，
+ * 记录每个文件在某一时刻的内容、mtime 等元信息，
+ * 供编辑工具（Edit/Write）在执行前后进行状态比对与冲突检测：
+ * - 基于 lru-cache 实现有界缓存，防止内存无限增长
+ * - 路径经过规范化处理以保证跨平台一致性
+ * - 与 fileHistory.ts 配合，支持多轮会话内的文件状态追踪
+ */
 import { LRUCache } from 'lru-cache'
 import { normalize } from 'path'
 

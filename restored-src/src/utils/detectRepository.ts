@@ -1,3 +1,10 @@
+/**
+ * 仓库检测模块。
+ *
+ * 在 Claude Code 系统中，该模块从当前工作目录检测 Git 仓库信息，
+ * 解析远程 URL 以提取 owner/repo 标识符，支持 GitHub 和 GitLab 格式：
+ * - detectRepository()：返回解析后的 ParsedRepository（owner、repo、platform）或 null
+ */
 import { getCwd } from './cwd.js'
 import { logForDebugging } from './debug.js'
 import { getRemoteUrl } from './git.js'

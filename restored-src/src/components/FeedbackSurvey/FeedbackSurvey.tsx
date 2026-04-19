@@ -1,3 +1,21 @@
+/**
+ * FeedbackSurvey.tsx — 反馈调查主编排组件
+ *
+ * 在 Claude Code 系统流程中的位置：
+ *   助手回复渲染层 → 调查弹出层 → 状态路由 → 具体子视图
+ *
+ * 主要功能：
+ *   1. FeedbackSurvey（主组件）：根据 state 状态字段将渲染任务路由到对应子视图：
+ *      - 'closed'         → 不渲染（返回 null）
+ *      - 'thanks'         → FeedbackSurveyThanks（感谢页面 + 可选跟进操作）
+ *      - 'submitted'      → 成功提示"感谢分享对话记录"
+ *      - 'submitting'     → 正在共享提示
+ *      - 'transcript_prompt' → TranscriptSharePrompt（询问是否共享对话记录）
+ *      - 'open'（默认）   → FeedbackSurveyView（展示调查选项 0/1/2/3）
+ *   2. FeedbackSurveyThanks（内部组件）：感谢页面，
+ *      当上次回应为"good"时可选按 [1] 启动 /feedback 命令做进一步反馈，
+ *      通过 useDebouncedDigitInput 监听防抖数字输入。
+ */
 import { c as _c } from "react/compiler-runtime";
 import React from 'react';
 import { type AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS, logEvent } from 'src/services/analytics/index.js';
@@ -7,6 +25,7 @@ import type { TranscriptShareResponse } from './TranscriptSharePrompt.js';
 import { TranscriptSharePrompt } from './TranscriptSharePrompt.js';
 import { useDebouncedDigitInput } from './useDebouncedDigitInput.js';
 import type { FeedbackSurveyResponse } from './utils.js';
+// Props 类型：state 为当前调查状态机状态；其余为状态机 handlers 和输入受控值
 type Props = {
   state: 'closed' | 'open' | 'thanks' | 'transcript_prompt' | 'submitting' | 'submitted';
   lastResponse: FeedbackSurveyResponse | null;
@@ -17,7 +36,23 @@ type Props = {
   onRequestFeedback?: () => void;
   message?: string;
 };
+/**
+ * FeedbackSurvey 主组件
+ *
+ * 整体流程：
+ *   1. state='closed' → 直接返回 null，不渲染任何内容
+ *   2. state='thanks' → 渲染感谢页，依赖 lastResponse/inputValue/onRequestFeedback，_c(16) 缓存
+ *   3. state='submitted' → 渲染"感谢分享"成功提示，静态内容使用 sentinel 缓存
+ *   4. state='submitting' → 渲染"共享中…"过渡提示，同上静态内容缓存
+ *   5. state='transcript_prompt' → 校验 handleTranscriptSelect 存在且输入值合法后渲染 TranscriptSharePrompt
+ *   6. 默认（state='open'）→ 校验 inputValue 是有效调查选项后渲染 FeedbackSurveyView
+ *
+ * 在系统中的角色：
+ *   作为统一入口，将调查状态机（useSurveyState）与各子视图解耦，
+ *   上层只需传入状态和 handler，不关心具体渲染逻辑。
+ */
 export function FeedbackSurvey(t0) {
+  // _c(16)：React 编译器记忆缓存，共 16 个槽位
   const $ = _c(16);
   const {
     state,
@@ -29,9 +64,11 @@ export function FeedbackSurvey(t0) {
     onRequestFeedback,
     message
   } = t0;
+  // state='closed'：调查关闭，什么都不渲染
   if (state === "closed") {
     return null;
   }
+  // state='thanks'：显示感谢页面，依赖 inputValue/lastResponse/onRequestFeedback/setInputValue 变化才重建
   if (state === "thanks") {
     let t1;
     if ($[0] !== inputValue || $[1] !== lastResponse || $[2] !== onRequestFeedback || $[3] !== setInputValue) {
@@ -46,6 +83,7 @@ export function FeedbackSurvey(t0) {
     }
     return t1;
   }
+  // state='submitted'：对话记录共享成功，使用 sentinel 缓存静态 JSX
   if (state === "submitted") {
     let t1;
     if ($[5] === Symbol.for("react.memo_cache_sentinel")) {
@@ -56,6 +94,7 @@ export function FeedbackSurvey(t0) {
     }
     return t1;
   }
+  // state='submitting'：对话记录共享进行中，同样使用 sentinel 缓存静态 JSX
   if (state === "submitting") {
     let t1;
     if ($[6] === Symbol.for("react.memo_cache_sentinel")) {
@@ -66,10 +105,13 @@ export function FeedbackSurvey(t0) {
     }
     return t1;
   }
+  // state='transcript_prompt'：询问是否共享对话记录
   if (state === "transcript_prompt") {
+    // 没有 handler 时不渲染（防御性检查）
     if (!handleTranscriptSelect) {
       return null;
     }
+    // 用户已输入非法选项字符时隐藏提示（防止误触）
     if (inputValue && !["1", "2", "3"].includes(inputValue)) {
       return null;
     }
@@ -85,6 +127,7 @@ export function FeedbackSurvey(t0) {
     }
     return t1;
   }
+  // state='open'（默认）：校验 inputValue 是有效调查选项，否则隐藏（防止调查框在用户打字时误显示）
   if (inputValue && !isValidResponseInput(inputValue)) {
     return null;
   }
@@ -101,14 +144,31 @@ export function FeedbackSurvey(t0) {
   }
   return t1;
 }
+// ThanksProps：感谢页面内部组件的 props，含最终回应值和输入控制器
 type ThanksProps = {
   lastResponse: FeedbackSurveyResponse | null;
   inputValue: string;
   setInputValue: (value: string) => void;
   onRequestFeedback?: () => void;
 };
+// isFollowUpDigit：判断输入字符是否为"1"（唯一合法的跟进操作触发键）
 const isFollowUpDigit = (char: string): char is '1' => char === '1';
+/**
+ * FeedbackSurveyThanks 内部组件
+ *
+ * 整体流程：
+ *   1. 当 lastResponse='good' 且 onRequestFeedback 存在时，显示跟进提示（showFollowUp=true）
+ *   2. 使用 useDebouncedDigitInput 监听用户按下 [1]，触发 onRequestFeedback 并记录 OTel 事件
+ *   3. 根据 lastResponse 分三种情况渲染底部文案：
+ *      - showFollowUp：可选按 [1] 告诉我们哪里做得好
+ *      - 'bad'：提示使用 /issue 报告模型行为问题
+ *      - 其他：提示使用 /feedback 分享详细反馈
+ *
+ * 在系统中的角色：
+ *   调查完成后的收尾页，引导用户进行下一步操作或了解其他反馈渠道。
+ */
 function FeedbackSurveyThanks(t0) {
+  // _c(12)：React 编译器记忆缓存，共 12 个槽位
   const $ = _c(12);
   const {
     lastResponse,
@@ -116,15 +176,20 @@ function FeedbackSurveyThanks(t0) {
     setInputValue,
     onRequestFeedback
   } = t0;
+  // 只有在 lastResponse='good' 且提供了跟进回调时才显示跟进操作
   const showFollowUp = onRequestFeedback && lastResponse === "good";
+  // 将 showFollowUp 转为 boolean 供 useDebouncedDigitInput 的 enabled 字段使用
   const t1 = Boolean(showFollowUp);
   let t2;
+  // 仅当 lastResponse 或 onRequestFeedback 变化时重建 onDigit 回调，避免重复注册防抖器
   if ($[0] !== lastResponse || $[1] !== onRequestFeedback) {
     t2 = () => {
+      // 记录跟进操作接受事件到 OTel 遥测
       logEvent("tengu_feedback_survey_event", {
         event_type: "followup_accepted" as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
         response: lastResponse as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS
       });
+      // 调用跟进回调，触发 /feedback 命令（可选链防空）
       onRequestFeedback?.();
     };
     $[0] = lastResponse;
@@ -134,6 +199,7 @@ function FeedbackSurveyThanks(t0) {
     t2 = $[2];
   }
   let t3;
+  // 构建 useDebouncedDigitInput 参数对象，仅在依赖变化时重建（避免重复触发防抖注册）
   if ($[3] !== inputValue || $[4] !== setInputValue || $[5] !== t1 || $[6] !== t2) {
     t3 = {
       inputValue,
@@ -151,7 +217,9 @@ function FeedbackSurveyThanks(t0) {
   } else {
     t3 = $[7];
   }
+  // 调用防抖数字输入 hook，监听 [1] 键并触发跟进操作
   useDebouncedDigitInput(t3);
+  // 根据发布环境选择反馈命令名称（内部版本用 /issue，外部版本用 /feedback）
   const feedbackCommand = false ? "/issue" : "/feedback";
   let t4;
   if ($[8] === Symbol.for("react.memo_cache_sentinel")) {

@@ -1,3 +1,21 @@
+/**
+ * 会话入口认证令牌模块
+ *
+ * 在 Claude Code 系统中的位置：
+ * 远程会话传输层 → CCR (Claude Code Remote) 认证 → sessionIngressAuth
+ *
+ * 主要功能：
+ * 提供获取和构建会话入口（Session Ingress）认证凭证的统一接口，
+ * 支持三种令牌来源（按优先级降序）：
+ * 1. 环境变量 CLAUDE_CODE_SESSION_ACCESS_TOKEN（在启动时注入或运行中更新）
+ * 2. 文件描述符 CLAUDE_CODE_WEBSOCKET_AUTH_FILE_DESCRIPTOR（仅可读取一次，读后缓存）
+ * 3. 约定文件（well-known file）：CLAUDE_SESSION_INGRESS_TOKEN_FILE 或默认路径
+ *
+ * 认证头构建规则：
+ * - sk-ant-sid 开头的令牌 → Cookie: sessionKey={token} + 可选 X-Organization-Uuid 头
+ * - JWT（其他格式）→ Authorization: Bearer {token}
+ */
+
 import {
   getSessionIngressToken,
   setSessionIngressToken,
@@ -12,11 +30,23 @@ import { errorMessage } from './errors.js'
 import { getFsImplementation } from './fsOperations.js'
 
 /**
- * Read token via file descriptor, falling back to well-known file.
- * Uses global state to cache the result since file descriptors can only be read once.
+ * 通过文件描述符（或约定文件）读取会话入口令牌
+ *
+ * 函数流程：
+ * 1. 先检查全局状态缓存（getSessionIngressToken），已有结果直接返回（FD 只能读一次）
+ * 2. 若无 CLAUDE_CODE_WEBSOCKET_AUTH_FILE_DESCRIPTOR 环境变量：
+ *    - 可能是非 CCR 环境，或父进程已去掉了无用的 FD 变量
+ *    - 回退到 CLAUDE_SESSION_INGRESS_TOKEN_FILE 或 CCR_SESSION_INGRESS_TOKEN_PATH 约定文件
+ * 3. 若有 FD 变量，将其解析为数字：
+ *    - 格式非法（NaN）→ 缓存 null，返回 null
+ * 4. 根据操作系统选择 FD 路径（macOS/BSD: /dev/fd/N, Linux: /proc/self/fd/N）
+ * 5. 读取后去空白，成功则缓存并通过 maybePersistTokenForSubprocesses 写入约定文件
+ * 6. 读取失败（通常是子进程继承了 FD 变量但没有 FD，ENXIO）→ 回退约定文件
+ *
+ * 注：全局缓存避免对文件描述符的重复读取（FD 一旦读取即关闭）。
  */
 function getTokenFromFileDescriptor(): string | null {
-  // Check if we've already attempted to read the token
+  // 检查全局缓存，避免对 FD 的重复读取
   const cachedToken = getSessionIngressToken()
   if (cachedToken !== undefined) {
     return cachedToken
@@ -24,8 +54,8 @@ function getTokenFromFileDescriptor(): string | null {
 
   const fdEnv = process.env.CLAUDE_CODE_WEBSOCKET_AUTH_FILE_DESCRIPTOR
   if (!fdEnv) {
-    // No FD env var — either we're not in CCR, or we're a subprocess whose
-    // parent stripped the (useless) FD env var. Try the well-known file.
+    // 无 FD 变量：非 CCR 环境，或子进程已被去掉无用的 FD 变量
+    // 直接尝试从约定文件读取
     const path =
       process.env.CLAUDE_SESSION_INGRESS_TOKEN_FILE ??
       CCR_SESSION_INGRESS_TOKEN_PATH
@@ -34,6 +64,7 @@ function getTokenFromFileDescriptor(): string | null {
     return fromFile
   }
 
+  // 解析 FD 编号
   const fd = parseInt(fdEnv, 10)
   if (Number.isNaN(fd)) {
     logForDebugging(
@@ -45,9 +76,9 @@ function getTokenFromFileDescriptor(): string | null {
   }
 
   try {
-    // Read from the file descriptor
-    // Use /dev/fd on macOS/BSD, /proc/self/fd on Linux
+    // 通过文件描述符路径读取令牌内容
     const fsOps = getFsImplementation()
+    // macOS/BSD 使用 /dev/fd/N，Linux 使用 /proc/self/fd/N
     const fdPath =
       process.platform === 'darwin' || process.platform === 'freebsd'
         ? `/dev/fd/${fd}`
@@ -63,6 +94,7 @@ function getTokenFromFileDescriptor(): string | null {
     }
     logForDebugging(`Successfully read token from file descriptor ${fd}`)
     setSessionIngressToken(token)
+    // 将令牌持久化到约定文件，供子进程使用（子进程无法继承 FD）
     maybePersistTokenForSubprocesses(
       CCR_SESSION_INGRESS_TOKEN_PATH,
       token,
@@ -74,8 +106,7 @@ function getTokenFromFileDescriptor(): string | null {
       `Failed to read token from file descriptor ${fd}: ${errorMessage(error)}`,
       { level: 'error' },
     )
-    // FD env var was set but read failed — typically a subprocess that
-    // inherited the env var but not the FD (ENXIO). Try the well-known file.
+    // FD 读取失败（子进程继承了变量但 FD 已关闭，ENXIO 错误）→ 回退约定文件
     const path =
       process.env.CLAUDE_SESSION_INGRESS_TOKEN_FILE ??
       CCR_SESSION_INGRESS_TOKEN_PATH
@@ -86,55 +117,70 @@ function getTokenFromFileDescriptor(): string | null {
 }
 
 /**
- * Get session ingress authentication token.
+ * 获取会话入口认证令牌
  *
- * Priority order:
- *  1. Environment variable (CLAUDE_CODE_SESSION_ACCESS_TOKEN) — set at spawn time,
- *     updated in-process via updateSessionIngressAuthToken or
- *     update_environment_variables stdin message from the parent bridge process.
- *  2. File descriptor (legacy path) — CLAUDE_CODE_WEBSOCKET_AUTH_FILE_DESCRIPTOR,
- *     read once and cached.
- *  3. Well-known file — CLAUDE_SESSION_INGRESS_TOKEN_FILE env var path, or
- *     /home/claude/.claude/remote/.session_ingress_token. Covers subprocesses
- *     that can't inherit the FD.
+ * 优先级顺序（从高到低）：
+ * 1. 环境变量 CLAUDE_CODE_SESSION_ACCESS_TOKEN
+ *    - 在进程启动时由父进程注入
+ *    - 可通过 updateSessionIngressAuthToken() 或 stdin update_environment_variables 消息在运行时更新
+ * 2. 文件描述符路径（传统方式，读一次后缓存）
+ *    - CLAUDE_CODE_WEBSOCKET_AUTH_FILE_DESCRIPTOR
+ * 3. 约定文件路径（覆盖子进程场景）
+ *    - CLAUDE_SESSION_INGRESS_TOKEN_FILE 或 /home/claude/.claude/remote/.session_ingress_token
+ *
+ * @returns 认证令牌字符串，获取失败时返回 null
  */
 export function getSessionIngressAuthToken(): string | null {
-  // 1. Check environment variable
+  // 优先级 1：环境变量（最新值，可在运行中被替换）
   const envToken = process.env.CLAUDE_CODE_SESSION_ACCESS_TOKEN
   if (envToken) {
     return envToken
   }
 
-  // 2. Check file descriptor (legacy path), with file fallback
+  // 优先级 2 & 3：文件描述符（含约定文件回退）
   return getTokenFromFileDescriptor()
 }
 
 /**
- * Build auth headers for the current session token.
- * Session keys (sk-ant-sid) use Cookie auth + X-Organization-Uuid;
- * JWTs use Bearer auth.
+ * 根据当前会话令牌构建 HTTP 认证头
+ *
+ * 认证方式判断：
+ * - 令牌以 "sk-ant-sid" 开头 → Anthropic 会话密钥格式
+ *   - 使用 Cookie: sessionKey={token} 头
+ *   - 若有 CLAUDE_CODE_ORGANIZATION_UUID，追加 X-Organization-Uuid 头
+ * - 其他格式（JWT 等）→ Bearer Token 格式
+ *   - 使用 Authorization: Bearer {token} 头
+ *
+ * @returns 认证头对象（键值对），无令牌时返回空对象
  */
 export function getSessionIngressAuthHeaders(): Record<string, string> {
   const token = getSessionIngressAuthToken()
   if (!token) return {}
   if (token.startsWith('sk-ant-sid')) {
+    // Anthropic 会话密钥：使用 Cookie 认证
     const headers: Record<string, string> = {
       Cookie: `sessionKey=${token}`,
     }
+    // 若有组织 UUID，添加对应头（用于多组织场景）
     const orgUuid = process.env.CLAUDE_CODE_ORGANIZATION_UUID
     if (orgUuid) {
       headers['X-Organization-Uuid'] = orgUuid
     }
     return headers
   }
+  // JWT 等格式：使用 Bearer 认证
   return { Authorization: `Bearer ${token}` }
 }
 
 /**
- * Update the session ingress auth token in-process by setting the env var.
- * Used by the REPL bridge to inject a fresh token after reconnection
- * without restarting the process.
+ * 在进程内更新会话入口认证令牌（修改 process.env）
+ *
+ * 用于 REPL Bridge 在重新连接后注入新令牌，无需重启进程。
+ * 下次调用 getSessionIngressAuthToken() 时会读取到新值。
+ *
+ * @param token - 新的认证令牌字符串
  */
 export function updateSessionIngressAuthToken(token: string): void {
+  // 直接写入环境变量，使其在优先级 1 中被优先使用
   process.env.CLAUDE_CODE_SESSION_ACCESS_TOKEN = token
 }

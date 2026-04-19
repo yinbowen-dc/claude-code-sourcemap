@@ -1,6 +1,11 @@
 /**
- * Frontmatter parser for markdown files
- * Extracts and parses YAML frontmatter between --- delimiters
+ * Markdown 前置元数据（Frontmatter）解析模块。
+ *
+ * 在 Claude Code 系统中，该模块解析 Markdown 文件开头的 YAML 前置元数据块，
+ * 用于读取 CLAUDE.md 等配置文件中的结构化配置信息：
+ * - 识别并提取 `---` 分隔符之间的 YAML 内容
+ * - 使用 yaml.ts 解析为结构化对象，支持 HooksSettings 等类型
+ * - 解析失败时通过 logForDebugging 记录调试信息并返回 null
  */
 
 import { logForDebugging } from './debug.js'

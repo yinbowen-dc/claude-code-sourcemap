@@ -1,3 +1,20 @@
+/**
+ * useInboxPoller.ts
+ *
+ * 【系统流程位置】
+ * 本文件处于 Claude Code 多智能体（Swarm）协作架构的核心通信层。
+ * 在整个系统中，多个 Agent（Teammate/TeamLead）通过文件系统"邮箱"进行异步消息传递。
+ * useInboxPoller 负责定期轮询当前 Agent 的邮箱，将收到的消息分类处理后
+ * 提交给 REPL 主循环，是 Swarm 模式下消息驱动任务调度的入口。
+ *
+ * 【主要功能】
+ * 1. 每隔 1 秒轮询邮箱未读消息（teammates 或 team lead）
+ * 2. 对消息按类型分类：权限请求/响应、沙箱权限、关机请求/批准、模式变更、计划审批、普通消息
+ * 3. 空闲时立即将普通消息提交为新 turn；忙碌时入队 AppState.inbox 等待
+ * 4. 会话变为空闲后，自动投递 inbox 中挂起的消息
+ * 5. 处理团队成员关机、任务清理、桌面通知等副作用
+ */
+
 import { randomUUID } from 'crypto'
 import { useCallback, useEffect, useRef } from 'react'
 import { useInterval } from 'usehooks-ts'
@@ -72,56 +89,61 @@ import {
 } from './useSwarmPermissionPoller.js'
 
 /**
- * Get the agent name to poll for messages.
- * - In-process teammates return undefined (they use waitForNextPromptOrShutdown instead)
- * - Process-based teammates use their CLAUDE_CODE_AGENT_NAME
- * - Team leads use their name from teamContext.teammates
- * - Standalone sessions return undefined
+ * 获取当前 Agent 需要轮询邮箱时使用的名称。
+ *
+ * 返回规则：
+ * - 进程内 Teammate（in-process）返回 undefined：它们有自己独立的
+ *   waitForNextPromptOrShutdown() 轮询机制，不应使用 useInboxPoller
+ * - 进程级 Teammate 返回其 CLAUDE_CODE_AGENT_NAME 环境变量值
+ * - Team Lead 从 teamContext.teammates 映射中查找自身名称
+ * - 普通独立会话返回 undefined（不轮询）
  */
 function getAgentNameToPoll(appState: AppState): string | undefined {
-  // In-process teammates should NOT use useInboxPoller - they have their own
-  // polling mechanism via waitForNextPromptOrShutdown() in inProcessRunner.ts.
-  // Using useInboxPoller would cause message routing issues since in-process
-  // teammates share the same React context and AppState with the leader.
+  // 进程内 Teammate 不应使用 useInboxPoller —— 它们有自己的
+  // 轮询机制（inProcessRunner.ts 中的 waitForNextPromptOrShutdown()）。
+  // 使用 useInboxPoller 会因共享 React context 和 AppState 导致消息路由问题。
   //
-  // Note: This can be called when the leader's REPL re-renders while an
-  // in-process teammate's AsyncLocalStorage context is active (due to shared
-  // setAppState). We return undefined to gracefully skip polling rather than
-  // throwing, since this is a normal occurrence during concurrent execution.
+  // 注意：在 Leader 的 REPL 重新渲染时，可能处于进程内 Teammate 的
+  // AsyncLocalStorage 上下文中（因为共享了 setAppState），此时返回 undefined
+  // 以优雅地跳过轮询，而不是抛出异常（并发执行期间这是正常现象）。
   if (isInProcessTeammate()) {
     return undefined
   }
+  // 进程级 Teammate：使用自身的 Agent 名称
   if (isTeammate()) {
     return getAgentName()
   }
-  // Team lead polls using their agent name (not ID)
+  // Team Lead 使用 agent 名称（不是 ID）轮询
   if (isTeamLead(appState.teamContext)) {
     const leadAgentId = appState.teamContext!.leadAgentId
-    // Look up the lead's name from teammates map
+    // 从 teammates 映射中查找 Lead 的名称
     const leadName = appState.teamContext!.teammates[leadAgentId]?.name
     return leadName || 'team-lead'
   }
   return undefined
 }
 
+// 邮箱轮询间隔：每 1000ms（1秒）轮询一次
 const INBOX_POLL_INTERVAL_MS = 1000
 
+// Hook 入参类型定义
 type Props = {
-  enabled: boolean
-  isLoading: boolean
-  focusedInputDialog: string | undefined
-  // Returns true if submission succeeded, false if rejected (e.g., query already running)
-  // Dead code elimination: parameter named onSubmitMessage to avoid "teammate" string in external builds
+  enabled: boolean                          // 是否启用轮询
+  isLoading: boolean                        // 当前会话是否处于加载（忙碌）状态
+  focusedInputDialog: string | undefined    // 当前是否有聚焦的输入对话框（忙碌标志）
+  // 提交消息回调，成功返回 true，被拒绝（如查询已在运行）返回 false
+  // 参数名使用 onSubmitMessage 是为了避免外部构建产物中出现 "teammate" 字符串
   onSubmitMessage: (formatted: string) => boolean
 }
 
 /**
- * Polls the teammate inbox for new messages and submits them as turns.
+ * useInboxPoller：轮询 Teammate 邮箱并将新消息作为 turn 提交。
  *
- * This hook:
- * 1. Polls every 1s for unread messages (teammates or team leads)
- * 2. When idle: submits messages immediately as a new turn
- * 3. When busy: queues messages in AppState.inbox for UI display, delivers when turn ends
+ * 流程：
+ * 1. 每 1 秒读取邮箱未读消息（适用于 Teammate 或 Team Lead）
+ * 2. 空闲状态：立即将消息作为新 turn 提交
+ * 3. 忙碌状态：将消息加入 AppState.inbox 排队，待 turn 结束后投递
+ * 4. 处理各类特殊消息：权限流程、关机流程、模式变更、计划审批等
  */
 export function useInboxPoller({
   enabled,
@@ -129,21 +151,35 @@ export function useInboxPoller({
   focusedInputDialog,
   onSubmitMessage,
 }: Props): void {
-  // Assign to original name for clarity within the function
+  // 将回调重命名以在函数内部保持语义清晰
   const onSubmitTeammateMessage = onSubmitMessage
+  // 使用 store 而非直接订阅 appState，避免依赖变更导致无限循环
   const store = useAppStateStore()
   const setAppState = useSetAppState()
+  // 仅订阅 inbox.messages.length，减少不必要的重渲染
   const inboxMessageCount = useAppState(s => s.inbox.messages.length)
+  // 终端通知句柄（用于发送桌面通知）
   const terminal = useTerminalNotification()
 
+  /**
+   * poll：核心轮询函数。
+   *
+   * 流程：
+   * 1. 检查启用状态和 Agent 名称
+   * 2. 读取未读消息并按类型分类
+   * 3. 分别处理：权限请求/响应、沙箱权限、关机、模式变更、计划审批
+   * 4. 将普通消息格式化后提交或入队
+   * 5. 最后标记消息为已读（确保消息不丢失）
+   */
   const poll = useCallback(async () => {
     if (!enabled) return
 
-    // Use ref to avoid dependency on appState object (prevents infinite loop)
+    // 通过 store.getState() 获取最新状态，避免依赖 appState 对象（防止无限循环）
     const currentAppState = store.getState()
     const agentName = getAgentNameToPoll(currentAppState)
     if (!agentName) return
 
+    // 从文件系统邮箱读取未读消息
     const unread = await readUnreadMessages(
       agentName,
       currentAppState.teamContext?.teamName,
@@ -153,21 +189,21 @@ export function useInboxPoller({
 
     logForDebugging(`[InboxPoller] Found ${unread.length} unread message(s)`)
 
-    // Check for plan approval responses and transition out of plan mode if approved
-    // Security: Only accept approval responses from the team lead
+    // 处理计划审批响应：若当前处于 plan 模式且收到 team-lead 的批准，则退出 plan 模式
+    // 安全性：只接受来自 team-lead 的批准响应，防止 teammate 伪造审批
     if (isTeammate() && isPlanModeRequired()) {
       for (const msg of unread) {
         const approvalResponse = isPlanApprovalResponse(msg.text)
-        // Verify the message is from the team lead to prevent teammates from forging approvals
+        // 验证消息来自 team-lead，防止 teammate 伪造批准
         if (approvalResponse && msg.from === 'team-lead') {
           logForDebugging(
             `[InboxPoller] Received plan approval response from team-lead: approved=${approvalResponse.approved}`,
           )
           if (approvalResponse.approved) {
-            // Use leader's permission mode if provided, otherwise default
+            // 使用 leader 提供的权限模式，否则使用默认值
             const targetMode = approvalResponse.permissionMode ?? 'default'
 
-            // Transition out of plan mode
+            // 退出 plan 模式，切换到目标权限模式
             setAppState(prev => ({
               ...prev,
               toolPermissionContext: applyPermissionUpdate(
@@ -188,6 +224,7 @@ export function useInboxPoller({
             )
           }
         } else if (approvalResponse) {
+          // 忽略非 team-lead 来源的计划审批响应
           logForDebugging(
             `[InboxPoller] Ignoring plan approval response from non-team-lead: ${msg.from}`,
           )
@@ -195,24 +232,25 @@ export function useInboxPoller({
       }
     }
 
-    // Helper to mark messages as read in the inbox file.
-    // Called after messages are successfully delivered or reliably queued.
+    // 标记消息已读的辅助函数。
+    // 仅在消息成功投递或可靠入队后调用，防止崩溃时消息永久丢失。
     const markRead = () => {
       void markMessagesAsRead(agentName, currentAppState.teamContext?.teamName)
     }
 
-    // Separate permission messages from regular teammate messages
-    const permissionRequests: TeammateMessage[] = []
-    const permissionResponses: TeammateMessage[] = []
-    const sandboxPermissionRequests: TeammateMessage[] = []
-    const sandboxPermissionResponses: TeammateMessage[] = []
-    const shutdownRequests: TeammateMessage[] = []
-    const shutdownApprovals: TeammateMessage[] = []
-    const teamPermissionUpdates: TeammateMessage[] = []
-    const modeSetRequests: TeammateMessage[] = []
-    const planApprovalRequests: TeammateMessage[] = []
-    const regularMessages: TeammateMessage[] = []
+    // 按消息类型分类到各自的数组
+    const permissionRequests: TeammateMessage[] = []       // 权限请求（leader 侧处理）
+    const permissionResponses: TeammateMessage[] = []      // 权限响应（worker 侧处理）
+    const sandboxPermissionRequests: TeammateMessage[] = [] // 沙箱权限请求
+    const sandboxPermissionResponses: TeammateMessage[] = [] // 沙箱权限响应
+    const shutdownRequests: TeammateMessage[] = []         // 关机请求
+    const shutdownApprovals: TeammateMessage[] = []        // 关机批准
+    const teamPermissionUpdates: TeammateMessage[] = []    // 团队权限更新
+    const modeSetRequests: TeammateMessage[] = []          // 模式变更请求
+    const planApprovalRequests: TeammateMessage[] = []     // 计划审批请求
+    const regularMessages: TeammateMessage[] = []          // 普通消息
 
+    // 逐一检测每条消息的类型，分入对应数组
     for (const m of unread) {
       const permReq = isPermissionRequest(m.text)
       const permResp = isPermissionResponse(m.text)
@@ -247,7 +285,9 @@ export function useInboxPoller({
       }
     }
 
-    // Handle permission requests (leader side) - route to ToolUseConfirmQueue
+    // ===== 处理权限请求（Leader 侧）=====
+    // 将权限请求路由到 ToolUseConfirmQueue，使 tmux worker 获得与
+    // in-process teammate 相同的工具专属 UI（BashPermissionRequest、FileEditToolDiff 等）
     if (
       permissionRequests.length > 0 &&
       isTeamLead(currentAppState.teamContext)
@@ -264,9 +304,7 @@ export function useInboxPoller({
         if (!parsed) continue
 
         if (setToolUseConfirmQueue) {
-          // Route through the standard ToolUseConfirmQueue so tmux workers
-          // get the same tool-specific UI (BashPermissionRequest, FileEditToolDiff, etc.)
-          // as in-process teammates.
+          // 通过标准 ToolUseConfirmQueue 路由，使 tmux worker 获得工具专属 UI
           const tool = findToolByName(getAllBaseTools(), parsed.tool_name)
           if (!tool) {
             logForDebugging(
@@ -275,6 +313,7 @@ export function useInboxPoller({
             continue
           }
 
+          // 构建 ToolUseConfirm 条目，包含 onAllow/onReject/onAbort 回调
           const entry: ToolUseConfirm = {
             assistantMessage: createAssistantMessage({ content: '' }),
             tool,
@@ -287,14 +326,16 @@ export function useInboxPoller({
               message: parsed.description,
             },
             permissionPromptStartTimeMs: Date.now(),
+            // 在 UI 中显示来自哪个 worker 的请求
             workerBadge: {
               name: parsed.agent_id,
               color: 'cyan',
             },
             onUserInteraction() {
-              // No-op for tmux workers (no classifier auto-approval)
+              // tmux worker 无需自动审批分类器，此处为空操作
             },
             onAbort() {
+              // 用户中止：通过邮箱发送拒绝响应
               void sendPermissionResponseViaMailbox(
                 parsed.agent_id,
                 { decision: 'rejected', resolvedBy: 'leader' },
@@ -306,6 +347,7 @@ export function useInboxPoller({
               updatedInput: Record<string, unknown>,
               permissionUpdates: PermissionUpdate[],
             ) {
+              // 用户批准：通过邮箱发送批准响应（含更新的输入和权限规则）
               void sendPermissionResponseViaMailbox(
                 parsed.agent_id,
                 {
@@ -319,6 +361,7 @@ export function useInboxPoller({
               )
             },
             onReject(feedback?: string) {
+              // 用户拒绝：通过邮箱发送拒绝响应（含可选的反馈信息）
               void sendPermissionResponseViaMailbox(
                 parsed.agent_id,
                 {
@@ -331,12 +374,12 @@ export function useInboxPoller({
               )
             },
             async recheckPermission() {
-              // No-op for tmux workers — permission state is on the worker side
+              // tmux worker 的权限状态在 worker 侧，Leader 侧无需重新检查
             },
           }
 
-          // Deduplicate: if markMessagesAsRead failed on a prior poll,
-          // the same message will be re-read — skip if already queued.
+          // 去重处理：若上次 markMessagesAsRead 失败，同一消息会被重复读取
+          // 通过检查 toolUseID 跳过已入队的请求
           setToolUseConfirmQueue(queue => {
             if (queue.some(q => q.toolUseID === parsed.tool_use_id)) {
               return queue
@@ -350,7 +393,7 @@ export function useInboxPoller({
         }
       }
 
-      // Send desktop notification for the first request
+      // 对第一个权限请求发送桌面通知（仅在空闲且无对话框时）
       const firstParsed = isPermissionRequest(permissionRequests[0]?.text ?? '')
       if (firstParsed && !isLoading && !focusedInputDialog) {
         void sendNotification(
@@ -363,7 +406,8 @@ export function useInboxPoller({
       }
     }
 
-    // Handle permission responses (worker side) - invoke registered callbacks
+    // ===== 处理权限响应（Worker 侧）=====
+    // 调用已注册的回调函数处理来自 leader 的权限决定
     if (permissionResponses.length > 0 && isTeammate()) {
       logForDebugging(
         `[InboxPoller] Found ${permissionResponses.length} permission response(s)`,
@@ -373,12 +417,14 @@ export function useInboxPoller({
         const parsed = isPermissionResponse(m.text)
         if (!parsed) continue
 
+        // 检查是否存在对应的权限回调
         if (hasPermissionCallback(parsed.request_id)) {
           logForDebugging(
             `[InboxPoller] Processing permission response for ${parsed.request_id}: ${parsed.subtype}`,
           )
 
           if (parsed.subtype === 'success') {
+            // 批准：传递更新后的输入和权限规则
             processMailboxPermissionResponse({
               requestId: parsed.request_id,
               decision: 'approved',
@@ -386,6 +432,7 @@ export function useInboxPoller({
               permissionUpdates: parsed.response?.permission_updates,
             })
           } else {
+            // 拒绝：传递反馈信息
             processMailboxPermissionResponse({
               requestId: parsed.request_id,
               decision: 'rejected',
@@ -396,7 +443,8 @@ export function useInboxPoller({
       }
     }
 
-    // Handle sandbox permission requests (leader side) - add to workerSandboxPermissions queue
+    // ===== 处理沙箱权限请求（Leader 侧）=====
+    // 将新的沙箱网络访问请求加入 workerSandboxPermissions 队列
     if (
       sandboxPermissionRequests.length > 0 &&
       isTeamLead(currentAppState.teamContext)
@@ -418,7 +466,7 @@ export function useInboxPoller({
         const parsed = isSandboxPermissionRequest(m.text)
         if (!parsed) continue
 
-        // Validate required nested fields to prevent crashes from malformed messages
+        // 校验必要字段，防止格式错误的消息导致崩溃
         if (!parsed.hostPattern?.host) {
           logForDebugging(
             `[InboxPoller] Invalid sandbox permission request: missing hostPattern.host`,
@@ -437,6 +485,7 @@ export function useInboxPoller({
       }
 
       if (newSandboxRequests.length > 0) {
+        // 将新请求追加到 AppState 中的沙箱权限请求队列
         setAppState(prev => ({
           ...prev,
           workerSandboxPermissions: {
@@ -448,7 +497,7 @@ export function useInboxPoller({
           },
         }))
 
-        // Send desktop notification for the first new request
+        // 对第一个新请求发送桌面通知
         const firstRequest = newSandboxRequests[0]
         if (firstRequest && !isLoading && !focusedInputDialog) {
           void sendNotification(
@@ -462,7 +511,8 @@ export function useInboxPoller({
       }
     }
 
-    // Handle sandbox permission responses (worker side) - invoke registered callbacks
+    // ===== 处理沙箱权限响应（Worker 侧）=====
+    // 调用已注册的沙箱权限回调，并清除挂起的沙箱请求状态
     if (sandboxPermissionResponses.length > 0 && isTeammate()) {
       logForDebugging(
         `[InboxPoller] Found ${sandboxPermissionResponses.length} sandbox permission response(s)`,
@@ -472,20 +522,20 @@ export function useInboxPoller({
         const parsed = isSandboxPermissionResponse(m.text)
         if (!parsed) continue
 
-        // Check if we have a registered callback for this request
+        // 检查是否存在对应的沙箱权限回调
         if (hasSandboxPermissionCallback(parsed.requestId)) {
           logForDebugging(
             `[InboxPoller] Processing sandbox permission response for ${parsed.requestId}: allow=${parsed.allow}`,
           )
 
-          // Process the response using the exported function
+          // 处理沙箱权限响应（调用回调）
           processSandboxPermissionResponse({
             requestId: parsed.requestId,
             host: parsed.host,
             allow: parsed.allow,
           })
 
-          // Clear the pending sandbox request indicator
+          // 清除挂起的沙箱请求指示器
           setAppState(prev => ({
             ...prev,
             pendingSandboxRequest: null,
@@ -494,7 +544,8 @@ export function useInboxPoller({
       }
     }
 
-    // Handle team permission updates (teammate side) - apply permission to context
+    // ===== 处理团队权限更新（Teammate 侧）=====
+    // 应用 leader 推送的权限规则到本地 toolPermissionContext
     if (teamPermissionUpdates.length > 0 && isTeammate()) {
       logForDebugging(
         `[InboxPoller] Found ${teamPermissionUpdates.length} team permission update(s)`,
@@ -509,7 +560,7 @@ export function useInboxPoller({
           continue
         }
 
-        // Validate required nested fields to prevent crashes from malformed messages
+        // 校验必要嵌套字段，防止格式错误消息导致崩溃
         if (
           !parsed.permissionUpdate?.rules ||
           !parsed.permissionUpdate?.behavior
@@ -520,7 +571,7 @@ export function useInboxPoller({
           continue
         }
 
-        // Apply the permission update to the teammate's context
+        // 将权限规则更新应用到 teammate 的上下文中
         logForDebugging(
           `[InboxPoller] Applying team permission update: ${parsed.toolName} allowed in ${parsed.directoryPath}`,
         )
@@ -528,6 +579,7 @@ export function useInboxPoller({
           `[InboxPoller] Permission update rules: ${jsonStringify(parsed.permissionUpdate.rules)}`,
         )
 
+        // 使用 addRules 将新规则追加到 session 级别的权限上下文
         setAppState(prev => {
           const updated = applyPermissionUpdate(prev.toolPermissionContext, {
             type: 'addRules',
@@ -546,14 +598,15 @@ export function useInboxPoller({
       }
     }
 
-    // Handle mode set requests (teammate side) - team lead changing teammate's mode
+    // ===== 处理模式变更请求（Teammate 侧）=====
+    // 仅接受来自 team-lead 的模式变更指令
     if (modeSetRequests.length > 0 && isTeammate()) {
       logForDebugging(
         `[InboxPoller] Found ${modeSetRequests.length} mode set request(s)`,
       )
 
       for (const m of modeSetRequests) {
-        // Only accept mode changes from team-lead
+        // 安全校验：只接受来自 team-lead 的模式变更
         if (m.from !== 'team-lead') {
           logForDebugging(
             `[InboxPoller] Ignoring mode set request from non-team-lead: ${m.from}`,
@@ -569,12 +622,13 @@ export function useInboxPoller({
           continue
         }
 
+        // 解析目标权限模式
         const targetMode = permissionModeFromString(parsed.mode)
         logForDebugging(
           `[InboxPoller] Applying mode change from team-lead: ${targetMode}`,
         )
 
-        // Update local permission context
+        // 更新本地权限上下文为新模式
         setAppState(prev => ({
           ...prev,
           toolPermissionContext: applyPermissionUpdate(
@@ -587,7 +641,7 @@ export function useInboxPoller({
           ),
         }))
 
-        // Update config.json so team lead can see the new mode
+        // 更新 config.json，使 team lead 可以看到新模式
         const teamName = currentAppState.teamContext?.teamName
         const agentName = getAgentName()
         if (teamName && agentName) {
@@ -596,7 +650,8 @@ export function useInboxPoller({
       }
     }
 
-    // Handle plan approval requests (leader side) - auto-approve and write response to teammate inbox
+    // ===== 处理计划审批请求（Leader 侧）=====
+    // Leader 自动批准 teammate 发来的计划，并将批准响应写入 teammate 的邮箱
     if (
       planApprovalRequests.length > 0 &&
       isTeamLead(currentAppState.teamContext)
@@ -606,6 +661,7 @@ export function useInboxPoller({
       )
 
       const teamName = currentAppState.teamContext?.teamName
+      // 确定要继承的权限模式（若 leader 在 plan 模式，则 teammate 继承 default）
       const leaderExternalMode = toExternalPermissionMode(
         currentAppState.toolPermissionContext.mode,
       )
@@ -616,7 +672,7 @@ export function useInboxPoller({
         const parsed = isPlanApprovalRequest(m.text)
         if (!parsed) continue
 
-        // Write approval response to teammate's inbox
+        // 构建批准响应并写入 teammate 的邮箱
         const approvalResponse = {
           type: 'plan_approval_response',
           requestId: parsed.requestId,
@@ -635,7 +691,7 @@ export function useInboxPoller({
           teamName,
         )
 
-        // Update in-process teammate task state if applicable
+        // 如果是进程内 teammate，同步更新其任务状态
         const taskId = findInProcessTeammateTaskId(m.from, currentAppState)
         if (taskId) {
           handlePlanApprovalResponse(
@@ -655,26 +711,26 @@ export function useInboxPoller({
           `[InboxPoller] Auto-approved plan from ${m.from} (request ${parsed.requestId})`,
         )
 
-        // Still pass through as a regular message so the model has context
-        // about what the teammate is doing, but the approval is already sent
+        // 同时将计划请求作为普通消息传递，让模型了解 teammate 正在做什么
         regularMessages.push(m)
       }
     }
 
-    // Handle shutdown requests (teammate side) - preserve JSON for UI rendering
+    // ===== 处理关机请求（Teammate 侧）=====
+    // 保留 JSON 格式以便 UI 组件渲染，直接归入普通消息处理
     if (shutdownRequests.length > 0 && isTeammate()) {
       logForDebugging(
         `[InboxPoller] Found ${shutdownRequests.length} shutdown request(s)`,
       )
 
-      // Pass through shutdown requests - the UI component will render them nicely
-      // and the model will receive instructions via the tool prompt documentation
+      // 将关机请求传递给普通消息流，UI 组件会渲染友好的提示
       for (const m of shutdownRequests) {
         regularMessages.push(m)
       }
     }
 
-    // Handle shutdown approvals (leader side) - kill the teammate's pane
+    // ===== 处理关机批准（Leader 侧）=====
+    // 关闭 teammate 的 pane，从团队中移除该成员，清理任务
     if (
       shutdownApprovals.length > 0 &&
       isTeamLead(currentAppState.teamContext)
@@ -687,11 +743,11 @@ export function useInboxPoller({
         const parsed = isShutdownApproved(m.text)
         if (!parsed) continue
 
-        // Kill the pane if we have the info (pane-based teammates)
+        // 若有 pane 信息（pane 型 teammate），则关闭对应 pane
         if (parsed.paneId && parsed.backendType) {
           void (async () => {
             try {
-              // Ensure backend classes are imported (no subprocess probes)
+              // 确保 backend 类已导入（不使用子进程探测）
               await ensureBackendsRegistered()
               const insideTmux = await isInsideTmux()
               const backend = getBackendByType(
@@ -712,16 +768,16 @@ export function useInboxPoller({
           })()
         }
 
-        // Remove the teammate from teamContext.teammates so the count is accurate
+        // 从 teamContext.teammates 中移除该 teammate，确保计数准确
         const teammateToRemove = parsed.from
         if (teammateToRemove && currentAppState.teamContext?.teammates) {
-          // Find the teammate ID by name
+          // 通过名称找到 teammate 的 ID
           const teammateId = Object.entries(
             currentAppState.teamContext.teammates,
           ).find(([, t]) => t.name === teammateToRemove)?.[0]
 
           if (teammateId) {
-            // Remove from team file (leader owns team file mutations)
+            // 从团队文件中移除（Leader 负责团队文件的变更）
             const teamName = currentAppState.teamContext?.teamName
             if (teamName) {
               removeTeammateFromTeamFile(teamName, {
@@ -730,7 +786,7 @@ export function useInboxPoller({
               })
             }
 
-            // Unassign tasks and build notification message
+            // 取消分配该 teammate 的任务，并获取通知消息
             const { notificationMessage } = teamName
               ? await unassignTeammateTasks(
                   teamName,
@@ -743,13 +799,13 @@ export function useInboxPoller({
             setAppState(prev => {
               if (!prev.teamContext?.teammates) return prev
               if (!(teammateId in prev.teamContext.teammates)) return prev
+              // 从 teammates 映射中删除已关机的成员
               const { [teammateId]: _, ...remainingTeammates } =
                 prev.teamContext.teammates
 
-              // Mark the teammate's task as completed so hasRunningTeammates
-              // becomes false and the spinner stops. Without this, out-of-process
-              // (tmux) teammate tasks stay status:'running' forever because
-              // only in-process teammates have a runner that sets 'completed'.
+              // 将该 teammate 的任务标记为已完成，使 hasRunningTeammates 变为 false
+              // 若不这样做，out-of-process（tmux）的 teammate 任务会永远保持 'running' 状态
+              // 因为只有 in-process teammates 有 runner 会设置 'completed'
               const updatedTasks = { ...prev.tasks }
               for (const [tid, task] of Object.entries(updatedTasks)) {
                 if (
@@ -771,6 +827,7 @@ export function useInboxPoller({
                   ...prev.teamContext,
                   teammates: remainingTeammates,
                 },
+                // 向 inbox 添加系统通知消息，告知 leader teammate 已终止
                 inbox: {
                   messages: [
                     ...prev.inbox.messages,
@@ -794,21 +851,20 @@ export function useInboxPoller({
           }
         }
 
-        // Pass through for UI rendering - the component will render it nicely
+        // 将关机批准传递给普通消息流，UI 组件会渲染友好的提示
         regularMessages.push(m)
       }
     }
 
-    // Process regular teammate messages (existing logic)
+    // ===== 处理普通 teammate 消息（已有逻辑）=====
     if (regularMessages.length === 0) {
-      // No regular messages, but we may have processed non-regular messages
-      // (permissions, shutdown requests, etc.) above — mark those as read.
+      // 没有普通消息，但可能已处理了非普通消息（权限、关机等），标记为已读
       markRead()
       return
     }
 
-    // Format messages with XML wrapper for Claude (include color if available)
-    // Transform plan approval requests to include instructions for Claude
+    // 将消息格式化为带 XML 包装的字符串（包含 color 和 summary 属性）
+    // 用于提交给 Claude 模型理解消息来源
     const formatted = regularMessages
       .map(m => {
         const colorAttr = m.color ? ` color="${m.color}"` : ''
@@ -819,7 +875,7 @@ export function useInboxPoller({
       })
       .join('\n\n')
 
-    // Helper to queue messages in AppState for later delivery
+    // 辅助函数：将消息加入 AppState.inbox 队列，等待稍后投递
     const queueMessages = () => {
       setAppState(prev => ({
         ...prev,
@@ -841,26 +897,25 @@ export function useInboxPoller({
     }
 
     if (!isLoading && !focusedInputDialog) {
-      // IDLE: Submit as new turn immediately
+      // 空闲状态：立即作为新 turn 提交
       logForDebugging(`[InboxPoller] Session idle, submitting immediately`)
       const submitted = onSubmitTeammateMessage(formatted)
       if (!submitted) {
-        // Submission rejected (query already running), queue for later
+        // 提交被拒绝（查询已在运行），入队稍后投递
         logForDebugging(
           `[InboxPoller] Submission rejected, queuing for later delivery`,
         )
         queueMessages()
       }
     } else {
-      // BUSY: Add to inbox queue for UI display + later delivery
+      // 忙碌状态：加入 inbox 队列，等待空闲时投递
       logForDebugging(`[InboxPoller] Session busy, queuing for later delivery`)
       queueMessages()
     }
 
-    // Mark messages as read only after they have been successfully delivered
-    // or reliably queued in AppState. This prevents permanent message loss
-    // when the session is busy — if we crash before this point, the messages
-    // will be re-read on the next poll cycle instead of being silently dropped.
+    // 仅在消息成功投递或可靠入队后才标记为已读。
+    // 这样可以防止会话繁忙时消息永久丢失——若在此处之前崩溃，
+    // 消息将在下次轮询时重新读取，而不是被静默丢弃。
     markRead()
   }, [
     enabled,
@@ -872,20 +927,25 @@ export function useInboxPoller({
     store,
   ])
 
-  // When session becomes idle, deliver any pending messages and clean up processed ones
+  /**
+   * 当会话变为空闲时，投递挂起的消息并清理已处理的消息。
+   *
+   * 触发条件：isLoading 变为 false 或 focusedInputDialog 变为 undefined
+   */
   useEffect(() => {
     if (!enabled) return
 
-    // Skip if busy or in a dialog
+    // 仍处于忙碌状态或有对话框，跳过
     if (isLoading || focusedInputDialog) {
       return
     }
 
-    // Use ref to avoid dependency on appState object (prevents infinite loop)
+    // 通过 store.getState() 获取最新状态，避免依赖 appState 对象
     const currentAppState = store.getState()
     const agentName = getAgentNameToPoll(currentAppState)
     if (!agentName) return
 
+    // 分类 inbox 中的消息
     const pendingMessages = currentAppState.inbox.messages.filter(
       m => m.status === 'pending',
     )
@@ -893,7 +953,7 @@ export function useInboxPoller({
       m => m.status === 'processed',
     )
 
-    // Clean up processed messages (they were already delivered mid-turn as attachments)
+    // 清理已处理的消息（它们在 turn 进行中已作为附件投递）
     if (processedMessages.length > 0) {
       logForDebugging(
         `[InboxPoller] Cleaning up ${processedMessages.length} processed message(s) that were delivered mid-turn`,
@@ -907,14 +967,14 @@ export function useInboxPoller({
       }))
     }
 
-    // No pending messages to deliver
+    // 无挂起消息，不需要投递
     if (pendingMessages.length === 0) return
 
     logForDebugging(
       `[InboxPoller] Session idle, delivering ${pendingMessages.length} pending message(s)`,
     )
 
-    // Format messages with XML wrapper for Claude (include color if available)
+    // 格式化挂起消息为 XML 包装字符串
     const formatted = pendingMessages
       .map(m => {
         const colorAttr = m.color ? ` color="${m.color}"` : ''
@@ -923,10 +983,10 @@ export function useInboxPoller({
       })
       .join('\n\n')
 
-    // Try to submit - only clear messages if successful
+    // 尝试提交——仅在成功时清除消息
     const submitted = onSubmitTeammateMessage(formatted)
     if (submitted) {
-      // Clear the specific messages we just submitted by their IDs
+      // 通过 ID 集合清除已提交的特定消息
       const submittedIds = new Set(pendingMessages.map(m => m.id))
       setAppState(prev => ({
         ...prev,
@@ -949,21 +1009,21 @@ export function useInboxPoller({
     store,
   ])
 
-  // Poll if running as a teammate or as a team lead
+  // 仅在作为 teammate 或 team lead 运行时才启动轮询定时器
   const shouldPoll = enabled && !!getAgentNameToPoll(store.getState())
   useInterval(() => void poll(), shouldPoll ? INBOX_POLL_INTERVAL_MS : null)
 
-  // Initial poll on mount (only once)
+  // 挂载时立即执行一次初始轮询（仅一次，通过 ref 防止重复）
   const hasDoneInitialPollRef = useRef(false)
   useEffect(() => {
     if (!enabled) return
     if (hasDoneInitialPollRef.current) return
-    // Use store.getState() to avoid dependency on appState object
+    // 使用 store.getState() 避免依赖 appState 对象
     if (getAgentNameToPoll(store.getState())) {
       hasDoneInitialPollRef.current = true
       void poll()
     }
-    // Note: poll uses store.getState() (not appState) so it won't re-run on appState changes
-    // The ref guard is a safety measure to ensure initial poll only happens once
+    // 注意：poll 使用 store.getState()（而非 appState），因此不会因 appState 变更而重新运行
+    // ref 守卫是额外的安全措施，确保初始轮询只发生一次
   }, [enabled, poll, store])
 }

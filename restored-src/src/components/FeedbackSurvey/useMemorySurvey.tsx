@@ -1,3 +1,26 @@
+/**
+ * useMemorySurvey.tsx — 记忆功能使用调查 Hook
+ *
+ * 在 Claude Code 系统流程中的位置：
+ *   REPL 主循环 → 每次 AI 回复后 → useMemorySurvey → 判断是否展示记忆调查
+ *
+ * 主要功能：
+ *   useMemorySurvey：自定义 React Hook，
+ *   在满足以下所有条件时以 20% 概率弹出记忆调查：
+ *     1. GrowthBook 特性门控（tengu_dunwich_bell）已开启
+ *     2. 自动记忆功能已启用（isAutoMemoryEnabled）
+ *     3. 最后一条助手消息包含"memory/memories"关键词（正则匹配）
+ *     4. 当前会话中助手曾通过 FileRead 工具读取记忆文件
+ *     5. 当前无活跃提示、未在加载中、调查未禁用、策略允许反馈
+ *
+ * 辅助函数：
+ *   hasMemoryFileRead：O(n) 线性扫描消息列表，检查是否有 FileRead 工具调用
+ *   读取了 isAutoManagedMemoryFile 识别的记忆文件路径。
+ *
+ * 事件追踪：
+ *   - MEMORY_SURVEY_EVENT = 'tengu_memory_survey_event'，上报至 Statsig + OTel
+ *   - TRANSCRIPT_SHARE_TRIGGER = 'memory_survey'，传入 submitTranscriptShare
+ */
 import { useCallback, useEffect, useMemo, useRef } from 'react';
 import { isFeedbackSurveyDisabled } from 'src/services/analytics/config.js';
 import { getFeatureValue_CACHED_MAY_BE_STALE } from 'src/services/analytics/growthbook.js';
@@ -15,35 +38,104 @@ import { submitTranscriptShare } from './submitTranscriptShare.js';
 import type { TranscriptShareResponse } from './TranscriptSharePrompt.js';
 import { useSurveyState } from './useSurveyState.js';
 import type { FeedbackSurveyResponse } from './utils.js';
+// 感谢提示展示时长（毫秒）：3 秒后自动关闭
 const HIDE_THANKS_AFTER_MS = 3000;
+// GrowthBook 特性门控名称（Bedrock/Vertex/Foundry 默认关闭，仅 Anthropic 直连开启）
 const MEMORY_SURVEY_GATE = 'tengu_dunwich_bell';
+// Statsig / OTel 事件名称，用于统一上报记忆调查的各类行为事件
 const MEMORY_SURVEY_EVENT = 'tengu_memory_survey_event';
+// 调查弹出概率：20%，避免对用户造成过多打扰
 const SURVEY_PROBABILITY = 0.2;
+// 传递给 submitTranscriptShare 的触发器标识，说明本次转录共享由记忆调查发起
 const TRANSCRIPT_SHARE_TRIGGER = 'memory_survey';
+// 正则：匹配助手消息中的 "memory" 或 "memories"（单词边界，忽略大小写）
 const MEMORY_WORD_RE = /\bmemor(?:y|ies)\b/i;
+
+/**
+ * hasMemoryFileRead
+ *
+ * 整体流程：
+ *   1. 遍历消息列表，跳过非助手消息
+ *   2. 对每条助手消息，获取其 content 数组
+ *   3. 遍历 content 中的每个块（block），跳过非 tool_use 块或非 FileRead 工具调用
+ *   4. 将 block.input 强转为带 file_path 字段的对象
+ *   5. 若 file_path 是字符串且被 isAutoManagedMemoryFile 识别为自动管理记忆文件，则返回 true
+ *   6. 全部遍历完毕未命中则返回 false
+ *
+ * 在系统中的角色：
+ *   是 useMemorySurvey 的前置检查条件，确保当前会话确实使用了记忆功能，
+ *   结果通过 memoryReadSeen ref 缓存，避免对同一会话重复执行 O(n) 扫描。
+ */
 function hasMemoryFileRead(messages: Message[]): boolean {
+  // 遍历所有消息，只关注助手消息（含工具调用的消息）
   for (const message of messages) {
+    // 跳过非助手消息（用户消息、系统消息等无 tool_use 块）
     if (message.type !== 'assistant') {
       continue;
     }
     const content = message.message.content;
+    // 跳过非数组 content（纯文本字符串等格式不含工具调用块）
     if (!Array.isArray(content)) {
       continue;
     }
+    // 遍历助手消息中的每个内容块
     for (const block of content) {
+      // 只处理 FileRead 工具调用块，跳过文本块和其他工具调用
       if (block.type !== 'tool_use' || block.name !== FILE_READ_TOOL_NAME) {
         continue;
       }
+      // 将工具输入强转为含 file_path 字段的对象（编译后类型擦除）
       const input = block.input as {
         file_path?: unknown;
       };
+      // 若 file_path 是字符串且属于自动管理记忆文件，则本次会话确实读取了记忆文件
       if (typeof input.file_path === 'string' && isAutoManagedMemoryFile(input.file_path)) {
         return true;
       }
     }
   }
+  // 遍历完毕未发现记忆文件读取记录
   return false;
 }
+/**
+ * useMemorySurvey
+ *
+ * 整体流程：
+ *   1. 初始化 refs：
+ *      - seenAssistantUuids：Set<string>，记录已评估过的助手消息 UUID，避免重复触发
+ *      - memoryReadSeen：boolean，一旦检测到记忆文件读取即置 true，后续跳过 O(n) 扫描
+ *      - messagesRef：最新消息列表镜像，供异步回调（onTranscriptSelect）安全访问
+ *   2. 构造调查生命周期回调（均通过 useCallback 稳定引用）：
+ *      - onOpen：调查弹出时上报 'appeared' 事件至 Statsig + OTel
+ *      - onSelect：用户选择评分时上报 'responded' 事件
+ *      - shouldShowTranscriptPrompt：仅 Anthropic 内部构建（"ant"）且用户选 bad/good、
+ *        未永久拒绝分享、策略允许时返回 true
+ *      - onTranscriptPromptShown：转录共享提示弹出时上报 'transcript_prompt_appeared' 事件
+ *      - onTranscriptSelect：用户做出转录共享决定时：
+ *          a. 上报 `transcript_share_${selected}` 事件
+ *          b. 若选 'dont_ask_again' → 永久保存 transcriptShareDismissed=true
+ *          c. 若选 'yes' → 调用 submitTranscriptShare 提交转录，上报成功/失败事件
+ *   3. 调用 useSurveyState 获取状态机（state/lastResponse/open/handleSelect/handleTranscriptSelect）
+ *   4. 通过 useMemo 计算最后一条助手消息（lastAssistant），仅在 messages 变化时重算
+ *   5. useEffect 监听核心依赖，执行触发逻辑：
+ *      a. enabled=false → 直接跳过
+ *      b. messages 为空（/clear 后）→ 重置 memoryReadSeen / seenAssistantUuids，返回
+ *      c. 调查已打开 / 正在加载 / 有活跃提示 → 跳过
+ *      d. GrowthBook 门控未开启 → 跳过
+ *      e. 自动记忆未启用 → 跳过
+ *      f. 调查已禁用（配置/环境变量/策略）→ 跳过
+ *      g. lastAssistant 为空或已评估过 → 跳过
+ *      h. 助手消息不含 memory/memories 词 → 跳过
+ *      i. 将当前 UUID 加入 seenAssistantUuids（防止后续重复扫描）
+ *      j. 若 memoryReadSeen 为 false → 执行 hasMemoryFileRead O(n) 扫描并缓存结果
+ *      k. 记忆文件读取未检测到 → 跳过
+ *      l. Math.random() < 0.2 → 调用 open() 弹出调查（20% 概率）
+ *   6. 返回 { state, lastResponse, handleSelect, handleTranscriptSelect }
+ *
+ * 在系统中的角色：
+ *   是记忆功能调查的唯一入口，由 REPL 主组件在每轮 AI 回复后挂载使用，
+ *   通过 seenAssistantUuids + memoryReadSeen 双重缓存机制保证高效且不重复触发。
+ */
 export function useMemorySurvey(messages: Message[], isLoading: boolean, hasActivePrompt = false, {
   enabled = true
 }: {
@@ -56,12 +148,17 @@ export function useMemorySurvey(messages: Message[], isLoading: boolean, hasActi
 } {
   // Track assistant message UUIDs that were already evaluated so we don't
   // re-roll probability on re-renders or re-scan messages for the same turn.
+  // 已评估过的助手消息 UUID 集合，防止同一轮消息多次触发调查
   const seenAssistantUuids = useRef<Set<string>>(new Set());
   // Once a memory file read is observed it stays true for the session —
   // skip the O(n) scan on subsequent turns.
+  // 记忆文件读取标志：一旦发现即置 true，避免后续重复 O(n) 扫描
   const memoryReadSeen = useRef(false);
+  // 镜像最新消息列表，供异步回调（onTranscriptSelect）读取当前消息而无需加入 effect 依赖
   const messagesRef = useRef(messages);
   messagesRef.current = messages;
+
+  // 调查弹出时上报 'appeared' 事件（Statsig + OTel 双路上报）
   const onOpen = useCallback((appearanceId: string) => {
     logEvent(MEMORY_SURVEY_EVENT, {
       event_type: 'appeared' as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
@@ -73,6 +170,8 @@ export function useMemorySurvey(messages: Message[], isLoading: boolean, hasActi
       survey_type: 'memory'
     });
   }, []);
+
+  // 用户选择评分时上报 'responded' 事件，携带 response 字段记录具体选项
   const onSelect = useCallback((appearanceId_0: string, selected: FeedbackSurveyResponse) => {
     logEvent(MEMORY_SURVEY_EVENT, {
       event_type: 'responded' as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
@@ -86,21 +185,30 @@ export function useMemorySurvey(messages: Message[], isLoading: boolean, hasActi
       survey_type: 'memory'
     });
   }, []);
+
+  // 决定是否在评分后弹出转录共享提示：
+  // 仅 Anthropic 内部构建（"ant"）、评分为 bad/good、用户未永久拒绝、策略允许时才显示
   const shouldShowTranscriptPrompt = useCallback((selected_0: FeedbackSurveyResponse) => {
+    // 非 Anthropic 内部构建（如第三方发行版）不弹出转录共享
     if ("external" !== 'ant') {
       return false;
     }
+    // 只有 bad/good 评分才有意义共享转录（dismissed 不共享）
     if (selected_0 !== 'bad' && selected_0 !== 'good') {
       return false;
     }
+    // 用户曾选择"不再询问"→ 永久跳过
     if (getGlobalConfig().transcriptShareDismissed) {
       return false;
     }
+    // 策略不允许产品反馈 → 跳过
     if (!isPolicyAllowed('allow_product_feedback')) {
       return false;
     }
     return true;
   }, []);
+
+  // 转录共享提示弹出时上报 'transcript_prompt_appeared' 事件，携带 trigger 字段
   const onTranscriptPromptShown = useCallback((appearanceId_1: string) => {
     logEvent(MEMORY_SURVEY_EVENT, {
       event_type: 'transcript_prompt_appeared' as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
@@ -113,20 +221,29 @@ export function useMemorySurvey(messages: Message[], isLoading: boolean, hasActi
       survey_type: 'memory'
     });
   }, []);
+
+  // 用户对转录共享做出决定时的异步回调：
+  //   - 上报 transcript_share_${selected} 事件
+  //   - 'dont_ask_again' → 保存全局配置标志位
+  //   - 'yes' → 调用 submitTranscriptShare 实际上传，并上报成功/失败
   const onTranscriptSelect = useCallback(async (appearanceId_2: string, selected_1: TranscriptShareResponse): Promise<boolean> => {
+    // 上报用户对转录共享的选择（yes/no/dont_ask_again）
     logEvent(MEMORY_SURVEY_EVENT, {
       event_type: `transcript_share_${selected_1}` as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
       appearance_id: appearanceId_2 as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
       trigger: TRANSCRIPT_SHARE_TRIGGER as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS
     });
+    // 用户选择"不再询问"：永久保存到全局配置，后续 shouldShowTranscriptPrompt 将返回 false
     if (selected_1 === 'dont_ask_again') {
       saveGlobalConfig(current => ({
         ...current,
         transcriptShareDismissed: true
       }));
     }
+    // 用户同意共享：使用 messagesRef 获取最新消息列表，执行脱敏+上传
     if (selected_1 === 'yes') {
       const result = await submitTranscriptShare(messagesRef.current, TRANSCRIPT_SHARE_TRIGGER, appearanceId_2);
+      // 上报提交结果（成功或失败）
       logEvent(MEMORY_SURVEY_EVENT, {
         event_type: (result.success ? 'transcript_share_submitted' : 'transcript_share_failed') as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
         appearance_id: appearanceId_2 as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
@@ -134,8 +251,11 @@ export function useMemorySurvey(messages: Message[], isLoading: boolean, hasActi
       });
       return result.success;
     }
+    // no/dont_ask_again 均不实际上传，返回 false
     return false;
   }, []);
+
+  // 接入 useSurveyState 状态机，获取调查状态和控制函数
   const {
     state,
     lastResponse,
@@ -150,41 +270,62 @@ export function useMemorySurvey(messages: Message[], isLoading: boolean, hasActi
     onTranscriptPromptShown,
     onTranscriptSelect
   });
+
+  // 缓存最后一条助手消息，避免每次渲染重新线性扫描消息列表
   const lastAssistant = useMemo(() => getLastAssistantMessage(messages), [messages]);
+
   useEffect(() => {
+    // hook 被禁用时直接跳过所有逻辑
     if (!enabled) return;
 
     // /clear resets messages but REPL stays mounted — reset refs so a memory
     // read from the previous conversation doesn't leak into the new one.
+    // /clear 后消息列表清空 → 重置跨轮次状态，防止旧会话的记忆标志污染新会话
     if (messages.length === 0) {
       memoryReadSeen.current = false;
       seenAssistantUuids.current.clear();
       return;
     }
+
+    // 调查已打开/在加载中/有活跃提示时不再触发新调查
     if (state !== 'closed' || isLoading || hasActivePrompt) {
       return;
     }
 
     // 3P default: survey off (no GrowthBook on Bedrock/Vertex/Foundry).
+    // GrowthBook 门控：第三方部署（Bedrock/Vertex/Foundry）默认为 false，仅 Anthropic 直连开启
     if (!getFeatureValue_CACHED_MAY_BE_STALE(MEMORY_SURVEY_GATE, false)) {
       return;
     }
+
+    // 自动记忆功能未启用时不触发记忆调查
     if (!isAutoMemoryEnabled()) {
       return;
     }
+
+    // 全局配置/环境变量已禁用反馈调查时跳过
     if (isFeedbackSurveyDisabled()) {
       return;
     }
+
+    // 策略不允许产品反馈时跳过
     if (!isPolicyAllowed('allow_product_feedback')) {
       return;
     }
+
+    // 环境变量 CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=true 时完全禁用调查
     if (isEnvTruthy(process.env.CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY)) {
       return;
     }
+
+    // 没有助手消息，或该助手消息已被评估过（同一轮不重复触发）
     if (!lastAssistant || seenAssistantUuids.current.has(lastAssistant.uuid)) {
       return;
     }
+
+    // 提取助手消息文本（空格拼接多块内容）
     const text = extractTextContent(lastAssistant.message.content, ' ');
+    // 消息中不含 memory/memories 词 → 与记忆功能无关，跳过
     if (!MEMORY_WORD_RE.test(text)) {
       return;
     }
@@ -192,17 +333,24 @@ export function useMemorySurvey(messages: Message[], isLoading: boolean, hasActi
     // Mark as evaluated before the memory-read scan so a turn that mentions
     // "memory" but has no memory read doesn't trigger repeated O(n) scans
     // on subsequent renders with the same last assistant message.
+    // 先标记已评估，防止提到"memory"但无文件读取的消息在后续渲染中反复触发 O(n) 扫描
     seenAssistantUuids.current.add(lastAssistant.uuid);
+
+    // 若尚未检测到记忆文件读取，执行一次 O(n) 全量扫描并缓存结果
     if (!memoryReadSeen.current) {
       memoryReadSeen.current = hasMemoryFileRead(messages);
     }
+    // 当前会话没有记忆文件读取记录 → 不触发调查
     if (!memoryReadSeen.current) {
       return;
     }
+
+    // 以 20% 概率弹出调查，避免对用户造成过多打扰
     if (Math.random() < SURVEY_PROBABILITY) {
       open();
     }
   }, [enabled, state, isLoading, hasActivePrompt, lastAssistant, messages, open]);
+
   return {
     state,
     lastResponse,

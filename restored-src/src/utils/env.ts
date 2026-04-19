@@ -1,3 +1,12 @@
+/**
+ * 环境变量与运行时环境检测模块。
+ *
+ * 在 Claude Code 系统中，该模块提供对运行时环境的统一访问接口，
+ * 包括 API 密钥、认证配置、IDE 集成检测（JetBrains、VS Code 等）、
+ * 代理设置和各类功能标志：
+ * - env：包含所有环境变量的配置对象（带缓存）
+ * - JETBRAINS_IDES：支持的 JetBrains IDE 列表
+ */
 import memoize from 'lodash-es/memoize.js'
 import { homedir } from 'os'
 import { join } from 'path'

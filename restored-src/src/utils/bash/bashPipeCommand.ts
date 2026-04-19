@@ -1,3 +1,14 @@
+/**
+ * Bash 管道命令重排模块。
+ *
+ * 在 Claude Code 系统中，该模块负责将含管道（|）的 shell 命令安全地重排，
+ * 使 stdin 重定向（< /dev/null）作用于管道第一段命令而非 eval 整体：
+ * - rearrangePipeCommand()：主入口，解析后重排或降级为整体 eval-quote
+ * - 安全降级场景：反引号、$()、shell 变量引用、控制结构、行续接后含换行、
+ *   shell-quote 的单引号 bug、token 格式异常（注入防护）
+ * - buildCommandParts()：重建命令片段，正确处理 FD 重定向与环境变量赋值
+ * - singleQuoteForEval()：将命令单引号化以供 eval 使用，不破坏 jq/awk 过滤器
+ */
 import {
   hasMalformedTokens,
   hasShellQuoteSingleQuoteBug,
@@ -7,9 +18,10 @@ import {
 } from './shellQuote.js'
 
 /**
- * Rearranges a command with pipes to place stdin redirect after the first command.
- * This fixes an issue where eval treats the entire piped command as a single unit,
- * causing the stdin redirect to apply to eval itself rather than the first command.
+ * 将含管道的命令重排，使 stdin 重定向紧接第一段命令之后插入。
+ * 修复 eval 将整条管道命令视为单一单元时，stdin 重定向作用于 eval 本身而非第一段命令的问题。
+ * 遇到反引号、$()、shell 变量、控制结构、换行符、单引号 bug 或 token 格式异常时，
+ * 降级为对整条命令进行整体 eval-quote（安全回退）。
  */
 export function rearrangePipeCommand(command: string): string {
   // Skip if command has backticks - shell-quote doesn't handle them well
@@ -100,7 +112,8 @@ export function rearrangePipeCommand(command: string): string {
 }
 
 /**
- * Finds the index of the first pipe operator in parsed shell command
+ * 在已解析的 shell token 数组中查找第一个管道运算符（|）的位置。
+ * 返回其索引；若不存在则返回 -1。
  */
 function findFirstPipeOperator(parsed: ParseEntry[]): number {
   for (let i = 0; i < parsed.length; i++) {
@@ -113,8 +126,9 @@ function findFirstPipeOperator(parsed: ParseEntry[]): number {
 }
 
 /**
- * Builds command parts from parsed entries, handling strings and operators.
- * Special handling for file descriptor redirections to preserve them as single units.
+ * 从解析后的 token 数组中重建指定范围的命令片段列表。
+ * 对字符串 token 进行 shell quote；特殊处理 FD 重定向（2>&1、2>/dev/null 等）
+ * 使其合并为单一部分；对环境变量赋值（VAR=value）仅对值部分进行 quote。
  */
 function buildCommandParts(
   parsed: ParseEntry[],
@@ -212,24 +226,24 @@ function buildCommandParts(
 }
 
 /**
- * Checks if a string is an environment variable assignment (VAR=value)
- * Environment variable names must start with letter or underscore,
- * followed by letters, numbers, or underscores
+ * 判断字符串是否为环境变量赋值形式（VAR=value）。
+ * 变量名须以字母或下划线开头，后跟字母、数字或下划线，再接 `=`。
  */
 function isEnvironmentVariableAssignment(str: string): boolean {
   return /^[A-Za-z_][A-Za-z0-9_]*=/.test(str)
 }
 
 /**
- * Checks if an operator is a command separator that starts a new command context.
- * After these operators, environment variable assignments are valid again.
+ * 判断运算符是否为命令分隔符（&&、||、;）。
+ * 遇到命令分隔符后，下一段命令允许再次出现环境变量赋值。
  */
 function isCommandSeparator(op: string): boolean {
   return op === '&&' || op === '||' || op === ';'
 }
 
 /**
- * Type guard to check if a parsed entry is an operator
+ * 类型守卫：判断解析后的 entry 是否为运算符对象（{ op: string }）。
+ * 可选第二参数 op 用于精确匹配运算符字符串。
  */
 function isOperator(entry: unknown, op?: string): entry is { op: string } {
   if (!entry || typeof entry !== 'object' || !('op' in entry)) {
@@ -239,46 +253,37 @@ function isOperator(entry: unknown, op?: string): entry is { op: string } {
 }
 
 /**
- * Checks if a command contains bash control structures that shell-quote cannot parse.
- * These include for/while/until/if/case/select loops and conditionals.
- * We match keywords followed by whitespace to avoid false positives with commands
- * or arguments that happen to contain these words.
+ * 检测命令是否包含 shell-quote 无法正确解析的控制结构关键字
+ * （for / while / until / if / case / select），以关键字后接空白字符来匹配，
+ * 避免将命令名或参数中恰好含有这些词的情况误判。
  */
 function containsControlStructure(command: string): boolean {
   return /\b(for|while|until|if|case|select)\s/.test(command)
 }
 
 /**
- * Quotes a command and adds `< /dev/null` as a shell redirect on eval, rather than
- * as an eval argument. This is critical for pipe commands where we can't parse the
- * pipe boundary (e.g., commands with $(), backticks, or control structures).
- *
- * Using `singleQuoteForEval(cmd) + ' < /dev/null'` produces: eval 'cmd' < /dev/null
- *   → eval's stdin is /dev/null, eval evaluates 'cmd', pipes inside work correctly
- *
- * The previous approach `quote([cmd, '<', '/dev/null'])` produced: eval 'cmd' \< /dev/null
- *   → eval concatenates args to 'cmd < /dev/null', redirect applies to LAST pipe command
+ * 对无法解析管道边界的命令（含 $()、反引号、控制结构等），将整条命令
+ * 单引号化后追加 ` < /dev/null` 作为 eval 级别的 stdin 重定向。
+ * 注意：` < /dev/null` 在引号外，由 shell 直接处理，而非作为 eval 的参数。
  */
 function quoteWithEvalStdinRedirect(command: string): string {
   return singleQuoteForEval(command) + ' < /dev/null'
 }
 
 /**
- * Single-quote a string for use as an eval argument. Escapes embedded single
- * quotes via '"'"' (close-sq, literal-sq-in-dq, reopen-sq). Used instead of
- * shell-quote's quote() which switches to double-quote mode when the input
- * contains single quotes and then escapes ! -> \!, corrupting jq/awk filters
- * like `select(.x != .y)` into `select(.x \!= .y)`.
+ * 将字符串以单引号包裹，使其可作为 eval 的参数安全传递。
+ * 内嵌单引号通过 `'"'"'` 序列转义（关闭单引号→双引号内字面单引号→重开单引号）。
+ * 不使用 shell-quote 的 quote()，因其在含单引号时会切换为双引号模式并转义 `!`，
+ * 破坏 jq/awk 中的 `select(.x != .y)` 等过滤器。
  */
 function singleQuoteForEval(s: string): string {
   return "'" + s.replace(/'/g, `'"'"'`) + "'"
 }
 
 /**
- * Joins shell continuation lines (backslash-newline) into a single line.
- * Only joins when there's an odd number of backslashes before the newline
- * (the last one escapes the newline). Even backslashes pair up as escape
- * sequences and the newline remains a separator.
+ * 将命令中的行续接序列（反斜杠 + 换行）合并为单行。
+ * 仅合并奇数个反斜杠后接换行的情况（最后一个反斜杠转义换行）；
+ * 偶数个反斜杠（两两配对为转义序列）时保留换行作为真正的分隔符。
  */
 function joinContinuationLines(command: string): string {
   return command.replace(/\\+\n/g, match => {

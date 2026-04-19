@@ -1,14 +1,13 @@
 /**
- * Terminal Launcher
+ * 终端启动器模块。
  *
- * Detects the user's preferred terminal emulator and launches Claude Code
- * inside it. Used by the deep link protocol handler when invoked by the OS
- * (i.e., not already running inside a terminal).
+ * 在 Claude Code 系统中，该模块检测用户首选终端模拟器并在其中启动 Claude Code，
+ * 供 deep link 协议处理器在 OS 调用时（即非终端运行时）使用。
  *
- * Platform support:
- *   macOS  — Terminal.app, iTerm2, Ghostty, Kitty, Alacritty, WezTerm
- *   Linux  — $TERMINAL, x-terminal-emulator, gnome-terminal, konsole, etc.
- *   Windows — Windows Terminal (wt.exe), PowerShell, cmd.exe
+ * 平台支持：
+ * - macOS：Terminal.app、iTerm2、Ghostty、Kitty、Alacritty、WezTerm
+ * - Linux：$TERMINAL、x-terminal-emulator、gnome-terminal、konsole 等
+ * - Windows：Windows Terminal（wt.exe）、PowerShell、cmd.exe
  */
 
 import { spawn } from 'child_process'

@@ -1,6 +1,20 @@
 /**
- * Keybindings template generator.
- * Generates a well-documented template file for ~/.claude/keybindings.json
+ * 键位绑定模板文件生成模块
+ *
+ * 【在 Claude Code 键位绑定系统中的位置与作用】
+ * 本文件负责生成 ~/.claude/keybindings.json 的初始模板文件，
+ * 是用户首次运行 /keybindings 命令时的入口点：
+ *
+ *   defaultBindings（完整的内置默认绑定）
+ *   reservedShortcuts（NON_REBINDABLE 保留键列表）
+ *     → template（本文件，过滤保留键 + 序列化为带注释的 JSON 模板）
+ *       ← /keybindings 命令调用此函数，写入 ~/.claude/keybindings.json
+ *
+ * 核心导出：
+ *  - generateKeybindingsTemplate()：
+ *    生成完整的 keybindings.json 模板内容（字符串），
+ *    包含所有可自定义的默认绑定，排除 ctrl+c / ctrl+d / ctrl+m 等不可重绑键，
+ *    并附带 $schema / $docs 元数据，便于编辑器提供智能提示。
  */
 
 import { jsonStringify } from '../utils/slowOperations.js'

@@ -1,3 +1,11 @@
+/**
+ * Shell 补全脚本安装与缓存管理模块。
+ *
+ * 在 Claude Code 系统中，该模块负责生成并安装 bash/zsh/fish 的命令行补全脚本，
+ * 将脚本缓存至 ~/.claude/completion.{zsh,bash,fish} 并向 RC 文件追加 source 指令：
+ * - setupShellCompletion()：检测当前 shell，生成补全脚本并写入 RC 文件
+ * - regenerateCompletionCache()：claude update 后重新生成补全缓存，与新二进制保持同步
+ */
 import chalk from 'chalk'
 import { mkdir, readFile, writeFile } from 'fs/promises'
 import { homedir } from 'os'
@@ -21,6 +29,10 @@ type ShellInfo = {
   shellFlag: string
 }
 
+/**
+ * 检测当前 shell 类型，返回对应的补全配置信息。
+ * 支持 zsh、bash、fish；无法识别时返回 null。
+ */
 function detectShell(): ShellInfo | null {
   const shell = process.env.SHELL || ''
   const home = homedir()
@@ -60,6 +72,10 @@ function detectShell(): ShellInfo | null {
   return null
 }
 
+/**
+ * 将文件路径格式化为支持点击跳转的超链接（终端支持时）。
+ * 不支持超链接时直接返回路径字符串。
+ */
 function formatPathLink(filePath: string): string {
   if (!supportsHyperlinks()) {
     return filePath
@@ -69,8 +85,8 @@ function formatPathLink(filePath: string): string {
 }
 
 /**
- * Generate and cache the completion script, then add a source line to the
- * shell's rc file. Returns a user-facing status message.
+ * 生成并缓存补全脚本，然后向 shell 的 RC 文件追加 source 指令。
+ * 返回供用户查看的状态消息。
  */
 export async function setupShellCompletion(theme: ThemeName): Promise<string> {
   const shell = detectShell()
@@ -78,7 +94,7 @@ export async function setupShellCompletion(theme: ThemeName): Promise<string> {
     return ''
   }
 
-  // Ensure the cache directory exists
+  // 确保缓存目录存在
   try {
     await mkdir(dirname(shell.cacheFile), { recursive: true })
   } catch (e: unknown) {
@@ -86,9 +102,8 @@ export async function setupShellCompletion(theme: ThemeName): Promise<string> {
     return `${EOL}${color('warning', theme)(`Could not write ${shell.name} completion cache`)}${EOL}${chalk.dim(`Run manually: claude completion ${shell.shellFlag} > ${shell.cacheFile}`)}${EOL}`
   }
 
-  // Generate the completion script by writing directly to the cache file.
-  // Using --output avoids piping through stdout where process.exit() can
-  // truncate output before the pipe buffer drains.
+  // 通过直接写入缓存文件来生成补全脚本。
+  // 使用 --output 可避免通过 stdout 输出时 process.exit() 在管道缓冲区刷新前截断内容。
   const claudeBin = process.argv[1] || 'claude'
   const result = await execFileNoThrow(claudeBin, [
     'completion',
@@ -100,7 +115,7 @@ export async function setupShellCompletion(theme: ThemeName): Promise<string> {
     return `${EOL}${color('warning', theme)(`Could not generate ${shell.name} shell completions`)}${EOL}${chalk.dim(`Run manually: claude completion ${shell.shellFlag} > ${shell.cacheFile}`)}${EOL}`
   }
 
-  // Check if rc file already sources completions
+  // 检查 RC 文件是否已包含补全 source 指令
   let existing = ''
   try {
     existing = await readFile(shell.rcFile, { encoding: 'utf-8' })
@@ -117,7 +132,7 @@ export async function setupShellCompletion(theme: ThemeName): Promise<string> {
     }
   }
 
-  // Append source line to rc file
+  // 向 RC 文件追加 source 指令
   try {
     const configDir = dirname(shell.rcFile)
     await mkdir(configDir, { recursive: true })
@@ -134,8 +149,8 @@ export async function setupShellCompletion(theme: ThemeName): Promise<string> {
 }
 
 /**
- * Regenerate cached shell completion scripts in ~/.claude/.
- * Called after `claude update` so completions stay in sync with the new binary.
+ * 重新生成 ~/.claude/ 目录下的 shell 补全脚本缓存。
+ * 在 `claude update` 后调用，确保补全与新二进制文件保持同步。
  */
 export async function regenerateCompletionCache(): Promise<void> {
   const shell = detectShell()

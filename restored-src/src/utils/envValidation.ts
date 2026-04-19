@@ -1,3 +1,10 @@
+/**
+ * 环境变量验证模块。
+ *
+ * 在 Claude Code 系统中，该模块验证数值型环境变量（如 token 限制、超时等）的合法性，
+ * 处理超出范围或非法值，返回有效值及验证状态（valid/capped/invalid）：
+ * - validateNumericEnvVar()：验证并规范化数值型环境变量
+ */
 import { logForDebugging } from './debug.js'
 
 export type EnvVarValidationResult = {

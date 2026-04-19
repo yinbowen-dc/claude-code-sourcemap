@@ -1,70 +1,103 @@
-import { performBackgroundPluginInstallations } from '../../services/plugins/PluginInstallationManager.js';
-import type { AppState } from '../../state/AppState.js';
-import { checkHasTrustDialogAccepted } from '../config.js';
-import { logForDebugging } from '../debug.js';
-import { clearMarketplacesCache, registerSeedMarketplaces } from './marketplaceManager.js';
-import { clearPluginCache } from './pluginLoader.js';
-type SetAppState = (f: (prevState: AppState) => AppState) => void;
+/**
+ * 插件系统启动检查入口模块。
+ *
+ * 在 Claude Code 插件系统流程中，本文件处于"REPL 启动初始化"层：
+ *   - 由 REPL.tsx 在用户通过"信任当前目录"对话框后立即调用；
+ *   - 确保 seed 市场（CLAUDE_CODE_PLUGIN_SEED_DIR）在后台安装任务开始前已注册；
+ *   - 若 seed 状态发生变化，清除陈旧缓存并通知 UI 刷新插件列表；
+ *   - 最终调用 performBackgroundPluginInstallations() 异步安装所有声明的插件。
+ *
+ * 安全注意：
+ *   本函数仅在用户显式信任当前目录后调用（cli.tsx 的信任对话框会阻断所有执行，
+ *   直到用户明确授权），从而防止恶意仓库自动安装插件。
+ *
+ * 主要导出：
+ *   - performStartupChecks(setAppState)：插件启动检查的总入口
+ */
+
+import { performBackgroundPluginInstallations } from '../../services/plugins/PluginInstallationManager.js'
+import type { AppState } from '../../state/AppState.js'
+import { checkHasTrustDialogAccepted } from '../config.js'
+import { logForDebugging } from '../debug.js'
+import {
+  clearMarketplacesCache,
+  registerSeedMarketplaces,
+} from './marketplaceManager.js'
+import { clearPluginCache } from './pluginLoader.js'
+
+// setAppState 函数类型：接收一个"前一状态 → 新状态"的转换函数
+type SetAppState = (f: (prevState: AppState) => AppState) => void
 
 /**
- * Perform plugin startup checks and initiate background installations
+ * 执行插件启动检查，并触发后台安装流程。
  *
- * This function starts background installation of marketplaces and plugins
- * from trusted sources (repository and user settings) without blocking startup.
- * Installation progress and errors are tracked in AppState and shown via notifications.
+ * 执行流程：
+ *   1. 检查当前目录是否已通过信任对话框授权，若未授权则直接返回；
+ *   2. 调用 registerSeedMarketplaces()，将 CLAUDE_CODE_PLUGIN_SEED_DIR 中的
+ *      市场注册到 known_marketplaces.json（幂等操作）；
+ *   3. 若注册导致状态变化，清除市场缓存和插件缓存，并设置 needsRefresh 标志
+ *      通知 useManagePlugins 提示用户运行 /reload-plugins；
+ *   4. 调用 performBackgroundPluginInstallations() 后台安装所有声明的插件；
+ *   5. 捕获所有异常并记录日志，确保任何错误都不阻断 REPL 启动。
  *
- * SECURITY: This function is only called from REPL.tsx after the "trust this folder"
- * dialog has been confirmed. The trust dialog in cli.tsx blocks all execution until
- * the user explicitly trusts the current working directory, ensuring that plugin
- * installations only happen with user consent. This prevents malicious repositories
- * from automatically installing plugins without user approval.
+ * 安全说明：仅在 REPL.tsx 确认信任后调用，防止恶意仓库自动植入插件。
  *
- * @param setAppState Function to update app state with installation progress
+ * @param setAppState 用于更新应用状态（安装进度、刷新标志等）的函数
  */
-export async function performStartupChecks(setAppState: SetAppState): Promise<void> {
-  logForDebugging('performStartupChecks called');
+export async function performStartupChecks(
+  setAppState: SetAppState,
+): Promise<void> {
+  logForDebugging('performStartupChecks called')
 
-  // Check if the current directory has been trusted
+  // 检查当前工作目录是否已被用户明确信任
   if (!checkHasTrustDialogAccepted()) {
-    logForDebugging('Trust not accepted for current directory - skipping plugin installations');
-    return;
+    // 未信任则跳过所有插件安装，防止恶意仓库利用插件系统
+    logForDebugging(
+      'Trust not accepted for current directory - skipping plugin installations',
+    )
+    return
   }
-  try {
-    logForDebugging('Starting background plugin installations');
 
-    // Register seed marketplaces (CLAUDE_CODE_PLUGIN_SEED_DIR) before diffing.
-    // Idempotent; no-op if seed not configured. Without this, background install
-    // would see seed marketplaces as missing → clone → defeats seed's purpose.
+  try {
+    logForDebugging('Starting background plugin installations')
+
+    // 在执行后台安装之前，先注册 seed 市场（CLAUDE_CODE_PLUGIN_SEED_DIR）。
+    // 幂等操作：若未配置 seed 目录则为空操作。
+    // 若不执行此步骤，后台安装会将 seed 市场视为缺失并重新克隆，
+    // 完全违背 seed 目录的初衷（节省网络和磁盘操作）。
     //
-    // If registration changed state, clear caches so earlier plugin-load passes
-    // (e.g. getAllMcpConfigs during REPL init) don't keep stale "marketplace
-    // not found" results.
-    const seedChanged = await registerSeedMarketplaces();
+    // 若注册改变了已知市场状态，则需清除缓存：
+    // 早期的插件加载（如 REPL 初始化时的 getAllMcpConfigs）可能已缓存了
+    // "市场未找到"的陈旧结果，清除缓存可让后续调用重新解析。
+    const seedChanged = await registerSeedMarketplaces()
     if (seedChanged) {
-      clearMarketplacesCache();
-      clearPluginCache('performStartupChecks: seed marketplaces changed');
-      // Set needsRefresh so useManagePlugins notifies the user to run
-      // /reload-plugins. Without this signal, the initial plugin-load
-      // (which raced and cached "marketplace not found") would persist
-      // until the user manually reloads.
+      // 清除市场元数据缓存（getMarketplace 等的 memoize 缓存）
+      clearMarketplacesCache()
+      // 清除插件加载缓存（pluginLoader 的内存缓存）
+      clearPluginCache('performStartupChecks: seed marketplaces changed')
+      // 设置 needsRefresh 标志，让 useManagePlugins 提示用户执行 /reload-plugins。
+      // 若不设此标志，早期已缓存"市场未找到"结果的插件加载轮次会持续生效，
+      // 直到用户手动重新加载。
       setAppState(prev => {
-        if (prev.plugins.needsRefresh) return prev;
+        // 若已设置 needsRefresh，直接返回原状态，避免不必要的重渲染
+        if (prev.plugins.needsRefresh) return prev
         return {
           ...prev,
           plugins: {
             ...prev.plugins,
-            needsRefresh: true
-          }
-        };
-      });
+            needsRefresh: true, // 通知 UI 提示用户刷新
+          },
+        }
+      })
     }
 
-    // Start background installations without waiting
-    // This will update AppState as installations progress
-    await performBackgroundPluginInstallations(setAppState);
+    // 启动后台安装任务（异步，不阻塞 REPL）
+    // 安装进度和错误会通过 setAppState 更新到应用状态，由通知组件展示
+    await performBackgroundPluginInstallations(setAppState)
   } catch (error) {
-    // Even if something fails here, don't block startup
-    logForDebugging(`Error initiating background plugin installations: ${error}`);
+    // 即使此处发生任何错误，也不应阻断 REPL 启动
+    logForDebugging(
+      `Error initiating background plugin installations: ${error}`,
+    )
   }
 }
-//# sourceMappingURL=data:application/json;charset=utf-8;base64,eyJ2ZXJzaW9uIjozLCJuYW1lcyI6WyJwZXJmb3JtQmFja2dyb3VuZFBsdWdpbkluc3RhbGxhdGlvbnMiLCJBcHBTdGF0ZSIsImNoZWNrSGFzVHJ1c3REaWFsb2dBY2NlcHRlZCIsImxvZ0ZvckRlYnVnZ2luZyIsImNsZWFyTWFya2V0cGxhY2VzQ2FjaGUiLCJyZWdpc3RlclNlZWRNYXJrZXRwbGFjZXMiLCJjbGVhclBsdWdpbkNhY2hlIiwiU2V0QXBwU3RhdGUiLCJmIiwicHJldlN0YXRlIiwicGVyZm9ybVN0YXJ0dXBDaGVja3MiLCJzZXRBcHBTdGF0ZSIsIlByb21pc2UiLCJzZWVkQ2hhbmdlZCIsInByZXYiLCJwbHVnaW5zIiwibmVlZHNSZWZyZXNoIiwiZXJyb3IiXSwic291cmNlcyI6WyJwZXJmb3JtU3RhcnR1cENoZWNrcy50c3giXSwic291cmNlc0NvbnRlbnQiOlsiaW1wb3J0IHsgcGVyZm9ybUJhY2tncm91bmRQbHVnaW5JbnN0YWxsYXRpb25zIH0gZnJvbSAnLi4vLi4vc2VydmljZXMvcGx1Z2lucy9QbHVnaW5JbnN0YWxsYXRpb25NYW5hZ2VyLmpzJ1xuaW1wb3J0IHR5cGUgeyBBcHBTdGF0ZSB9IGZyb20gJy4uLy4uL3N0YXRlL0FwcFN0YXRlLmpzJ1xuaW1wb3J0IHsgY2hlY2tIYXNUcnVzdERpYWxvZ0FjY2VwdGVkIH0gZnJvbSAnLi4vY29uZmlnLmpzJ1xuaW1wb3J0IHsgbG9nRm9yRGVidWdnaW5nIH0gZnJvbSAnLi4vZGVidWcuanMnXG5pbXBvcnQge1xuICBjbGVhck1hcmtldHBsYWNlc0NhY2hlLFxuICByZWdpc3RlclNlZWRNYXJrZXRwbGFjZXMsXG59IGZyb20gJy4vbWFya2V0cGxhY2VNYW5hZ2VyLmpzJ1xuaW1wb3J0IHsgY2xlYXJQbHVnaW5DYWNoZSB9IGZyb20gJy4vcGx1Z2luTG9hZGVyLmpzJ1xuXG50eXBlIFNldEFwcFN0YXRlID0gKGY6IChwcmV2U3RhdGU6IEFwcFN0YXRlKSA9PiBBcHBTdGF0ZSkgPT4gdm9pZFxuXG4vKipcbiAqIFBlcmZvcm0gcGx1Z2luIHN0YXJ0dXAgY2hlY2tzIGFuZCBpbml0aWF0ZSBiYWNrZ3JvdW5kIGluc3RhbGxhdGlvbnNcbiAqXG4gKiBUaGlzIGZ1bmN0aW9uIHN0YXJ0cyBiYWNrZ3JvdW5kIGluc3RhbGxhdGlvbiBvZiBtYXJrZXRwbGFjZXMgYW5kIHBsdWdpbnNcbiAqIGZyb20gdHJ1c3RlZCBzb3VyY2VzIChyZXBvc2l0b3J5IGFuZCB1c2VyIHNldHRpbmdzKSB3aXRob3V0IGJsb2NraW5nIHN0YXJ0dXAuXG4gKiBJbnN0YWxsYXRpb24gcHJvZ3Jlc3MgYW5kIGVycm9ycyBhcmUgdHJhY2tlZCBpbiBBcHBTdGF0ZSBhbmQgc2hvd24gdmlhIG5vdGlmaWNhdGlvbnMuXG4gKlxuICogU0VDVVJJVFk6IFRoaXMgZnVuY3Rpb24gaXMgb25seSBjYWxsZWQgZnJvbSBSRVBMLnRzeCBhZnRlciB0aGUgXCJ0cnVzdCB0aGlzIGZvbGRlclwiXG4gKiBkaWFsb2cgaGFzIGJlZW4gY29uZmlybWVkLiBUaGUgdHJ1c3QgZGlhbG9nIGluIGNsaS50c3ggYmxvY2tzIGFsbCBleGVjdXRpb24gdW50aWxcbiAqIHRoZSB1c2VyIGV4cGxpY2l0bHkgdHJ1c3RzIHRoZSBjdXJyZW50IHdvcmtpbmcgZGlyZWN0b3J5LCBlbnN1cmluZyB0aGF0IHBsdWdpblxuICogaW5zdGFsbGF0aW9ucyBvbmx5IGhhcHBlbiB3aXRoIHVzZXIgY29uc2VudC4gVGhpcyBwcmV2ZW50cyBtYWxpY2lvdXMgcmVwb3NpdG9yaWVzXG4gKiBmcm9tIGF1dG9tYXRpY2FsbHkgaW5zdGFsbGluZyBwbHVnaW5zIHdpdGhvdXQgdXNlciBhcHByb3ZhbC5cbiAqXG4gKiBAcGFyYW0gc2V0QXBwU3RhdGUgRnVuY3Rpb24gdG8gdXBkYXRlIGFwcCBzdGF0ZSB3aXRoIGluc3RhbGxhdGlvbiBwcm9ncmVzc1xuICovXG5leHBvcnQgYXN5bmMgZnVuY3Rpb24gcGVyZm9ybVN0YXJ0dXBDaGVja3MoXG4gIHNldEFwcFN0YXRlOiBTZXRBcHBTdGF0ZSxcbik6IFByb21pc2U8dm9pZD4ge1xuICBsb2dGb3JEZWJ1Z2dpbmcoJ3BlcmZvcm1TdGFydHVwQ2hlY2tzIGNhbGxlZCcpXG5cbiAgLy8gQ2hlY2sgaWYgdGhlIGN1cnJlbnQgZGlyZWN0b3J5IGhhcyBiZWVuIHRydXN0ZWRcbiAgaWYgKCFjaGVja0hhc1RydXN0RGlhbG9nQWNjZXB0ZWQoKSkge1xuICAgIGxvZ0ZvckRlYnVnZ2luZyhcbiAgICAgICdUcnVzdCBub3QgYWNjZXB0ZWQgZm9yIGN1cnJlbnQgZGlyZWN0b3J5IC0gc2tpcHBpbmcgcGx1Z2luIGluc3RhbGxhdGlvbnMnLFxuICAgIClcbiAgICByZXR1cm5cbiAgfVxuXG4gIHRyeSB7XG4gICAgbG9nRm9yRGVidWdnaW5nKCdTdGFydGluZyBiYWNrZ3JvdW5kIHBsdWdpbiBpbnN0YWxsYXRpb25zJylcblxuICAgIC8vIFJlZ2lzdGVyIHNlZWQgbWFya2V0cGxhY2VzIChDTEFVREVfQ09ERV9QTFVHSU5fU0VFRF9ESVIpIGJlZm9yZSBkaWZmaW5nLlxuICAgIC8vIElkZW1wb3RlbnQ7IG5vLW9wIGlmIHNlZWQgbm90IGNvbmZpZ3VyZWQuIFdpdGhvdXQgdGhpcywgYmFja2dyb3VuZCBpbnN0YWxsXG4gICAgLy8gd291bGQgc2VlIHNlZWQgbWFya2V0cGxhY2VzIGFzIG1pc3Npbmcg4oaSIGNsb25lIOKGkiBkZWZlYXRzIHNlZWQncyBwdXJwb3NlLlxuICAgIC8vXG4gICAgLy8gSWYgcmVnaXN0cmF0aW9uIGNoYW5nZWQgc3RhdGUsIGNsZWFyIGNhY2hlcyBzbyBlYXJsaWVyIHBsdWdpbi1sb2FkIHBhc3Nlc1xuICAgIC8vIChlLmcuIGdldEFsbE1jcENvbmZpZ3MgZHVyaW5nIFJFUEwgaW5pdCkgZG9uJ3Qga2VlcCBzdGFsZSBcIm1hcmtldHBsYWNlXG4gICAgLy8gbm90IGZvdW5kXCIgcmVzdWx0cy5cbiAgICBjb25zdCBzZWVkQ2hhbmdlZCA9IGF3YWl0IHJlZ2lzdGVyU2VlZE1hcmtldHBsYWNlcygpXG4gICAgaWYgKHNlZWRDaGFuZ2VkKSB7XG4gICAgICBjbGVhck1hcmtldHBsYWNlc0NhY2hlKClcbiAgICAgIGNsZWFyUGx1Z2luQ2FjaGUoJ3BlcmZvcm1TdGFydHVwQ2hlY2tzOiBzZWVkIG1hcmtldHBsYWNlcyBjaGFuZ2VkJylcbiAgICAgIC8vIFNldCBuZWVkc1JlZnJlc2ggc28gdXNlTWFuYWdlUGx1Z2lucyBub3RpZmllcyB0aGUgdXNlciB0byBydW5cbiAgICAgIC8vIC9yZWxvYWQtcGx1Z2lucy4gV2l0aG91dCB0aGlzIHNpZ25hbCwgdGhlIGluaXRpYWwgcGx1Z2luLWxvYWRcbiAgICAgIC8vICh3aGljaCByYWNlZCBhbmQgY2FjaGVkIFwibWFya2V0cGxhY2Ugbm90IGZvdW5kXCIpIHdvdWxkIHBlcnNpc3RcbiAgICAgIC8vIHVudGlsIHRoZSB1c2VyIG1hbnVhbGx5IHJlbG9hZHMuXG4gICAgICBzZXRBcHBTdGF0ZShwcmV2ID0+IHtcbiAgICAgICAgaWYgKHByZXYucGx1Z2lucy5uZWVkc1JlZnJlc2gpIHJldHVybiBwcmV2XG4gICAgICAgIHJldHVybiB7XG4gICAgICAgICAgLi4ucHJldixcbiAgICAgICAgICBwbHVnaW5zOiB7IC4uLnByZXYucGx1Z2lucywgbmVlZHNSZWZyZXNoOiB0cnVlIH0sXG4gICAgICAgIH1cbiAgICAgIH0pXG4gICAgfVxuXG4gICAgLy8gU3RhcnQgYmFja2dyb3VuZCBpbnN0YWxsYXRpb25zIHdpdGhvdXQgd2FpdGluZ1xuICAgIC8vIFRoaXMgd2lsbCB1cGRhdGUgQXBwU3RhdGUgYXMgaW5zdGFsbGF0aW9ucyBwcm9ncmVzc1xuICAgIGF3YWl0IHBlcmZvcm1CYWNrZ3JvdW5kUGx1Z2luSW5zdGFsbGF0aW9ucyhzZXRBcHBTdGF0ZSlcbiAgfSBjYXRjaCAoZXJyb3IpIHtcbiAgICAvLyBFdmVuIGlmIHNvbWV0aGluZyBmYWlscyBoZXJlLCBkb24ndCBibG9jayBzdGFydHVwXG4gICAgbG9nRm9yRGVidWdnaW5nKFxuICAgICAgYEVycm9yIGluaXRpYXRpbmcgYmFja2dyb3VuZCBwbHVnaW4gaW5zdGFsbGF0aW9uczogJHtlcnJvcn1gLFxuICAgIClcbiAgfVxufVxuIl0sIm1hcHBpbmdzIjoiQUFBQSxTQUFTQSxvQ0FBb0MsUUFBUSxxREFBcUQ7QUFDMUcsY0FBY0MsUUFBUSxRQUFRLHlCQUF5QjtBQUN2RCxTQUFTQywyQkFBMkIsUUFBUSxjQUFjO0FBQzFELFNBQVNDLGVBQWUsUUFBUSxhQUFhO0FBQzdDLFNBQ0VDLHNCQUFzQixFQUN0QkMsd0JBQXdCLFFBQ25CLHlCQUF5QjtBQUNoQyxTQUFTQyxnQkFBZ0IsUUFBUSxtQkFBbUI7QUFFcEQsS0FBS0MsV0FBVyxHQUFHLENBQUNDLENBQUMsRUFBRSxDQUFDQyxTQUFTLEVBQUVSLFFBQVEsRUFBRSxHQUFHQSxRQUFRLEVBQUUsR0FBRyxJQUFJOztBQUVqRTtBQUNBO0FBQ0E7QUFDQTtBQUNBO0FBQ0E7QUFDQTtBQUNBO0FBQ0E7QUFDQTtBQUNBO0FBQ0E7QUFDQTtBQUNBO0FBQ0E7QUFDQSxPQUFPLGVBQWVTLG9CQUFvQkEsQ0FDeENDLFdBQVcsRUFBRUosV0FBVyxDQUN6QixFQUFFSyxPQUFPLENBQUMsSUFBSSxDQUFDLENBQUM7RUFDZlQsZUFBZSxDQUFDLDZCQUE2QixDQUFDOztFQUU5QztFQUNBLElBQUksQ0FBQ0QsMkJBQTJCLENBQUMsQ0FBQyxFQUFFO0lBQ2xDQyxlQUFlLENBQ2IsMEVBQ0YsQ0FBQztJQUNEO0VBQ0Y7RUFFQSxJQUFJO0lBQ0ZBLGVBQWUsQ0FBQywwQ0FBMEMsQ0FBQzs7SUFFM0Q7SUFDQTtJQUNBO0lBQ0E7SUFDQTtJQUNBO0lBQ0E7SUFDQSxNQUFNVSxXQUFXLEdBQUcsTUFBTVIsd0JBQXdCLENBQUMsQ0FBQztJQUNwRCxJQUFJUSxXQUFXLEVBQUU7TUFDZlQsc0JBQXNCLENBQUMsQ0FBQztNQUN4QkUsZ0JBQWdCLENBQUMsaURBQWlELENBQUM7TUFDbkU7TUFDQTtNQUNBO01BQ0E7TUFDQUssV0FBVyxDQUFDRyxJQUFJLElBQUk7UUFDbEIsSUFBSUEsSUFBSSxDQUFDQyxPQUFPLENBQUNDLFlBQVksRUFBRSxPQUFPRixJQUFJO1FBQzFDLE9BQU87VUFDTCxHQUFHQSxJQUFJO1VBQ1BDLE9BQU8sRUFBRTtZQUFFLEdBQUdELElBQUksQ0FBQ0MsT0FBTztZQUFFQyxZQUFZLEVBQUU7VUFBSztRQUNqRCxDQUFDO01BQ0gsQ0FBQyxDQUFDO0lBQ0o7O0lBRUE7SUFDQTtJQUNBLE1BQU1oQixvQ0FBb0MsQ0FBQ1csV0FBVyxDQUFDO0VBQ3pELENBQUMsQ0FBQyxPQUFPTSxLQUFLLEVBQUU7SUFDZDtJQUNBZCxlQUFlLENBQ2IscURBQXFEYyxLQUFLLEVBQzVELENBQUM7RUFDSDtBQUNGIiwiaWdub3JlTGlzdCI6W119

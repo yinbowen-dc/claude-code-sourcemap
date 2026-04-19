@@ -1,5 +1,13 @@
+/**
+ * 并发会话管理模块。
+ *
+ * 在 Claude Code 系统中，该模块管理同一项目目录下多个并发 Claude 会话的状态，
+ * 通过 ~/.claude/projects/<hash>/sessions/ 目录下的锁文件追踪活跃会话：
+ * - 注册/注销当前会话
+ * - 枚举同一项目下的其他并发会话
+ * - 会话切换时自动更新状态
+ */
 import { feature } from 'bun:bundle'
-import { chmod, mkdir, readdir, readFile, unlink, writeFile } from 'fs/promises'
 import { join } from 'path'
 import {
   getOriginalCwd,
@@ -18,51 +26,56 @@ import { getAgentId } from './teammate.js'
 export type SessionKind = 'interactive' | 'bg' | 'daemon' | 'daemon-worker'
 export type SessionStatus = 'busy' | 'idle' | 'waiting'
 
+/** 返回会话 PID 文件所在目录路径（~/.claude/sessions/） */
 function getSessionsDir(): string {
   return join(getClaudeConfigHomeDir(), 'sessions')
 }
 
 /**
- * Kind override from env. Set by the spawner (`claude --bg`, daemon
- * supervisor) so the child can register without the parent having to
- * write the file for it — cleanup-on-exit wiring then works for free.
- * Gated so the env-var string is DCE'd from external builds.
+ * 从环境变量读取会话类型覆盖值。
+ *
+ * 由 spawner（`claude --bg`、daemon supervisor）在启动子进程时注入 CLAUDE_CODE_SESSION_KIND，
+ * 这样子进程可以自行注册 PID 文件，无需父进程代为写入——退出时的清理钩子也可自动生效。
+ * 通过 feature gate 控制，确保该环境变量字符串在外部构建中被 DCE 移除。
  */
 function envSessionKind(): SessionKind | undefined {
   if (feature('BG_SESSIONS')) {
     const k = process.env.CLAUDE_CODE_SESSION_KIND
+    // 仅识别已知的后台会话类型，其余值忽略
     if (k === 'bg' || k === 'daemon' || k === 'daemon-worker') return k
   }
   return undefined
 }
 
 /**
- * True when this REPL is running inside a `claude --bg` tmux session.
- * Exit paths (/exit, ctrl+c, ctrl+d) should detach the attached client
- * instead of killing the process.
+ * 判断当前 REPL 是否运行在 `claude --bg` tmux 会话中。
+ *
+ * 为 true 时，/exit、Ctrl+C、Ctrl+D 等退出路径应 detach 已附加的客户端，
+ * 而非直接杀死进程（后台会话需保持存活）。
  */
 export function isBgSession(): boolean {
   return envSessionKind() === 'bg'
 }
 
 /**
- * Write a PID file for this session and register cleanup.
+ * 为当前会话写入 PID 文件并注册退出清理钩子。
  *
- * Registers all top-level sessions — interactive CLI, SDK (vscode, desktop,
- * typescript, python, -p), bg/daemon spawns — so `claude ps` sees everything
- * the user might be running. Skips only teammates/subagents, which would
- * conflate swarm usage with genuine concurrency and pollute ps with noise.
+ * 注册范围：所有顶层会话（交互式 CLI、SDK（vscode/desktop/ts/py/-p）、bg/daemon 子进程）
+ * 均会注册，使 `claude ps` 能枚举用户正在运行的所有实例。
+ * 跳过 teammates/subagents：它们是 swarm 内部并发，混入后会污染 ps 输出。
  *
- * Returns true if registered, false if skipped.
- * Errors logged to debug, never thrown.
+ * @returns 注册成功返回 true，跳过或失败返回 false（错误记录到 debug 日志，不抛出）
  */
 export async function registerSession(): Promise<boolean> {
+  // subagent（teammate）跳过注册，避免 ps 噪音
   if (getAgentId() != null) return false
 
+  // 默认为 interactive；bg/daemon 子进程通过环境变量传入
   const kind: SessionKind = envSessionKind() ?? 'interactive'
   const dir = getSessionsDir()
   const pidFile = join(dir, `${process.pid}.json`)
 
+  // 注册退出清理：进程正常退出时删除 PID 文件
   registerCleanup(async () => {
     try {
       await unlink(pidFile)
@@ -72,6 +85,7 @@ export async function registerSession(): Promise<boolean> {
   })
 
   try {
+    // 创建 sessions 目录（权限 700，仅当前用户可访问）
     await mkdir(dir, { recursive: true, mode: 0o700 })
     await chmod(dir, 0o700)
     await writeFile(
@@ -83,9 +97,11 @@ export async function registerSession(): Promise<boolean> {
         startedAt: Date.now(),
         kind,
         entrypoint: process.env.CLAUDE_CODE_ENTRYPOINT,
+        // UDS 收件箱功能开启时写入消息套接字路径
         ...(feature('UDS_INBOX')
           ? { messagingSocketPath: process.env.CLAUDE_CODE_MESSAGING_SOCKET }
           : {}),
+        // bg 会话功能开启时写入会话名/日志路径/代理标识
         ...(feature('BG_SESSIONS')
           ? {
               name: process.env.CLAUDE_CODE_SESSION_NAME,
@@ -95,9 +111,9 @@ export async function registerSession(): Promise<boolean> {
           : {}),
       }),
     )
-    // --resume / /resume mutates getSessionId() via switchSession. Without
-    // this, the PID file's sessionId goes stale and `claude ps` sparkline
-    // reads the wrong transcript.
+    // --resume / /resume 会通过 switchSession 修改 getSessionId()。
+    // 不订阅此事件的话，PID 文件中的 sessionId 会过时，
+    // 导致 `claude ps` 的 sparkline 读取错误的对话记录。
     onSessionSwitch(id => {
       void updatePidFile({ sessionId: id })
     })
@@ -109,13 +125,15 @@ export async function registerSession(): Promise<boolean> {
 }
 
 /**
- * Update this session's name in its PID registry file so ListPeers
- * can surface it. Best-effort: silently no-op if name is falsy, the
- * file doesn't exist (session not registered), or read/write fails.
+ * 以 patch 对象更新当前进程的 PID 文件（读-改-写）。
+ *
+ * 用于更新会话名、sessionId、bridgeSessionId 等字段，供 `claude ps` 读取最新状态。
+ * 采用 best-effort 策略：文件不存在（会话未注册）或读写失败时静默忽略，记录 debug 日志。
  */
 async function updatePidFile(patch: Record<string, unknown>): Promise<void> {
   const pidFile = join(getSessionsDir(), `${process.pid}.json`)
   try {
+    // 读取当前文件内容，合并 patch 后写回
     const data = jsonParse(await readFile(pidFile, 'utf8')) as Record<
       string,
       unknown
@@ -128,6 +146,7 @@ async function updatePidFile(patch: Record<string, unknown>): Promise<void> {
   }
 }
 
+/** 更新会话名称到 PID 文件，名称为空时跳过（best-effort）。 */
 export async function updateSessionName(
   name: string | undefined,
 ): Promise<void> {
@@ -136,10 +155,10 @@ export async function updateSessionName(
 }
 
 /**
- * Record this session's Remote Control session ID so peer enumeration can
- * dedup: a session reachable over both UDS and bridge should only appear
- * once (local wins). Cleared on bridge teardown so stale IDs don't
- * suppress a legitimately-remote session after reconnect.
+ * 将当前会话的 Remote Control（桥接）session ID 写入 PID 文件。
+ *
+ * 用于对等枚举时去重：同一会话通过 UDS 和 bridge 均可达时，只显示一次（本地优先）。
+ * 桥接断开时传入 null 清除旧值，防止重连后旧 ID 错误地抑制合法的远程会话条目。
  */
 export async function updateSessionBridgeId(
   bridgeSessionId: string | null,
@@ -148,22 +167,28 @@ export async function updateSessionBridgeId(
 }
 
 /**
- * Push live activity state for `claude ps`. Fire-and-forget from REPL's
- * status-change effect — a dropped write just means ps falls back to
- * transcript-tail derivation for one refresh.
+ * 推送实时活动状态到 PID 文件，供 `claude ps` 显示。
+ *
+ * 由 REPL 的状态变更 effect 触发（fire-and-forget）；
+ * 写入失败时 ps 仅对该次刷新回退到 transcript-tail 派生状态，不影响功能。
+ * BG_SESSIONS feature gate 关闭时直接跳过。
  */
 export async function updateSessionActivity(patch: {
   status?: SessionStatus
   waitingFor?: string
 }): Promise<void> {
   if (!feature('BG_SESSIONS')) return
+  // 附加 updatedAt 时间戳，便于 ps 判断数据新鲜度
   await updatePidFile({ ...patch, updatedAt: Date.now() })
 }
 
 /**
- * Count live concurrent CLI sessions (including this one).
- * Filters out stale PID files (crashed sessions) and deletes them.
- * Returns 0 on any error (conservative).
+ * 统计当前活跃的并发 CLI 会话数（含本进程）。
+ *
+ * 遍历 sessions 目录下的 PID 文件，过滤掉因崩溃遗留的过时文件并删除之。
+ * 任何错误均返回 0（保守估计），不影响主流程。
+ * WSL 环境下跳过过时文件清理：~/.claude/sessions/ 可能通过符号链接与 Windows 原生
+ * Claude 共享，WSL 无法探测 Windows PID，会误删活跃会话的文件。
  */
 export async function countConcurrentSessions(): Promise<number> {
   const dir = getSessionsDir()
@@ -179,24 +204,20 @@ export async function countConcurrentSessions(): Promise<number> {
 
   let count = 0
   for (const file of files) {
-    // Strict filename guard: only `<pid>.json` is a candidate. parseInt's
-    // lenient prefix-parsing means `2026-03-14_notes.md` would otherwise
-    // parse as PID 2026 and get swept as stale — silent user data loss.
-    // See anthropics/claude-code#34210.
+    // 严格文件名校验：只处理 `<pid>.json` 格式的文件。
+    // parseInt 的前缀宽松解析（如 "2026-03-14_notes.md" → PID 2026）
+    // 会把用户文件误判为过时 PID 并删除——静默数据丢失。见 issue #34210。
     if (!/^\d+\.json$/.test(file)) continue
     const pid = parseInt(file.slice(0, -5), 10)
     if (pid === process.pid) {
+      // 当前进程直接计数
       count++
       continue
     }
     if (isProcessRunning(pid)) {
       count++
     } else if (getPlatform() !== 'wsl') {
-      // Stale file from a crashed session — sweep it. Skip on WSL: if
-      // ~/.claude/sessions/ is shared with Windows-native Claude (symlink
-      // or CLAUDE_CONFIG_DIR), a Windows PID won't be probeable from WSL
-      // and we'd falsely delete a live session's file. This is just
-      // telemetry so conservative undercount is acceptable.
+      // 过时文件（进程已崩溃）：清除之。WSL 下跳过（见函数注释）。
       void unlink(join(dir, file)).catch(() => {})
     }
   }

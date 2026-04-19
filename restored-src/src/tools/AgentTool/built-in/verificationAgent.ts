@@ -1,3 +1,27 @@
+/**
+ * 验证内置 Agent 定义模块
+ *
+ * 在 Claude Code AgentTool 层中，该模块定义了内置的 verification Agent——
+ * 一个专门用于对实现工作进行对抗性验证的 Agent，目标是"尝试破坏"而非"确认正确"。
+ *
+ * 核心特性：
+ * 1. 对抗性验证：不信任实现者的测试套件，独立执行验证
+ * 2. 只读模式（项目目录）：禁止修改项目文件，但允许在 /tmp 创建临时测试脚本
+ * 3. 模型：'inherit'（继承父 Agent 模型，保持充分的推理能力）
+ * 4. 颜色：red（标志性红色，提醒这是关键质量门控步骤）
+ * 5. background: true（支持后台运行，不阻塞父 Agent）
+ * 6. criticalSystemReminder_EXPERIMENTAL：强制提醒只读约束和 VERDICT 输出格式
+ *
+ * 输出格式要求：
+ * - 每次检查必须包含：实际执行的命令、命令输出、PASS/FAIL 结论
+ * - 响应末尾必须包含 VERDICT: PASS / VERDICT: FAIL / VERDICT: PARTIAL
+ *
+ * 典型调用场景：
+ * - 3 个以上文件被修改后
+ * - 后端/API 变更后
+ * - 基础设施/配置变更后
+ */
+
 import { BASH_TOOL_NAME } from 'src/tools/BashTool/toolName.js'
 import { EXIT_PLAN_MODE_TOOL_NAME } from 'src/tools/ExitPlanModeTool/constants.js'
 import { FILE_EDIT_TOOL_NAME } from 'src/tools/FileEditTool/constants.js'
@@ -7,6 +31,8 @@ import { WEB_FETCH_TOOL_NAME } from 'src/tools/WebFetchTool/prompt.js'
 import { AGENT_TOOL_NAME } from '../constants.js'
 import type { BuiltInAgentDefinition } from '../loadAgentsDir.js'
 
+// 验证 Agent 的完整系统提示
+// 包含：验证策略、失败模式识别、只读约束、输出格式要求和 VERDICT 规范
 const VERIFICATION_SYSTEM_PROMPT = `You are a verification specialist. Your job is not to confirm the implementation works — it's to try to break it.
 
 You have two documented failure patterns. First, verification avoidance: when faced with a check, you find reasons not to run it — you read code, narrate what you would test, write "PASS," and move on. Second, being seduced by the first 80%: you see a polished UI or a passing test suite and feel inclined to pass it, not noticing half the buttons do nothing, the state vanishes on refresh, or the backend crashes on bad input. The first 80% is the easy part. Your entire value is in finding the last 20%. The caller may spot-check your commands by re-running them — if a PASS step has no command output, or output that doesn't match re-execution, your report gets rejected.
@@ -128,25 +154,35 @@ Use the literal string \`VERDICT: \` followed by exactly one of \`PASS\`, \`FAIL
 - **FAIL**: include what failed, exact error output, reproduction steps.
 - **PARTIAL**: what was verified, what could not be and why (missing tool/env), what the implementer should know.`
 
+// 验证 Agent 的调用时机说明
 const VERIFICATION_WHEN_TO_USE =
   'Use this agent to verify that implementation work is correct before reporting completion. Invoke after non-trivial tasks (3+ file edits, backend/API changes, infrastructure changes). Pass the ORIGINAL user task description, list of files changed, and approach taken. The agent runs builds, tests, linters, and checks to produce a PASS/FAIL/PARTIAL verdict with evidence.'
 
+/**
+ * verification 内置 Agent 定义。
+ *
+ * 对抗性验证 Agent，通过实际执行命令（而非阅读代码）来验证实现正确性。
+ * 只读模式（项目目录），支持后台运行，使用红色标识。
+ */
 export const VERIFICATION_AGENT: BuiltInAgentDefinition = {
   agentType: 'verification',
   whenToUse: VERIFICATION_WHEN_TO_USE,
-  color: 'red',
-  background: true,
+  color: 'red',       // 红色标识：关键质量门控
+  background: true,   // 支持后台运行，不阻塞父 Agent
+  // 禁用所有可能修改项目文件的工具（/tmp 临时文件通过 Bash 重定向创建，不受此限制）
   disallowedTools: [
-    AGENT_TOOL_NAME,
-    EXIT_PLAN_MODE_TOOL_NAME,
-    FILE_EDIT_TOOL_NAME,
-    FILE_WRITE_TOOL_NAME,
-    NOTEBOOK_EDIT_TOOL_NAME,
+    AGENT_TOOL_NAME,           // 禁止启动子 Agent
+    EXIT_PLAN_MODE_TOOL_NAME,  // 禁止退出计划模式
+    FILE_EDIT_TOOL_NAME,       // 禁止文件编辑
+    FILE_WRITE_TOOL_NAME,      // 禁止文件写入
+    NOTEBOOK_EDIT_TOOL_NAME,   // 禁止 Notebook 编辑
   ],
   source: 'built-in',
   baseDir: 'built-in',
-  model: 'inherit',
+  model: 'inherit', // 继承父 Agent 模型，保持充分的推理能力
   getSystemPrompt: () => VERIFICATION_SYSTEM_PROMPT,
+  // 关键系统提醒（实验性）：在每次 API 调用中附加的强制提醒
+  // 用于防止 Agent 在长对话中忘记只读约束和 VERDICT 输出要求
   criticalSystemReminder_EXPERIMENTAL:
     'CRITICAL: This is a VERIFICATION-ONLY task. You CANNOT edit, write, or create files IN THE PROJECT DIRECTORY (tmp is allowed for ephemeral test scripts). You MUST end with VERDICT: PASS, VERDICT: FAIL, or VERDICT: PARTIAL.',
 }

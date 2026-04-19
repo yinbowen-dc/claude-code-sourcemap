@@ -1,21 +1,13 @@
 /**
- * Deep Link URI Parser
+ * Deep Link URI 解析模块。
  *
- * Parses `claude-cli://open` URIs. All parameters are optional:
- *   q    — pre-fill the prompt input (not submitted)
- *   cwd  — working directory (absolute path)
- *   repo — owner/name slug, resolved against githubRepoPaths config
+ * 在 Claude Code 系统中，该模块解析 `claude-cli://open` URI，所有参数均可选：
+ * - q：预填充 prompt 输入（不自动提交）
+ * - cwd：工作目录（绝对路径）
+ * - repo：owner/name 格式，根据 githubRepoPaths 配置解析
  *
- * Examples:
- *   claude-cli://open
- *   claude-cli://open?q=hello+world
- *   claude-cli://open?q=fix+tests&repo=owner/repo
- *   claude-cli://open?cwd=/path/to/project
- *
- * Security: values are URL-decoded, Unicode-sanitized, and rejected if they
- * contain ASCII control characters (newlines etc. can act as command
- * separators). All values are single-quote shell-escaped at the point of
- * use (terminalLauncher.ts) — that escaping is the injection boundary.
+ * 安全措施：值经过 URL 解码、Unicode 净化，并拒绝含 ASCII 控制字符的值
+ *（换行符等可作为命令分隔符）。所有值在 terminalLauncher.ts 中进行单引号 shell 转义。
  */
 
 import { partiallySanitizeUnicode } from '../sanitization.js'

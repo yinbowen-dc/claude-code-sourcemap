@@ -1,3 +1,26 @@
+/**
+ * BashTool/readOnlyValidation.ts
+ *
+ * 【在 Claude Code 系统中的位置】
+ * 本文件属于 BashTool 工具模块，负责 BashTool 的只读命令验证逻辑。
+ * 当用户开启只读模式时，BashTool 会先经过本文件校验命令是否为只读操作，
+ * 通过则自动放行（behavior: 'allow'），否则转交其他权限检查。
+ *
+ * 【主要功能】
+ * - CommandConfig 类型：声明式命令配置结构（安全 flag 列表、正则、危险回调）。
+ * - FD_SAFE_FLAGS：fd/fdfind 命令的安全 flag 集合（共享，避免重复定义）。
+ * - COMMAND_ALLOWLIST：基于 flag 白名单的命令校验总配置（涵盖 git、grep、ps 等数十个命令）。
+ * - ANT_ONLY_COMMAND_ALLOWLIST：ant 用户专属命令白名单（gh、aki 等需网络的命令）。
+ * - getCommandAllowlist：运行时构建最终白名单（含平台分支和用户类型分支）。
+ * - SAFE_TARGET_COMMANDS_FOR_XARGS：xargs 安全目标命令列表。
+ * - isCommandSafeViaFlagParsing：基于白名单配置的声明式命令安全性检查核心函数。
+ * - makeRegexForSafeCommand：为简单只读命令生成安全正则的工厂函数。
+ * - READONLY_COMMANDS / READONLY_COMMAND_REGEXES：基于正则的只读命令集合（次级防线）。
+ * - containsUnquotedExpansion：检测命令中是否含未引用的 glob 或 $ 变量展开。
+ * - isCommandReadOnly：判断单条子命令是否只读（内部工具函数）。
+ * - commandHasAnyGit / commandWritesToGitInternalPaths：git 沙箱逃逸防护辅助函数。
+ * - checkReadOnlyConstraints：对外导出的只读约束入口，供 BashTool 权限流程调用。
+ */
 import type { z } from 'zod/v4'
 import { getOriginalCwd } from '../../bootstrap/state.js'
 import {
@@ -31,6 +54,19 @@ import {
 } from './pathValidation.js'
 import { sedCommandIsAllowedByAllowlist } from './sedValidation.js'
 
+/**
+ * CommandConfig
+ *
+ * 【说明】
+ * 声明式命令验证配置类型，供 COMMAND_ALLOWLIST 中每条命令使用。
+ * - safeFlags：命令支持的安全 flag 列表及其参数类型（none/string/number/...）；
+ *   未列出的 flag 均被视为不安全，自动拒绝。
+ * - regex：可选的额外正则校验，补充 flag 验证之外的命令结构检查。
+ * - additionalCommandIsDangerousCallback：可选的自定义危险性回调，返回 true 表示危险。
+ *   与 safeFlags 校验配合使用，实现更细粒度的安全判断。
+ * - respectsDoubleDash：是否遵守 POSIX `--` 结束选项分隔符；
+ *   为 false 时 validateFlags 在 `--` 后继续检查 flag（如 macOS base64）。
+ */
 // Unified command validation configuration system
 type CommandConfig = {
   // A Record mapping from the command (e.g. `xargs` or `git diff`) to its safe flags and the values they accept
@@ -49,6 +85,17 @@ type CommandConfig = {
   respectsDoubleDash?: boolean
 }
 
+/**
+ * FD_SAFE_FLAGS
+ *
+ * 【说明】
+ * fd 和 fdfind（Debian/Ubuntu 包名）共用的安全 flag 集合。
+ * 刻意排除 -x/--exec 和 -X/--exec-batch：
+ *   这两个 flag 会对每个搜索结果执行任意命令，存在命令执行风险。
+ * 同时排除 -l/--list-details：
+ *   内部会以子进程方式调用 ls（与 --exec-batch 同路径），
+ *   若 PATH 中存在恶意 ls 二进制则有 PATH 劫持风险。
+ */
 // Shared safe flags for fd and fdfind (Debian/Ubuntu package name)
 // SECURITY: -x/--exec and -X/--exec-batch are deliberately excluded —
 // they execute arbitrary commands for each search result.
@@ -122,9 +169,24 @@ const FD_SAFE_FLAGS: Record<string, FlagArgType> = {
   '--format': 'string',
 }
 
-// Central configuration for allowlist-based command validation
-// All commands and flags here should only allow reading files. They should not
-// allow writing to files, executing code, or creating network requests.
+/**
+ * COMMAND_ALLOWLIST
+ *
+ * 【说明】
+ * 基于 flag 白名单的命令验证总配置，是 isCommandSafeViaFlagParsing 的核心数据结构。
+ * 每条记录的键为命令名称（或多词命令如 "git diff"），值为 CommandConfig。
+ *
+ * 【设计原则】
+ * - safeFlags 中仅列出经过人工审查的安全 flag，未列出的 flag 全部自动拒绝。
+ * - 对于语义复杂的命令（如 ps、date、hostname），配合 additionalCommandIsDangerousCallback
+ *   进行额外的参数级安全判断。
+ * - 对于存在已知危险 flag 的命令，在注释中明确标注为 SECURITY: ... EXCLUDED 并说明原因。
+ * - 所有命令和 flag 应仅允许读取文件，不允许写入文件、执行代码或发起网络请求。
+ *
+ * Central configuration for allowlist-based command validation
+ * All commands and flags here should only allow reading files. They should not
+ * allow writing to files, executing code, or creating network requests.
+ */
 const COMMAND_ALLOWLIST: Record<string, CommandConfig> = {
   xargs: {
     safeFlags: {
@@ -1136,8 +1198,19 @@ const COMMAND_ALLOWLIST: Record<string, CommandConfig> = {
   ...DOCKER_READ_ONLY_COMMANDS,
 }
 
-// gh commands are ant-only since they make network requests, which goes against
-// the read-only validation principle of no network access
+/**
+ * ANT_ONLY_COMMAND_ALLOWLIST
+ *
+ * 【说明】
+ * ant 用户专属命令白名单（ant = Anthropic 内部员工）。
+ * 此白名单中的命令会发起网络请求，与只读验证的"禁止网络访问"原则不符，
+ * 因此仅对 ant 用户开放。目前包含：
+ *   - GH_READ_ONLY_COMMANDS：gh（GitHub CLI）只读命令集合
+ *   - aki：Anthropic 内部知识库搜索 CLI（网络只读，--audit-csv 已排除：会写磁盘）
+ *
+ * gh commands are ant-only since they make network requests, which goes against
+ * the read-only validation principle of no network access
+ */
 const ANT_ONLY_COMMAND_ALLOWLIST: Record<string, CommandConfig> = {
   // All gh read-only commands from shared validation map
   ...GH_READ_ONLY_COMMANDS,
@@ -1198,6 +1271,15 @@ const ANT_ONLY_COMMAND_ALLOWLIST: Record<string, CommandConfig> = {
   },
 }
 
+/**
+ * getCommandAllowlist
+ *
+ * 【函数作用】
+ * 运行时构建最终有效的命令白名单，处理平台差异和用户类型分支：
+ *   - Windows：排除 xargs（xargs 可用于 UNC 路径 data→code 桥接攻击，
+ *     文件内容中的 UNC 路径无法被正则检测捕获）。
+ *   - ant 用户：合并 ANT_ONLY_COMMAND_ALLOWLIST（gh、aki 等需网络的命令）。
+ */
 function getCommandAllowlist(): Record<string, CommandConfig> {
   let allowlist: Record<string, CommandConfig> = COMMAND_ALLOWLIST
   // On Windows, xargs can be used as a data-to-code bridge: if a file contains
@@ -1215,6 +1297,20 @@ function getCommandAllowlist(): Record<string, CommandConfig> {
 }
 
 /**
+ * SAFE_TARGET_COMMANDS_FOR_XARGS
+ *
+ * 【说明】
+ * 允许作为 xargs 目标命令自动放行的安全命令列表。
+ *
+ * 【安全要求】
+ * 仅当一个命令满足以下所有条件时，才可加入此列表：
+ *   1. 没有任何可写文件的 flag（如 find 的 -fprint、sed 的 -i）
+ *   2. 没有任何可执行代码的 flag（如 find 的 -exec、awk 的 system()）
+ *   3. 不发起网络请求
+ * 这些命令必须是纯粹的只读工具。当 xargs 使用此列表中的命令作为目标时，
+ * isCommandSafeViaFlagParsing 在目标命令之后停止校验 flag（见其中的 break），
+ * 因此目标命令本身不能有任何危险 flag，而不仅仅是安全子集。
+ *
  * Commands that are safe to use as xargs targets for auto-approval.
  *
  * SECURITY: Only add a command to this list if it has NO flags that can:
@@ -1239,6 +1335,25 @@ const SAFE_TARGET_COMMANDS_FOR_XARGS = [
 ]
 
 /**
+ * isCommandSafeViaFlagParsing
+ *
+ * 【函数作用】
+ * 基于 COMMAND_ALLOWLIST 白名单配置的声明式命令安全性检查核心函数。
+ * 是 isCommandReadOnly 的主要检查路径（优先级高于正则回退）。
+ *
+ * 【执行流程】
+ *   1. 使用 shell tokenizer 解析命令（glob token 转为字符串）；
+ *   2. 若命令含操作符（管道、重定向等），直接返回 false（上游已拆分）；
+ *   3. 在 allowlist 中查找最长匹配的命令前缀（支持多词命令如 "git diff"）；
+ *   4. git ls-remote 特殊处理：拒绝含 URL/remote 的参数（防数据泄露）；
+ *   5. 安全关键：拒绝命令前缀之后任何含 $ 的 token（变量展开无法静态确认安全）
+ *      以及含 { + , 或 .. 的 token（大括号展开混淆）；
+ *   6. 调用 validateFlags 校验 flag 白名单；
+ *   7. 若有 regex 则校验；无 regex 则拒绝含反引号的命令；
+ *   8. grep/rg 额外拒绝含换行的命令（防注入）；
+ *   9. 若有 additionalCommandIsDangerousCallback 则调用；
+ *  10. 全部通过则返回 true。
+ *
  * Unified command validation function that replaces individual validator functions.
  * Uses declarative configuration from COMMAND_ALLOWLIST to validate commands and their flags.
  * Handles combined flags, argument validation, and shell quoting bypass detection.
@@ -1408,6 +1523,16 @@ export function isCommandSafeViaFlagParsing(command: string): boolean {
 }
 
 /**
+ * makeRegexForSafeCommand
+ *
+ * 【函数作用】
+ * 为简单只读命令生成安全正则模式的工厂函数。
+ * 生成的正则阻断以下模式：
+ *   - Shell 元字符（可能导致命令注入或重定向）
+ *   - 反引号或 $() 形式的命令替换
+ *   - 可能含恶意载荷的变量展开
+ *   - 环境变量赋值绕过（command=value 形式）
+ *
  * Creates a regex pattern that matches safe invocations of a command.
  *
  * The regex ensures commands are invoked safely by blocking:
@@ -1424,11 +1549,21 @@ function makeRegexForSafeCommand(command: string): RegExp {
   return new RegExp(`^${command}(?:\\s|$)[^<>()$\`|{}&;\\n\\r]*$`)
 }
 
-// Simple commands that are safe for execution (converted to regex patterns using makeRegexForSafeCommand)
-// WARNING: If you are adding new commands here, be very careful to ensure
-// they are truly safe. This includes ensuring:
-// 1. That they don't have any flags that allow file writing or command execution
-// 2. Use makeRegexForSafeCommand() to ensure proper regex pattern creation
+/**
+ * READONLY_COMMANDS
+ *
+ * 【说明】
+ * 简单只读命令列表，通过 makeRegexForSafeCommand 转换为安全正则后加入 READONLY_COMMAND_REGEXES。
+ * 警告：在此列表中新增命令前，请仔细确认：
+ *   1. 命令不含任何允许写入文件或执行代码的 flag；
+ *   2. 使用 makeRegexForSafeCommand() 确保正则模式正确创建。
+ *
+ * Simple commands that are safe for execution (converted to regex patterns using makeRegexForSafeCommand)
+ * WARNING: If you are adding new commands here, be very careful to ensure
+ * they are truly safe. This includes ensuring:
+ * 1. That they don't have any flags that allow file writing or command execution
+ * 2. Use makeRegexForSafeCommand() to ensure proper regex pattern creation
+ */
 const READONLY_COMMANDS = [
   // Cross-platform commands from shared validation
   ...EXTERNAL_READONLY_COMMANDS,
@@ -1502,6 +1637,17 @@ const READONLY_COMMANDS = [
   'pr', // Paginate files for printing
 ]
 
+/**
+ * READONLY_COMMAND_REGEXES
+ *
+ * 【说明】
+ * 基于正则的只读命令集合，是 isCommandReadOnly 的次级检查路径（isCommandSafeViaFlagParsing 优先）。
+ * 包含：
+ *   - READONLY_COMMANDS 中的简单命令（经 makeRegexForSafeCommand 转换）
+ *   - 需要定制正则的复杂命令（如 echo、git、jq、find、ls、cd 等）
+ * 警告：尽量避免在此处新增正则，优先将命令添加到 COMMAND_ALLOWLIST，
+ *   基于 flag 白名单的方式更安全，可规避 gnu getopt_long 的已知漏洞。
+ */
 // Complex commands that require custom regex patterns
 // Warning: If possible, avoid adding new regexes here and prefer using COMMAND_ALLOWLIST
 // instead. This allowlist-based approach to CLI flags is more secure and avoids
@@ -1597,6 +1743,28 @@ const READONLY_COMMAND_REGEXES = new Set([
  * @param command The command string to check
  * @returns true if the command contains unquoted glob or expandable `$`
  */
+/**
+ * containsUnquotedExpansion
+ *
+ * 【函数作用】
+ * 检测命令字符串中是否含有引号外的 glob 字符（?、*、[、]）
+ * 或可展开的 $ 变量引用，这些内容可能导致运行时展开绕过正则安全检查。
+ *
+ * 【安全背景】
+ * - glob 展开：`python *` 如果存在名为 `--help` 的文件，会展开为 `python --help`。
+ * - 变量展开：`uniq --skip-chars=0$_` → $_ 展开为上条命令的最后参数，
+ *   通过 IFS word splitting 将位置参数注入到"仅允许 flag"的正则中。
+ * - $ 仅在单引号内是字面量；在双引号和无引号上下文中均会展开。
+ * - glob 仅在双引号和单引号内是字面量；在无引号上下文中展开。
+ *
+ * 【实现细节】
+ * - 逐字符跟踪引号状态（单引号/双引号/转义），避免误报已引用的内容。
+ * - 安全注意：反斜杠 \ 仅在单引号外具有转义语义；
+ *   否则 `'\'` 会使解析器脱轨，导致后续展开漏检（见注释中的 Defense-in-depth 说明）。
+ *
+ * @param command The command string to check
+ * @returns true if the command contains unquoted glob or expandable `$`
+ */
 function containsUnquotedExpansion(command: string): boolean {
   // Track quote state to avoid false positives for patterns inside quoted strings
   let inSingleQuote = false
@@ -1669,6 +1837,19 @@ function containsUnquotedExpansion(command: string): boolean {
 }
 
 /**
+ * isCommandReadOnly
+ *
+ * 【函数作用】
+ * 判断单条子命令字符串是否为只读命令（内部工具函数）。
+ *
+ * 【执行流程】
+ *   1. 处理末尾的 `2>&1` 重定向（仅此模式安全，移除后再校验）；
+ *   2. 检测 Windows UNC 路径（可能触发 WebDAV 攻击），有则直接返回 false；
+ *   3. 调用 containsUnquotedExpansion 检测未引用的 glob 或 $ 变量展开；
+ *   4. 调用 isCommandSafeViaFlagParsing（白名单 flag 校验，优先路径）；
+ *   5. 若白名单未命中，遍历 READONLY_COMMAND_REGEXES（正则回退路径）；
+ *      匹配成功后还需额外排除 git 的危险 flag（-c、--exec-path、--config-env）。
+ *
  * Checks if a single command string is read-only based on READONLY_COMMAND_REGEXES.
  * Internal helper function that validates individual commands.
  *
@@ -1752,6 +1933,12 @@ function isCommandReadOnly(command: string): boolean {
 }
 
 /**
+ * commandHasAnyGit
+ *
+ * 【函数作用】
+ * 检测复合命令中是否含有任何 git 子命令。
+ * 用于 checkReadOnlyConstraints 中的多项 git 沙箱逃逸防护检查前置条件。
+ *
  * Checks if a compound command contains any git command.
  *
  * @param command The full command string to check
@@ -1764,6 +1951,13 @@ function commandHasAnyGit(command: string): boolean {
 }
 
 /**
+ * GIT_INTERNAL_PATTERNS
+ *
+ * 【说明】
+ * git 内部路径模式列表，用于检测命令是否向 git 内部路径写入。
+ * 若命令创建了这些文件后再运行 git，git 可能执行来自新建文件的恶意 hook，
+ * 实现沙箱逃逸攻击。
+ *
  * Git-internal path patterns that can be exploited for sandbox escape.
  * If a command creates these files and then runs git, the git command
  * could execute malicious hooks from the created files.
@@ -1776,6 +1970,12 @@ const GIT_INTERNAL_PATTERNS = [
 ]
 
 /**
+ * isGitInternalPath
+ *
+ * 【函数作用】
+ * 判断给定路径是否为 git 内部路径（HEAD、objects/、refs/、hooks/）。
+ * 归一化路径（去除开头的 ./ 或 /）后与 GIT_INTERNAL_PATTERNS 逐一匹配。
+ *
  * Checks if a path is a git-internal path (HEAD, objects/, refs/, hooks/).
  */
 function isGitInternalPath(path: string): boolean {
@@ -1784,10 +1984,25 @@ function isGitInternalPath(path: string): boolean {
   return GIT_INTERNAL_PATTERNS.some(pattern => pattern.test(normalized))
 }
 
+/**
+ * NON_CREATING_WRITE_COMMANDS
+ *
+ * 【说明】
+ * 仅删除或原地修改文件的命令集合（不在新路径创建文件）。
+ * extractWritePathsFromSubcommand 中排除这些命令，
+ * 因为它们不会在新路径创建文件，不涉及 git 内部路径写入攻击向量。
+ */
 // Commands that only delete or modify in-place (don't create new files at new paths)
 const NON_CREATING_WRITE_COMMANDS = new Set(['rm', 'rmdir', 'sed'])
 
 /**
+ * extractWritePathsFromSubcommand
+ *
+ * 【函数作用】
+ * 从单条子命令中提取可能写入的目标路径列表，
+ * 仅考虑能在新路径创建文件/目录的写/创建类命令（排除 rm/rmdir/sed 等原地操作命令）。
+ * 供 commandWritesToGitInternalPaths 判断是否存在 git 内部路径写入风险。
+ *
  * Extracts write paths from a subcommand using PATH_EXTRACTORS.
  * Only returns paths for commands that can create new files/directories
  * (write/create operations excluding deletion and in-place modification).
@@ -1823,6 +2038,17 @@ function extractWritePathsFromSubcommand(subcommand: string): string[] {
 }
 
 /**
+ * commandWritesToGitInternalPaths
+ *
+ * 【函数作用】
+ * 检测复合命令中是否有子命令向 git 内部路径写入内容。
+ * 用于防御"创建恶意 git 内部文件后运行 git 触发 hook 执行"的沙箱逃逸攻击。
+ *
+ * 【检测方式】
+ *   1. 通过 extractWritePathsFromSubcommand 提取路径类命令（mkdir/touch/cp/mv）的目标路径；
+ *   2. 通过 extractOutputRedirections 提取输出重定向目标（如 `echo x > hooks/pre-commit`）；
+ *   3. 对所有提取到的路径调用 isGitInternalPath 判断是否命中 git 内部路径。
+ *
  * Checks if a compound command writes to any git-internal paths.
  * This is used to detect potential sandbox escape attacks where a command
  * creates git-internal files (HEAD, objects/, refs/, hooks/) and then runs git.
@@ -1864,6 +2090,23 @@ function commandWritesToGitInternalPaths(command: string): boolean {
 }
 
 /**
+ * checkReadOnlyConstraints
+ *
+ * 【函数作用】
+ * 对外导出的只读约束入口函数，供 BashTool 权限流程调用。
+ * 判断输入命令是否满足只读约束，是则返回 behavior: 'allow' 自动放行，
+ * 否则返回 behavior: 'passthrough' 转交后续权限检查。
+ *
+ * 【执行流程】
+ *   1. 尝试解析命令（不可解析则 passthrough）；
+ *   2. 对原始命令执行 bashCommandIsSafe_DEPRECATED 安全预检；
+ *   3. 检测 Windows UNC 路径（behavior: 'ask'）；
+ *   4. 检测 cd + git 复合命令（防 git hook 沙箱逃逸，passthrough）；
+ *   5. 检测裸 git 仓库目录下运行 git（防恶意 hook，passthrough）；
+ *   6. 检测写入 git 内部路径后运行 git（防动态创建 hook，passthrough）；
+ *   7. 沙箱启用时，非原始 cwd 下的 git 命令转交权限检查（防竞态条件）；
+ *   8. 拆分为子命令逐一校验 isCommandReadOnly，全部只读则 allow，否则 passthrough。
+ *
  * Checks read-only constraints for bash commands.
  * This is the single exported function that validates whether a command is read-only.
  * It handles compound commands, sandbox mode, and safety checks.

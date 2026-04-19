@@ -1,3 +1,21 @@
+/**
+ * 文件操作分析模块。
+ *
+ * 在 Claude Code 系统中，该模块为文件读写操作提供隐私安全的分析埋点，
+ * 通过哈希摘要替代原始路径与内容，确保上报数据不含敏感信息：
+ * - hashFilePath()：生成文件路径的 16 字符 SHA256 截断哈希，用于路径级统计
+ * - hashFileContent()：生成文件内容的完整 SHA256 哈希，用于去重与变更检测
+ * - 封装 logEvent 调用，统一上报 read/write/edit 等操作的分析元数据
+ */
+/**
+ * 文件操作分析模块。
+ *
+ * 在 Claude Code 系统中，该模块为文件读写操作提供隐私安全的分析埋点，
+ * 通过哈希摘要替代原始路径与内容，确保上报数据不含敏感信息：
+ * - hashFilePath()：生成文件路径的 16 字符 SHA256 截断哈希，用于路径级统计
+ * - hashFileContent()：生成文件内容的完整 SHA256 哈希，用于去重与变更检测
+ * - 封装 logEvent 调用，统一上报 read/write/edit 等操作的分析元数据
+ */
 import { createHash } from 'crypto'
 import type { AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS } from 'src/services/analytics/index.js'
 import { logEvent } from 'src/services/analytics/index.js'

@@ -1,8 +1,25 @@
 /**
- * Shared helper functions for plugin installation
+ * 插件安装辅助函数模块 — Claude Code 插件系统的安装调度层
  *
- * This module contains common utilities used across the plugin installation
- * system to reduce code duplication and improve maintainability.
+ * 在 Claude Code 插件系统中，此文件封装了插件安装流程中的公共操作，
+ * 被 CLI 路径（installPluginOp）和交互式 UI 路径（installPluginFromMarketplace）共用：
+ *
+ *   市场条目（PluginMarketplaceEntry）
+ *     → installResolvedPlugin（核心安装逻辑）
+ *       → 策略检查 → 依赖闭包解析 → settings 写回 → 缓存物化 → 清空缓存
+ *     → installPluginFromMarketplace（UI 包装：错误捕获 + 遥测 + 消息格式化）
+ *
+ * 关键职责：
+ *   - validatePathWithinBase：防止路径遍历攻击
+ *   - cacheAndRegisterPlugin：下载/复制到版本化缓存路径，并注册到 installed_plugins.json
+ *   - registerPluginInstallation：仅注册，不下载（本地来源插件）
+ *   - parsePluginId：解析 \"plugin@marketplace\" 格式
+ *   - installResolvedPlugin：安装核心逻辑（策略检查 + 依赖解析 + 写回 + 物化）
+ *   - installPluginFromMarketplace：UI 路径入口（包装 installResolvedPlugin）
+ *
+ * 遥测注意：
+ *   - 官方市场的插件 ID 写入 additional_metadata，第三方写 'third-party'（脱敏）
+ *   - 插件名称和市场名称路由到 _PROTO_* PII 标记的 BQ 列
  */
 
 import { randomBytes } from 'crypto'
@@ -59,41 +76,49 @@ import {
 } from './zipCache.js'
 
 /**
- * Plugin installation metadata for installed_plugins.json
+ * installed_plugins.json 中的插件安装元数据类型
  */
 export type PluginInstallationInfo = {
-  pluginId: string
-  installPath: string
-  version?: string
+  pluginId: string    // 插件 ID（格式：\"plugin@marketplace\"）
+  installPath: string // 安装路径
+  version?: string    // 可选的版本字符串
 }
 
 /**
- * Get current ISO timestamp
+ * 获取当前 ISO 格式时间戳字符串。
+ * 用于记录 installedAt 和 lastUpdated 时间。
+ *
+ * @returns ISO 8601 格式的时间戳字符串
  */
 export function getCurrentTimestamp(): string {
   return new Date().toISOString()
 }
 
 /**
- * Validate that a resolved path stays within a base directory.
- * Prevents path traversal attacks where malicious paths like './../../../etc/passwd'
- * could escape the expected directory.
+ * 验证解析后的路径是否在指定的基础目录内。
  *
- * @param basePath - The base directory that the resolved path must stay within
- * @param relativePath - The relative path to validate
- * @returns The validated absolute path
- * @throws Error if the path would escape the base directory
+ * 安全目的：防止路径遍历攻击（malicious paths like '../../../etc/passwd'
+ * 可能逃逸出预期的目录）。
+ *
+ * 实现细节：
+ *   - 拼接路径分隔符（sep）到 normalizedBase，避免部分目录名误匹配
+ *     （例如 /foo/bar 不应匹配 /foo/barbaz）
+ *   - 同时允许解析结果等于 basePath 本身（无尾部分隔符的场景）
+ *
+ * @param basePath - 解析结果必须在其内的基础目录
+ * @param relativePath - 待验证的相对路径
+ * @returns 验证通过后的绝对路径
+ * @throws Error 若路径会逃逸出基础目录
  */
 export function validatePathWithinBase(
   basePath: string,
   relativePath: string,
 ): string {
   const resolvedPath = resolve(basePath, relativePath)
+  // 追加路径分隔符，防止部分目录名误匹配
   const normalizedBase = resolve(basePath) + sep
 
-  // Check if the resolved path starts with the base path
-  // Adding sep ensures we don't match partial directory names
-  // e.g., /foo/bar should not match /foo/barbaz
+  // 检查解析后的路径是否以基础目录路径为前缀
   if (
     !resolvedPath.startsWith(normalizedBase) &&
     resolvedPath !== resolve(basePath)
@@ -107,23 +132,25 @@ export function validatePathWithinBase(
 }
 
 /**
- * Cache a plugin (local or external) and add it to installed_plugins.json
+ * 缓存插件（本地或外部来源）并将其添加到 installed_plugins.json。
  *
- * This function combines the common pattern of:
- * 1. Caching a plugin to ~/.claude/plugins/cache/
- * 2. Adding it to the installed plugins registry
+ * 此函数封装了安装流程中的公共模式：
+ *   1. 缓存插件到 ~/.claude/plugins/cache/（调用 cachePlugin）
+ *   2. 计算版本号（manifest.version > provided > git SHA > 'unknown'）
+ *   3. 将缓存目录移动到版本化路径 cache/marketplace/plugin/version/
+ *      - 特殊情况：若版本化路径是缓存路径的子目录（市场名 = 插件名），
+ *        先移动到临时路径再移动到最终位置，避免自我嵌套
+ *   4. Zip 缓存模式下：将目录转换为 ZIP 文件（用于 Filestore 挂载场景）
+ *   5. 添加到 installed_plugins.json（含 scope 和 projectPath）
  *
- * Both local plugins (with string source like "./path") and external plugins
- * (with object source like {source: "github", ...}) are cached to the same
- * location to ensure consistent behavior.
+ * 本地插件和外部插件均写入相同的缓存位置，保证行为一致性。
  *
- * @param pluginId - Plugin ID in "plugin@marketplace" format
- * @param entry - Plugin marketplace entry
- * @param scope - Installation scope (user, project, local, or managed). Defaults to 'user'.
- *                'managed' scope is used for plugins installed automatically from managed settings.
- * @param projectPath - Project path (required for project/local scopes)
- * @param localSourcePath - For local plugins, the resolved absolute path to the source directory
- * @returns The installation path
+ * @param pluginId - 插件 ID（格式：\"plugin@marketplace\"）
+ * @param entry - 插件市场条目
+ * @param scope - 安装作用域，默认为 'user'
+ * @param projectPath - project/local 作用域需要项目路径
+ * @param localSourcePath - 本地插件源目录的解析绝对路径
+ * @returns 最终安装路径（版本化路径或 ZIP 路径）
  */
 export async function cacheAndRegisterPlugin(
   pluginId: string,
@@ -132,27 +159,27 @@ export async function cacheAndRegisterPlugin(
   projectPath?: string,
   localSourcePath?: string,
 ): Promise<string> {
-  // For local plugins, we need the resolved absolute path
-  // Cast to PluginSource since cachePlugin handles any string path at runtime
+  // 本地插件使用解析后的绝对路径作为 source，确保 cachePlugin 能找到正确位置
   const source: PluginSource =
     typeof entry.source === 'string' && localSourcePath
       ? (localSourcePath as PluginSource)
       : entry.source
 
+  // 步骤 1：调用 cachePlugin 缓存插件内容
   const cacheResult = await cachePlugin(source, {
     manifest: entry as PluginMarketplaceEntry,
   })
 
-  // For local plugins, use the original source path for Git SHA calculation
-  // because the cached temp directory doesn't have .git (it's copied from a
-  // subdirectory of the marketplace git repo). For external plugins, use the
-  // cached path. For git-subdir sources, cachePlugin already captured the SHA
-  // before discarding the ephemeral clone (the extracted subdir has no .git).
+  // 步骤 2：确定用于计算 git SHA 的路径
+  // 本地插件：使用原始来源路径（缓存临时目录无 .git）
+  // 外部插件：使用缓存路径
+  // git-subdir：cachePlugin 已在丢弃临时克隆前捕获 SHA
   const pathForGitSha = localSourcePath || cacheResult.path
   const gitCommitSha =
     cacheResult.gitCommitSha ?? (await getGitCommitSha(pathForGitSha))
 
   const now = getCurrentTimestamp()
+  // 步骤 2b：计算版本号（优先级：manifest > provided > git SHA > 'unknown'）
   const version = await calculatePluginVersion(
     pluginId,
     entry.source,
@@ -162,31 +189,30 @@ export async function cacheAndRegisterPlugin(
     cacheResult.gitCommitSha,
   )
 
-  // Move the cached plugin to the versioned path: cache/marketplace/plugin/version/
+  // 步骤 3：将缓存目录移动到版本化路径 cache/marketplace/plugin/version/
   const versionedPath = getVersionedCachePath(pluginId, version)
   let finalPath = cacheResult.path
 
-  // Only move if the paths are different and plugin was cached to a different location
+  // 只在路径不同时才需要移动
   if (cacheResult.path !== versionedPath) {
-    // Create the versioned directory structure
+    // 创建版本化目录结构
     await getFsImplementation().mkdir(dirname(versionedPath))
 
-    // Remove existing versioned path if present (force: no-op if missing)
+    // 移除已存在的版本化路径（force: 路径不存在时不报错）
     await rm(versionedPath, { recursive: true, force: true })
 
-    // Check if versionedPath is a subdirectory of cacheResult.path
-    // This happens when marketplace name equals plugin name (e.g., "exa-mcp-server@exa-mcp-server")
-    // In this case, we can't directly rename because we'd be moving a directory into itself
+    // 检查版本化路径是否是缓存路径的子目录
+    // 当市场名 = 插件名时会触发（如 "exa-mcp-server@exa-mcp-server"）
+    // 不能直接 rename，因为会把目录移动到自身的子目录中
     const normalizedCachePath = cacheResult.path.endsWith(sep)
       ? cacheResult.path
       : cacheResult.path + sep
     const isSubdirectory = versionedPath.startsWith(normalizedCachePath)
 
     if (isSubdirectory) {
-      // Move to a temp location first, then to final destination
-      // We can't directly rename/copy a directory into its own subdirectory
-      // Use the parent of cacheResult.path (same filesystem) to avoid EXDEV
-      // errors when /tmp is on a different filesystem (e.g., tmpfs)
+      // 先移到临时位置，再移到最终目标
+      // 临时路径放在 cacheResult.path 的父目录（同文件系统），
+      // 避免 /tmp 跨文件系统 EXDEV 错误（e.g., tmpfs）
       const tempPath = join(
         dirname(cacheResult.path),
         `.claude-plugin-temp-${Date.now()}-${randomBytes(4).toString('hex')}`,
@@ -195,20 +221,21 @@ export async function cacheAndRegisterPlugin(
       await getFsImplementation().mkdir(dirname(versionedPath))
       await rename(tempPath, versionedPath)
     } else {
-      // Move the cached plugin to the versioned location
+      // 直接移动到版本化位置
       await rename(cacheResult.path, versionedPath)
     }
     finalPath = versionedPath
   }
 
-  // Zip cache mode: convert directory to ZIP and remove the directory
+  // 步骤 4：Zip 缓存模式——将目录转换为 ZIP 并删除原目录
+  // 用于 Filestore 挂载的短暂容器场景（CLAUDE_CODE_PLUGIN_USE_ZIP_CACHE 环境变量）
   if (isPluginZipCacheEnabled()) {
     const zipPath = getVersionedZipCachePath(pluginId, version)
     await convertDirectoryToZipInPlace(finalPath, zipPath)
     finalPath = zipPath
   }
 
-  // Add to both V1 and V2 installed_plugins files with correct scope
+  // 步骤 5：注册到 installed_plugins.json（V1 + V2 格式，含正确的 scope）
   addInstalledPlugin(
     pluginId,
     {
@@ -226,15 +253,14 @@ export async function cacheAndRegisterPlugin(
 }
 
 /**
- * Register a plugin installation without caching
+ * 注册插件安装信息，不执行缓存/下载操作。
  *
- * Used for local plugins that are already on disk and don't need remote caching.
- * External plugins should use cacheAndRegisterPlugin() instead.
+ * 适用于本地插件（已在磁盘上，无需远程缓存）。
+ * 外部插件应使用 cacheAndRegisterPlugin()。
  *
- * @param info - Plugin installation information
- * @param scope - Installation scope (user, project, local, or managed). Defaults to 'user'.
- *                'managed' scope is used for plugins registered from managed settings.
- * @param projectPath - Project path (required for project/local scopes)
+ * @param info - 插件安装信息（ID、路径、版本）
+ * @param scope - 安装作用域，默认为 'user'
+ * @param projectPath - project/local 作用域需要项目路径
  */
 export function registerPluginInstallation(
   info: PluginInstallationInfo,
@@ -242,6 +268,7 @@ export function registerPluginInstallation(
   projectPath?: string,
 ): void {
   const now = getCurrentTimestamp()
+  // 直接写入 installed_plugins.json，不执行任何文件系统操作
   addInstalledPlugin(
     info.pluginId,
     {
@@ -256,15 +283,20 @@ export function registerPluginInstallation(
 }
 
 /**
- * Parse plugin ID into components
+ * 解析插件 ID 字符串为名称和市场名称两个组件。
  *
- * @param pluginId - Plugin ID in "plugin@marketplace" format
- * @returns Parsed components or null if invalid
+ * 与 pluginIdentifier.ts 的 parsePluginIdentifier 的区别：
+ *   此函数要求严格的 \"name@marketplace\" 格式（恰好一个 '@'，两侧非空），
+ *   不满足时返回 null。
+ *
+ * @param pluginId - 格式为 \"plugin@marketplace\" 的插件 ID
+ * @returns 解析后的组件，若格式无效则返回 null
  */
 export function parsePluginId(
   pluginId: string,
 ): { name: string; marketplace: string } | null {
   const parts = pluginId.split('@')
+  // 要求恰好两个部分且均非空
   if (parts.length !== 2 || !parts[0] || !parts[1]) {
     return null
   }
@@ -276,8 +308,10 @@ export function parsePluginId(
 }
 
 /**
- * Structured result from the install core. Wrappers format messages and
- * handle analytics/error-catching around this.
+ * installResolvedPlugin 的结构化返回类型。
+ *
+ * 区分多种失败场景，供调用方（CLI、UI）格式化各自的错误消息。
+ * 成功时返回依赖闭包列表和可选的依赖数量注释字符串。
  */
 export type InstallCoreResult =
   | { ok: true; closure: string[]; depNote: string }
@@ -297,17 +331,28 @@ export type InstallCoreResult =
     }
 
 /**
- * Format a failed ResolutionResult into a user-facing message. Unified on
- * the richer CLI messages (the "Is the X marketplace added?" hint is useful
- * for UI users too).
+ * 将失败的 ResolutionResult 格式化为面向用户的错误消息。
+ *
+ * 统一使用 CLI 风格的消息（含「Is the X marketplace added?」提示），
+ * 因为此提示对 UI 用户同样有用。
+ *
+ * 场景覆盖：
+ *   - 'cycle'：依赖循环
+ *   - 'cross-marketplace'：跨市场依赖未列入白名单
+ *   - 'not-found'：依赖在市场中不存在
+ *
+ * @param r - 失败的解析结果
+ * @returns 面向用户的错误消息字符串
  */
 export function formatResolutionError(
   r: ResolutionResult & { ok: false },
 ): string {
   switch (r.reason) {
     case 'cycle':
+      // 依赖循环：展示循环链
       return `Dependency cycle: ${r.chain.join(' → ')}`
     case 'cross-marketplace': {
+      // 跨市场依赖：说明哪个市场未被允许，并给出添加白名单的提示
       const depMkt = parsePluginIdentifier(r.dependency).marketplace
       const where = depMkt
         ? `marketplace "${depMkt}"`
@@ -318,6 +363,7 @@ export function formatResolutionError(
       return `Dependency "${r.dependency}" (required by ${r.requiredBy}) is in ${where}, which is not in the allowlist — cross-marketplace dependencies are blocked by default. Install it manually first.${hint}`
     }
     case 'not-found': {
+      // 依赖不存在：提示用户是否添加了对应市场
       const { marketplace: depMkt } = parsePluginIdentifier(r.missing)
       return depMkt
         ? `Dependency "${r.missing}" (required by ${r.requiredBy}) not found. Is the "${depMkt}" marketplace added?`
@@ -327,23 +373,20 @@ export function formatResolutionError(
 }
 
 /**
- * Core plugin install logic, shared by the CLI path (`installPluginOp`) and
- * the interactive UI path (`installPluginFromMarketplace`). Given a
- * pre-resolved marketplace entry, this:
+ * 插件安装核心逻辑，被 CLI 路径和交互式 UI 路径共用。
  *
- *   1. Guards against local-source plugins without a marketplace install
- *      location (would silently no-op otherwise).
- *   2. Resolves the transitive dependency closure (when PLUGIN_DEPENDENCIES
- *      is on; trivial single-plugin closure otherwise).
- *   3. Writes the entire closure to enabledPlugins in one settings update.
- *   4. Caches each closure member (downloads/copies sources as needed).
- *   5. Clears memoization caches.
+ * 给定一个已解析的市场条目，执行：
+ *   1. 本地来源检查：确保本地插件有 marketplaceInstallLocation（否则缓存会静默失败）
+ *   2. 策略检查（根插件）：组织策略阻止的插件不能安装
+ *   3. 依赖闭包解析：收集所有传递依赖（启用 PLUGIN_DEPENDENCIES 时）
+ *   4. 策略检查（传递依赖）：确保依赖项也未被策略阻止
+ *   5. 写回 settings：一次性将整个闭包写入 enabledPlugins
+ *   6. 物化：为每个闭包成员调用 cacheAndRegisterPlugin（下载/复制）
+ *   7. 清空缓存：确保后续 loadAllPlugins 读取最新状态
  *
- * Returns a structured result. Message formatting, analytics, and top-level
- * error wrapping stay in the caller-specific wrappers.
+ * 返回结构化结果，消息格式化、遥测、异常捕获留给调用方包装层。
  *
- * @param marketplaceInstallLocation Pass this if the caller already has it
- *   (from a prior marketplace search) to avoid a redundant lookup.
+ * @param marketplaceInstallLocation - 若调用方已有此值则传入，避免重复查询市场
  */
 export async function installResolvedPlugin({
   pluginId,
@@ -358,25 +401,23 @@ export async function installResolvedPlugin({
 }): Promise<InstallCoreResult> {
   const settingSource = scopeToSettingSource(scope)
 
-  // ── Policy guard ──
-  // Org-blocked plugins (managed-settings.json enabledPlugins: false) cannot
-  // be installed. Checked here so all install paths (CLI, UI, hint-triggered)
-  // are covered in one place.
+  // ── 步骤 1：策略检查（根插件）──
+  // 组织策略阻止的插件（managed-settings.json enabledPlugins: false）不能安装。
+  // 在此统一检查，覆盖所有安装路径（CLI、UI、hint 触发）。
   if (isPluginBlockedByPolicy(pluginId)) {
     return { ok: false, reason: 'blocked-by-policy', pluginName: entry.name }
   }
 
-  // ── Resolve dependency closure ──
-  // depInfo caches marketplace lookups so the materialize loop doesn't
-  // re-fetch. Seed the root if the caller gave us its install location.
+  // ── 步骤 2：解析依赖闭包 ──
+  // depInfo 缓存市场查询结果，避免物化循环中重复 fetch。
+  // 若调用方提供了 marketplaceInstallLocation 则预填种子。
   const depInfo = new Map<
     string,
     { entry: PluginMarketplaceEntry; marketplaceInstallLocation: string }
   >()
-  // Without this guard, a local-source root with undefined
-  // marketplaceInstallLocation falls through: depInfo isn't seeded, the
-  // materialize loop's `if (!info) continue` skips the root, and the user
-  // sees "Successfully installed" while nothing is cached.
+  // 安全检查：本地来源插件必须有 marketplaceInstallLocation。
+  // 若缺失：depInfo 未被种子，物化循环的 `if (!info) continue` 会跳过根插件，
+  // 导致"成功安装"提示但实际什么都没缓存。
   if (isLocalPluginSource(entry.source) && !marketplaceInstallLocation) {
     return {
       ok: false,
@@ -388,6 +429,7 @@ export async function installResolvedPlugin({
     depInfo.set(pluginId, { entry, marketplaceInstallLocation })
   }
 
+  // 读取根插件所在市场的跨市场依赖白名单
   const rootMarketplace = parsePluginIdentifier(pluginId).marketplace
   const allowedCrossMarketplaces = new Set(
     (rootMarketplace
@@ -395,9 +437,11 @@ export async function installResolvedPlugin({
           ?.allowCrossMarketplaceDependenciesOn
       : undefined) ?? [],
   )
+  // 执行依赖闭包解析
   const resolution = await resolveDependencyClosure(
     pluginId,
     async id => {
+      // 优先从 depInfo 缓存取，避免重复 fetch
       if (depInfo.has(id)) return depInfo.get(id)!.entry
       if (id === pluginId) return entry
       const info = await getPluginById(id)
@@ -411,10 +455,9 @@ export async function installResolvedPlugin({
     return { ok: false, reason: 'resolution-failed', resolution }
   }
 
-  // ── Policy guard for transitive dependencies ──
-  // The root plugin was already checked above, but any dependency in the
-  // closure could also be policy-blocked. Check before writing to settings
-  // so a non-blocked plugin can't pull in a blocked dependency.
+  // ── 步骤 3：策略检查（传递依赖）──
+  // 根插件已在步骤 1 检查，此处检查闭包中的其他依赖。
+  // 确保非阻止插件不能引入被阻止的依赖。
   for (const id of resolution.closure) {
     if (id !== pluginId && isPluginBlockedByPolicy(id)) {
       return {
@@ -426,7 +469,7 @@ export async function installResolvedPlugin({
     }
   }
 
-  // ── ACTION: write entire closure to settings in one call ──
+  // ── 步骤 4：写回 settings（一次性将整个闭包写入 enabledPlugins）──
   const closureEnabled: Record<string, true> = {}
   for (const id of resolution.closure) closureEnabled[id] = true
   const { error } = updateSettingsForSource(settingSource, {
@@ -443,21 +486,22 @@ export async function installResolvedPlugin({
     }
   }
 
-  // ── Materialize: cache each closure member ──
+  // ── 步骤 5：物化——为每个闭包成员缓存插件 ──
   const projectPath = scope !== 'user' ? getCwd() : undefined
   for (const id of resolution.closure) {
     let info = depInfo.get(id)
-    // Root wasn't pre-seeded (caller didn't pass marketplaceInstallLocation
-    // for a non-local source). Fetch now; it's needed for the cache write.
+    // 根插件未预填种子（调用方未传 marketplaceInstallLocation 且非本地来源）
+    // 现在去 fetch，缓存写入需要此信息
     if (!info && id === pluginId) {
       const mktLocation = (await getPluginById(id))?.marketplaceInstallLocation
       if (mktLocation) info = { entry, marketplaceInstallLocation: mktLocation }
     }
-    if (!info) continue
+    if (!info) continue  // 无法获取信息时跳过（极少数情况）
 
     let localSourcePath: string | undefined
     const { source } = info.entry
     if (isLocalPluginSource(source)) {
+      // 本地来源：验证路径在市场安装目录内（防路径遍历），并获取绝对路径
       localSourcePath = validatePathWithinBase(
         info.marketplaceInstallLocation,
         source,
@@ -472,8 +516,10 @@ export async function installResolvedPlugin({
     )
   }
 
+  // 步骤 6：清空所有 memoize 缓存，确保后续 loadAllPlugins 读取最新状态
   clearAllCaches()
 
+  // 构建依赖数量注释字符串（如 \" (+ 2 dependencies)\"）
   const depNote = formatDependencyCountSuffix(
     resolution.closure.filter(id => id !== pluginId),
   )
@@ -481,27 +527,36 @@ export async function installResolvedPlugin({
 }
 
 /**
- * Result of a plugin installation operation
+ * 插件安装操作的结果类型
  */
 export type InstallPluginResult =
   | { success: true; message: string }
   | { success: false; error: string }
 
 /**
- * Parameters for installing a plugin from marketplace
+ * 从市场安装插件的参数类型
  */
 export type InstallPluginParams = {
-  pluginId: string
-  entry: PluginMarketplaceEntry
-  marketplaceName: string
-  scope?: 'user' | 'project' | 'local'
-  trigger?: 'hint' | 'user'
+  pluginId: string              // 插件 ID（格式：\"plugin@marketplace\"）
+  entry: PluginMarketplaceEntry // 市场条目
+  marketplaceName: string       // 市场名称（用于遥测）
+  scope?: 'user' | 'project' | 'local'  // 安装作用域（默认 'user'）
+  trigger?: 'hint' | 'user'    // 安装触发来源（用于遥测）
 }
 
 /**
- * Install a single plugin from a marketplace with the specified scope.
- * Interactive-UI wrapper around `installResolvedPlugin` — adds try/catch,
- * analytics, and UI-style message formatting.
+ * 从市场安装单个插件的交互式 UI 入口函数。
+ *
+ * 此函数是 installResolvedPlugin 的 UI 路径包装层，额外处理：
+ *   - try/catch：将所有异常转换为 { success: false, error } 格式
+ *   - 错误消息格式化：将结构化错误转换为 UI 友好的字符串
+ *   - 遥测上报：成功安装后记录 tengu_plugin_installed 事件
+ *     - 官方市场：pluginId 写入 additional_metadata
+ *     - 第三方市场：pluginId 脱敏为 'third-party'
+ *     - 插件名和市场名路由到 _PROTO_* PII 标记列
+ *
+ * @param params - 安装参数（插件 ID、市场条目、作用域、触发来源）
+ * @returns 安装结果（成功消息或错误字符串）
  */
 export async function installPluginFromMarketplace({
   pluginId,
@@ -511,12 +566,12 @@ export async function installPluginFromMarketplace({
   trigger = 'user',
 }: InstallPluginParams): Promise<InstallPluginResult> {
   try {
-    // Look up the marketplace install location for local-source plugins.
-    // Without this, plugins with relative-path sources fail from the
-    // interactive UI path (/plugin install) even though the CLI path works.
+    // 查询市场安装位置（本地来源插件需要此值）
+    // 不传此值的话，本地插件会在 installResolvedPlugin 中提前失败
     const pluginInfo = await getPluginById(pluginId)
     const marketplaceInstallLocation = pluginInfo?.marketplaceInstallLocation
 
+    // 调用核心安装逻辑
     const result = await installResolvedPlugin({
       pluginId,
       entry,
@@ -525,6 +580,7 @@ export async function installPluginFromMarketplace({
     })
 
     if (!result.ok) {
+      // 将结构化错误转换为 UI 友好的字符串
       switch (result.reason) {
         case 'local-source-no-location':
           return {
@@ -554,11 +610,10 @@ export async function installPluginFromMarketplace({
       }
     }
 
-    // _PROTO_* routes to PII-tagged plugin_name/marketplace_name BQ columns.
-    // plugin_id kept in additional_metadata (redacted to 'third-party' for
-    // non-official) because dbt external_claude_code_plugin_installs.sql
-    // extracts $.plugin_id for official-marketplace install tracking. Other
-    // plugin lifecycle events drop the blob key — no downstream consumers.
+    // 遥测上报：tengu_plugin_installed 事件
+    // _PROTO_* 路由到 PII 标记的 plugin_name/marketplace_name BQ 列
+    // plugin_id 写入 additional_metadata（官方市场保留原值，第三方脱敏为 'third-party'）
+    // dbt external_claude_code_plugin_installs.sql 使用 $.plugin_id 追踪官方市场安装
     logEvent('tengu_plugin_installed', {
       _PROTO_plugin_name:
         entry.name as AnalyticsMetadata_I_VERIFIED_THIS_IS_PII_TAGGED,
@@ -572,6 +627,7 @@ export async function installPluginFromMarketplace({
       install_source: (trigger === 'hint'
         ? 'ui-suggestion'
         : 'ui-discover') as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
+      // 构建插件遥测字段（含 managed 状态）
       ...buildPluginTelemetryFields(
         entry.name,
         marketplaceName,
@@ -588,6 +644,7 @@ export async function installPluginFromMarketplace({
       message: `✓ Installed ${entry.name}${result.depNote}. Run /reload-plugins to activate.`,
     }
   } catch (err) {
+    // 将所有未预期异常转换为 { success: false, error } 格式
     const errorMessage = err instanceof Error ? err.message : String(err)
     logError(toError(err))
     return { success: false, error: `Failed to install: ${errorMessage}` }

@@ -1,15 +1,42 @@
 /**
- * Classify an MCP tool as a search/read operation for UI collapsing.
- * Returns { isSearch: false, isRead: false } for tools that should not
- * collapse (e.g., send_message, create_*, update_*).
+ * classifyForCollapse.ts — MCP 工具 UI 折叠分类器
  *
- * Uses explicit per-tool allowlists for the most common MCP servers.
- * Tool names are stable across installs (even when the server name varies,
- * e.g., "slack" vs "claude_ai_Slack"), so matching is keyed on the tool
- * name alone after normalizing camelCase/kebab-case to snake_case.
- * Unknown tool names don't collapse (conservative).
+ * 【在 Claude Code 系统中的位置】
+ * 本文件为 MCPTool 提供 UI 折叠判断逻辑。
+ * 在 Claude Code 的消息列表中，搜索类和只读查询类操作默认折叠显示，
+ * 以减少 UI 噪音。本文件通过维护两个显式白名单集合，
+ * 判断某个 MCP 工具是否应被分类为可折叠的搜索操作或只读操作。
+ *
+ * 【主要功能】
+ * 1. SEARCH_TOOLS：搜索类工具名称白名单（Set<string>）
+ *    - 覆盖主流 MCP 服务器的搜索操作：Slack、GitHub、Linear、Datadog、
+ *      Sentry、Notion、Gmail、Google Drive、Google Calendar、Jira/Confluence、
+ *      Asana、Filesystem、Memory、Brave Search、Grafana、Supabase、Stripe、
+ *      PubMed、Firecrawl、Exa、Perplexity、Tavily、Obsidian、MongoDB、Neo4j、
+ *      Airtable、Todoist、AWS、Terraform 等
+ * 2. READ_TOOLS：只读查询类工具名称白名单（Set<string>）
+ *    - 覆盖主流 MCP 服务器的 get_/list_/read_ 类操作
+ * 3. normalize()：将工具名称标准化为 snake_case 小写
+ *    - camelCase → snake_case（goToDefinition → go_to_definition）
+ *    - kebab-case → snake_case（get-file → get_file）
+ * 4. classifyMcpToolForCollapse()：
+ *    - 标准化工具名称后查白名单
+ *    - 返回 { isSearch, isRead } 对象
+ *    - 未知工具名称保守处理（不折叠）
+ *
+ * 【设计决策】
+ * - 白名单匹配基于工具名称（toolName），不依赖服务器名称（serverName 被忽略）
+ *   原因：同一工具在不同安装中服务器名称可能不同（如 "slack" vs "claude_ai_Slack"），
+ *   但工具名称在各安装中保持稳定
+ * - 保守策略：未知工具名称不折叠，避免重要操作被误隐藏
  */
 
+/**
+ * 搜索类 MCP 工具名称白名单（标准化为 snake_case 后的名称）。
+ *
+ * 包含各主流 MCP 服务器的搜索操作工具名称，
+ * 这些工具在 UI 中默认折叠为搜索结果摘要。
+ */
 // prettier-ignore
 const SEARCH_TOOLS = new Set([
   // Slack (hosted + @modelcontextprotocol/server-slack)
@@ -73,12 +100,12 @@ const SEARCH_TOOLS = new Set([
   'brave_web_search',
   'brave_local_search',
   // Git (mcp-server-git)
-  // (git has no search verbs)
+  // (git 没有搜索类操作)
   // Grafana (grafana/mcp-grafana)
   'search_dashboards',
   'search_folders',
   // PagerDuty
-  // (pagerduty reads all use get_/list_, no search verbs)
+  // (pagerduty 的只读操作均使用 get_/list_，无搜索类操作)
   // Supabase
   'search_docs',
   // Stripe
@@ -138,6 +165,12 @@ const SEARCH_TOOLS = new Set([
   'search_policies',
 ])
 
+/**
+ * 只读查询类 MCP 工具名称白名单（标准化为 snake_case 后的名称）。
+ *
+ * 包含各主流 MCP 服务器的 get_/list_/read_ 等只读操作工具名称，
+ * 这些工具在 UI 中默认折叠为只读查询摘要。
+ */
 // prettier-ignore
 const READ_TOOLS = new Set([
   // Slack (hosted + @modelcontextprotocol/server-slack)
@@ -585,13 +618,41 @@ const READ_TOOLS = new Set([
   'resources_list',
 ])
 
+/**
+ * 将工具名称标准化为 snake_case 小写格式。
+ *
+ * 处理两种非标准命名格式：
+ * 1. camelCase → snake_case：在小写字母和大写字母之间插入下划线
+ *    示例：'goToDefinition' → 'go_to_definition'
+ * 2. kebab-case → snake_case：将连字符替换为下划线
+ *    示例：'get-file-contents' → 'get_file_contents'
+ * 3. 最后转为全小写
+ *
+ * @param name - 原始工具名称
+ * @returns 标准化后的 snake_case 小写名称
+ */
 function normalize(name: string): string {
   return name
-    .replace(/([a-z])([A-Z])/g, '$1_$2')
-    .replace(/-/g, '_')
+    .replace(/([a-z])([A-Z])/g, '$1_$2')  // camelCase → snake_case
+    .replace(/-/g, '_')                      // kebab-case → snake_case
     .toLowerCase()
 }
 
+/**
+ * 将 MCP 工具分类为搜索操作或只读操作（用于 UI 折叠判断）。
+ *
+ * 通过以下步骤判断：
+ * 1. normalize(toolName) 将工具名称标准化为 snake_case
+ * 2. 查询 SEARCH_TOOLS 白名单 → isSearch
+ * 3. 查询 READ_TOOLS 白名单 → isRead
+ *
+ * 保守策略：未知工具名称返回 { isSearch: false, isRead: false }（不折叠）。
+ * 服务器名称参数（_serverName）当前被忽略，白名单匹配仅基于工具名称。
+ *
+ * @param _serverName - MCP 服务器名称（当前未使用，保留供未来扩展）
+ * @param toolName - MCP 工具名称
+ * @returns { isSearch, isRead } 折叠分类结果
+ */
 export function classifyMcpToolForCollapse(
   _serverName: string,
   toolName: string,

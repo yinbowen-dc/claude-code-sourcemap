@@ -1,3 +1,29 @@
+/**
+ * ToolSelector.tsx — Agent 工具多选 UI 组件
+ *
+ * 在 Claude Code 系统流程中的位置：
+ *   ToolsStep（向导工具选择步骤） → ToolSelector（当前文件）
+ *
+ * 主要功能：
+ *   - 将所有可用工具按类别分桶（只读/编辑/执行/MCP/其他）展示给用户
+ *   - 支持按桶批量选择和逐个工具精细选择（高级选项展开）
+ *   - MCP 工具按服务器名分组，支持服务器级别批量切换
+ *   - 确认时：若全选则传递 undefined（语义："所有工具"），否则传递选中工具名数组
+ *   - 取消时：调用 onCancel 或恢复初始工具列表
+ *
+ * 工具分桶规则（getToolBuckets）：
+ *   READ_ONLY  → Glob/Grep/FileRead/WebFetch/TodoWrite/WebSearch 等只读工具
+ *   EDIT       → FileEdit/FileWrite/NotebookEdit 等编辑工具
+ *   EXECUTION  → Bash（以及 ant 环境下的 Tungsten）
+ *   MCP        → 动态：通过 isMcpTool 判断的 MCP 工具
+ *   OTHER      → 未归类的自定义工具
+ *
+ * 依赖：
+ *   - react/compiler-runtime (_c)：React 编译器自动生成的记忆化缓存（69 个槽位）
+ *   - filterToolsForAgent：过滤掉内置与异步工具，只保留可用于自定义 Agent 的工具
+ *   - figures：终端复选框符号（✔/○）
+ *   - useKeybinding：键盘快捷键注册，"Confirmation" 上下文注册 ESC → 取消
+ */
 import { c as _c } from "react/compiler-runtime";
 import figures from 'figures';
 import React, { useCallback, useMemo, useState } from 'react';

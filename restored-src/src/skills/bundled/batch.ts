@@ -1,3 +1,18 @@
+/**
+ * 批量并行任务编排技能 (batch)
+ *
+ * 在 Claude Code 技能系统中的位置：
+ *   src/skills/bundled/batch.ts → 通过 index.ts 的 initBundledSkills() 在启动时注册
+ *
+ * 功能概述：
+ *   实现 /batch 斜杠命令，用于将大规模代码变更分解为 5~30 个独立的并行子任务，
+ *   每个子任务在独立的 git worktree 中执行，最终各自提交 PR。
+ *   整体流程分三个阶段：
+ *     Phase 1 — 进入 Plan Mode，研究代码库并制定分解方案
+ *     Phase 2 — 同时启动多个后台 Agent（每个对应一个工作单元）
+ *     Phase 3 — 收集各 Agent 的 PR 链接，渲染进度表格
+ */
+
 import { AGENT_TOOL_NAME } from '../../tools/AgentTool/constants.js'
 import { ASK_USER_QUESTION_TOOL_NAME } from '../../tools/AskUserQuestionTool/prompt.js'
 import { ENTER_PLAN_MODE_TOOL_NAME } from '../../tools/EnterPlanModeTool/constants.js'

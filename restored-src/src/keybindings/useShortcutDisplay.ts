@@ -1,3 +1,24 @@
+/**
+ * 快捷键显示文本 React Hook 模块
+ *
+ * 【在 Claude Code 键位绑定系统中的位置与作用】
+ * 本文件提供 React Hook 版的快捷键显示文本查询，
+ * 供各 UI 组件在渲染时动态获取当前配置的快捷键字符串：
+ *
+ *   KeybindingContext（提供 getDisplayText 方法）
+ *     → useShortcutDisplay（本文件，React Hook 封装）
+ *       ← UI 组件调用此 Hook 渲染快捷键提示文字
+ *
+ * 与 shortcutFormat.getShortcutDisplay（非 React 版本）的区别：
+ *  - 本 Hook 依赖 React Context，只能在 React 组件树内使用
+ *  - 使用 useRef(false) 守卫确保每次挂载最多记录一次分析日志，
+ *    避免频繁重渲染时产生大量 tengu_keybinding_fallback_used 事件
+ *
+ * 核心导出：
+ *  - useShortcutDisplay(action, context, fallback)：
+ *    从 KeybindingContext 获取指定 action 在指定 context 中的显示文本；
+ *    若未找到则返回 fallback，并（仅首次挂载时）触发一次分析日志。
+ */
 import { useEffect, useRef } from 'react'
 import {
   type AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,

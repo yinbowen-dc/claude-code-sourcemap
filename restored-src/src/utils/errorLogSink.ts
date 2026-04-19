@@ -1,13 +1,10 @@
 /**
- * Error log sink implementation
+ * 错误日志 Sink 实现模块。
  *
- * This module contains the heavy implementation for error logging and should be
- * initialized during app startup. It handles file-based error logging to disk.
- *
- * Usage: Call initializeErrorLogSink() during app startup to attach the sink.
- *
- * DESIGN: This module is separate from log.ts to avoid import cycles.
- * log.ts has NO heavy dependencies - events are queued until this sink is attached.
+ * 在 Claude Code 系统中，该模块实现基于文件的错误日志写入，
+ * 在应用启动时初始化，将错误事件持久化到磁盘，同时支持上报至监控服务。
+ * 与 log.ts 分离以避免循环依赖——log.ts 无重依赖，事件在 sink 挂载前排队缓存。
+ * - initializeErrorLogSink()：在应用启动时调用以附加 sink
  */
 
 import axios from 'axios'

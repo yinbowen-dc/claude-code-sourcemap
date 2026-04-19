@@ -1,3 +1,12 @@
+/**
+ * 错误类型与工具函数模块。
+ *
+ * 在 Claude Code 系统中，该模块定义 Claude Code 专用错误类型，
+ * 并提供常用的错误判断、消息提取工具函数：
+ * - ClaudeError：基础 Claude 错误类
+ * - isENOENT()：判断是否为文件不存在错误
+ * - errorMessage()：从任意值安全提取错误消息字符串
+ */
 import { APIUserAbortError } from '@anthropic-ai/sdk'
 
 export class ClaudeError extends Error {

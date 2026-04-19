@@ -1,6 +1,34 @@
+/**
+ * 【文件定位】UI 渲染层 — 主题系统（颜色调色板）
+ *
+ * 在 Claude Code 系统流程中的位置：
+ *   应用启动 → 读取用户配置中的 themeSetting（'auto'/'dark'/'light' 等）
+ *     → 通过 getTheme(themeName) 获取具体调色板对象 Theme
+ *     → Ink 组件使用 theme.xxx 属性取色渲染 UI
+ *
+ * 主要职责：
+ *   1. Theme 类型定义  — 包含约 60 个命名颜色属性（UI、语义、Diff、彩虹等）
+ *   2. 6 个主题对象   — darkTheme / lightTheme（RGB 精确色）
+ *                       darkAnsiTheme / lightAnsiTheme（标准 ANSI 16 色）
+ *                       darkDaltonizedTheme / lightDaltonizedTheme（色盲友好）
+ *   3. getTheme()     — 按名称分发主题对象的工厂函数
+ *   4. themeColorToAnsi() — 将 rgb(r,g,b) 字符串转换为 ANSI 转义序列
+ *                           Apple Terminal 使用 256 色模式（level:2），避免真彩色兼容问题
+ *
+ * 设计原则：
+ *   - RGB 主题使用硬编码颜色，避免用户自定义 ANSI 颜色影响效果
+ *   - ANSI 主题仅使用 16 种标准终端颜色，兼容无真彩色支持的终端
+ *   - 色盲主题（Daltonized）针对色弱用户（尤其是红绿色盲）调整对比度
+ */
+
 import chalk, { Chalk } from 'chalk'
 import { env } from './env.js'
 
+/**
+ * Claude Code 完整颜色调色板类型定义。
+ * 每个字段对应 UI 中一个具体使用场景，类型为颜色字符串
+ * （格式：'rgb(r,g,b)' 或 'ansi:colorName'）。
+ */
 export type Theme = {
   autoAccept: string
   bashBorder: string
@@ -72,6 +100,7 @@ export type Theme = {
   briefLabelYou: string
   briefLabelClaude: string
   // Rainbow colors for ultrathink keyword highlighting
+  // 彩虹色系：用于 "ultrathink" 关键词的高亮动画（7 色循环）
   rainbow_red: string
   rainbow_orange: string
   rainbow_yellow: string
@@ -88,6 +117,7 @@ export type Theme = {
   rainbow_violet_shimmer: string
 }
 
+// 支持的主题名称列表（as const 使 TypeScript 可推导字面量类型）
 export const THEME_NAMES = [
   'dark',
   'light',
@@ -100,6 +130,7 @@ export const THEME_NAMES = [
 /** A renderable theme. Always resolvable to a concrete color palette. */
 export type ThemeName = (typeof THEME_NAMES)[number]
 
+// 用户配置中支持的主题设置（包含 'auto'：跟随系统明暗模式）
 export const THEME_SETTINGS = ['auto', ...THEME_NAMES] as const
 
 /**
@@ -109,8 +140,10 @@ export const THEME_SETTINGS = ['auto', ...THEME_NAMES] as const
 export type ThemeSetting = (typeof THEME_SETTINGS)[number]
 
 /**
- * Light theme using explicit RGB values to avoid inconsistencies
- * from users' custom terminal ANSI color definitions
+ * 浅色主题（显式 RGB 颜色，避免用户自定义 ANSI 颜色造成不一致）。
+ *
+ * 设计目标：在浅色背景终端上具有足够的对比度和可读性。
+ * 不使用标准 ANSI 颜色（如 'red'），因为用户可能重映射了终端颜色。
  */
 const lightTheme: Theme = {
   autoAccept: 'rgb(135,0,255)', // Electric violet
@@ -191,8 +224,8 @@ const lightTheme: Theme = {
 }
 
 /**
- * Light ANSI theme using only the 16 standard ANSI colors
- * for terminals without true color support
+ * 浅色 ANSI 主题：仅使用 16 种标准 ANSI 颜色，适用于不支持真彩色的终端。
+ * 颜色名称为 'ansi:colorName' 格式，由渲染层识别并映射到终端颜色代码。
  */
 const lightAnsiTheme: Theme = {
   autoAccept: 'ansi:magenta',
@@ -272,8 +305,7 @@ const lightAnsiTheme: Theme = {
 }
 
 /**
- * Dark ANSI theme using only the 16 standard ANSI colors
- * for terminals without true color support
+ * 深色 ANSI 主题：仅使用 16 种标准 ANSI 颜色，适用于深色背景的 ANSI 兼容终端。
  */
 const darkAnsiTheme: Theme = {
   autoAccept: 'ansi:magentaBright',
@@ -353,8 +385,8 @@ const darkAnsiTheme: Theme = {
 }
 
 /**
- * Light daltonized theme (color-blind friendly) using explicit RGB values
- * to avoid inconsistencies from users' custom terminal ANSI color definitions
+ * 浅色色盲友好主题（Daltonized）：针对色弱用户（特别是红绿色盲/deuteranopia）
+ * 调整颜色，使用蓝色替代绿色、提高对比度等色盲适配策略。
  */
 const lightDaltonizedTheme: Theme = {
   autoAccept: 'rgb(135,0,255)', // Electric violet
@@ -434,8 +466,8 @@ const lightDaltonizedTheme: Theme = {
 }
 
 /**
- * Dark theme using explicit RGB values to avoid inconsistencies
- * from users' custom terminal ANSI color definitions
+ * 深色主题（显式 RGB 颜色）：适用于深色背景终端。
+ * 色系整体较亮，与深色背景形成高对比度。
  */
 const darkTheme: Theme = {
   autoAccept: 'rgb(175,135,255)', // Electric violet
@@ -515,8 +547,8 @@ const darkTheme: Theme = {
 }
 
 /**
- * Dark daltonized theme (color-blind friendly) using explicit RGB values
- * to avoid inconsistencies from users' custom terminal ANSI color definitions
+ * 深色色盲友好主题（Daltonized）：适用于深色背景的色弱用户。
+ * 使用蓝色替代绿色来表示"成功/新增"等含义，避免红绿混淆。
  */
 const darkDaltonizedTheme: Theme = {
   autoAccept: 'rgb(175,135,255)', // Electric violet
@@ -595,6 +627,15 @@ const darkDaltonizedTheme: Theme = {
   rainbow_violet_shimmer: 'rgb(230,180,210)',
 }
 
+/**
+ * 按主题名称返回对应的调色板对象。
+ *
+ * 通过 switch 分发到具体主题；default 兜底返回深色主题
+ * （'dark' 也走 default 分支，减少冗余 case）。
+ *
+ * @param themeName 已解析的主题名称（非 'auto'，'auto' 在外层已转换）
+ * @returns 对应的 Theme 颜色对象
+ */
 export function getTheme(themeName: ThemeName): Theme {
   switch (themeName) {
     case 'light':
@@ -608,20 +649,28 @@ export function getTheme(themeName: ThemeName): Theme {
     case 'dark-daltonized':
       return darkDaltonizedTheme
     default:
+      // 'dark' 以及任何未知名称均返回深色主题
       return darkTheme
   }
 }
 
-// Create a chalk instance with 256-color level for Apple Terminal
-// Apple Terminal doesn't handle 24-bit color escape sequences well
+// Apple Terminal 不能正确处理 24 位真彩色转义序列，因此专门为其创建 256 色级别的 chalk 实例
 const chalkForChart =
   env.terminal === 'Apple_Terminal'
-    ? new Chalk({ level: 2 }) // 256 colors
+    ? new Chalk({ level: 2 }) // 256 色模式（Apple Terminal 兼容）
     : chalk
 
 /**
- * Converts a theme color to an ANSI escape sequence for use with asciichart.
- * Uses chalk to generate the escape codes, with 256-color mode for Apple Terminal.
+ * 将主题颜色字符串转换为 ANSI 转义序列，供 asciichart 等图形库使用。
+ *
+ * 流程：
+ *   1. 用正则提取 rgb(r,g,b) 格式中的三个分量
+ *   2. 用 chalk.rgb(r,g,b)('X') 生成含颜色的字符串，取 'X' 之前的部分即为开启序列
+ *   3. Apple Terminal 使用 level:2 的 chalkForChart，自动降级为 256 色
+ *   4. 若正则匹配失败（如 ANSI 主题的 'ansi:xxx' 格式），回退为洋红色 \x1b[35m
+ *
+ * @param themeColor 主题颜色字符串（如 'rgb(215,119,87)'）
+ * @returns ANSI 颜色开启转义序列
  */
 export function themeColorToAnsi(themeColor: string): string {
   const rgbMatch = themeColor.match(/rgb\(\s?(\d+),\s?(\d+),\s?(\d+)\s?\)/)

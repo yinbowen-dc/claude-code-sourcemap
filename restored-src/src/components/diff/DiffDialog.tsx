@@ -1,3 +1,54 @@
+/**
+ * DiffDialog.tsx — 差异查看对话框组件
+ *
+ * 在 Claude Code 系统流程中的位置：
+ *   工具响应层 → 差异展示 → 顶层对话框（管理数据源切换与文件列表/详情双级导航）
+ *
+ * 主要功能：
+ *   1. turnDiffToDiffData：将 TurnDiff（历史轮次差异）转换为统一的 DiffData 格式，
+ *      包括文件列表（按路径排序）和 hunks Map。
+ *   2. DiffDialog：主对话框组件，支持在"当前 git diff"与各历史轮次之间切换数据源，
+ *      并在文件列表视图（list）和单文件详情视图（detail）之间双级导航。
+ *   3. _temp3：React Compiler 提取的辅助函数，计算上一个文件索引（Math.max(0, prev-1)）。
+ *   4. _temp2：React Compiler 提取的辅助函数，计算上一个数据源索引（Math.max(0, prev-1)）。
+ *   5. _temp：React Compiler 提取的辅助函数，将 TurnDiff 包装为 DiffSource 对象。
+ *
+ * 视图状态机：
+ *   - ViewMode = 'list' | 'detail'：文件列表 ↔ 单文件详情
+ *   - DiffSource = {type:'current'} | {type:'turn', turn:TurnDiff}：当前差异 or 历史轮次
+ *   - sources 数组 = [{type:'current'}, ...turnDiffs.map(_temp)]
+ *
+ * 6 个按键绑定（context "DiffDialog"）：
+ *   - diff:previousSource：列表模式左切源 / 详情模式返回列表
+ *   - diff:nextSource：列表模式右切源
+ *   - diff:back：详情模式返回列表
+ *   - diff:viewDetails：列表模式进入详情
+ *   - diff:previousFile：列表模式上移文件光标
+ *   - diff:nextFile：列表模式下移文件光标
+ *
+ * React Compiler 缓存槽分配（_c(73)）：
+ *   $[0]：静态 {type:"current"} 对象（sentinel 缓存，只创建一次）
+ *   $[1]-$[2]：turnDiffs → sources 数组
+ *   $[3]-$[5]：currentTurn + gitDiffData → diffData
+ *   $[6]-$[8]：diffData.hunks + selectedFile → selectedHunks
+ *   $[9]-$[12]：sourceIndex + sources.length → useEffect1 回调 + 依赖数组
+ *   $[13]-$[15]：sourceIndex → useEffect2 回调 + 依赖数组
+ *   $[16]-$[19]：sources.length + viewMode → previousSource/nextSource 回调
+ *   $[20]-$[21]：viewMode → back 回调
+ *   $[22]-$[24]：selectedFile + viewMode → viewDetails 回调
+ *   $[25]-$[26]：viewMode → previousFile 回调
+ *   $[27]-$[29]：diffData.files.length + viewMode → nextFile 回调
+ *   $[30]-$[36]：6 个回调 → keybindings 对象
+ *   $[37]：静态 {context:"DiffDialog"} 选项（sentinel 缓存）
+ *   $[38]-$[39]：diffData.stats → subtitle JSX
+ *   $[40]-$[42]：sourceIndex + sources → sourceSelector JSX
+ *   $[43]-$[44]：headerSubtitle → headerSubtitle Text JSX
+ *   $[45]-$[47]：headerTitle + t20 → title JSX
+ *   $[48]-$[50]：onDone + viewMode → handleCancel 函数
+ *   $[51]-$[54]：dismissShortcut + sources.length + viewMode → inputGuide 函数
+ *   $[55]-$[65]：10 个差异数据字段 → 内容区 JSX（空列表/文件列表/文件详情）
+ *   $[66]-$[72]：handleCancel + sourceSelector + subtitle + inputGuide + 内容区 + title → Dialog JSX
+ */
 import { c as _c } from "react/compiler-runtime";
 import type { StructuredPatchHunk } from 'diff';
 import React, { useEffect, useMemo, useRef, useState } from 'react';
@@ -14,19 +65,40 @@ import { Byline } from '../design-system/Byline.js';
 import { Dialog } from '../design-system/Dialog.js';
 import { DiffDetailView } from './DiffDetailView.js';
 import { DiffFileList } from './DiffFileList.js';
+
+// Props 类型：messages 用于提取历史轮次差异；onDone 在对话框关闭时回调
 type Props = {
   messages: Message[];
   onDone: (result?: string, options?: {
     display?: CommandResultDisplay;
   }) => void;
 };
+
+// ViewMode：list = 文件列表视图；detail = 单文件差异详情视图
 type ViewMode = 'list' | 'detail';
+
+// DiffSource：current = 当前 git 工作区差异；turn = 指定历史轮次的差异
 type DiffSource = {
   type: 'current';
 } | {
   type: 'turn';
   turn: TurnDiff;
 };
+
+/**
+ * turnDiffToDiffData
+ *
+ * 整体流程：
+ *   1. 将 turn.files（Map<string, TurnFileDiff>）展开为数组，
+ *      映射为标准化的文件元数据对象（固定 isBinary=false 等字段）
+ *   2. 按 filePath 字典序排序（localeCompare），确保文件列表稳定有序
+ *   3. 构建 hunks Map：filePath → StructuredPatchHunk[]
+ *   4. 组装并返回 DiffData 对象，loading 固定为 false（数据已同步就绪）
+ *
+ * 在系统中的角色：
+ *   将历史轮次的 TurnDiff 格式统一转换为 DiffDialog 可直接渲染的 DiffData 格式，
+ *   使 DiffDetailView 和 DiffFileList 无需感知数据来源差异。
+ */
 function turnDiffToDiffData(turn: TurnDiff): DiffData {
   const files = Array.from(turn.files.values()).map(f => ({
     path: f.filePath,
@@ -52,18 +124,48 @@ function turnDiffToDiffData(turn: TurnDiff): DiffData {
     loading: false
   };
 }
+/**
+ * DiffDialog 组件
+ *
+ * 整体流程：
+ *   1. 初始化状态：viewMode("list")、selectedIndex(0)、sourceIndex(0)
+ *   2. 构建 sources 数组：[{type:'current'}, ...turnDiffs.map(_temp)]，依赖 turnDiffs 缓存
+ *   3. 根据 sourceIndex 决定 currentTurn（null = 当前 git diff），计算 diffData
+ *   4. 从 diffData.files[selectedIndex] 取 selectedFile，再取对应 selectedHunks
+ *   5. useEffect1：sources 数组缩小时，将 sourceIndex 收缩到合法范围（clamp）
+ *   6. useEffect2：sourceIndex 变化时，重置 selectedIndex=0（切源后从第一个文件开始）
+ *   7. 注册 diff-dialog overlay，禁用 Chat 层键盘绑定（避免穿透）
+ *   8. 注册 6 个键盘绑定（DiffDialog context），管理导航逻辑
+ *   9. 计算 subtitle、headerTitle、headerSubtitle、sourceSelector、dismissShortcut
+ *  10. bb0 标记块：计算 emptyMessage（4 种情况：loading/currentTurn无文件/文件过多/干净工作树）
+ *  11. 计算 title、handleCancel、inputGuide、内容区（空/列表/详情）、Dialog JSX
+ *
+ * 在系统中的角色：
+ *   作为 diff 查看功能的顶层容器，整合数据源切换与双级导航，
+ *   通过 Dialog 组件提供统一的模态框视觉框架。
+ */
 export function DiffDialog(t0) {
+  // _c(73)：初始化 73 个 React Compiler 记忆缓存槽
   const $ = _c(73);
   const {
     messages,
     onDone
   } = t0;
+
+  // 获取当前 git 工作区差异数据（异步加载）
   const gitDiffData = useDiffData();
+  // 从消息历史中提取各轮次差异
   const turnDiffs = useTurnDiffs(messages);
+
+  // 视图状态：list（文件列表）/ detail（单文件详情）
   const [viewMode, setViewMode] = useState("list");
+  // 当前选中的文件索引
   const [selectedIndex, setSelectedIndex] = useState(0);
+  // 当前选中的数据源索引（0 = 当前 git diff，1+ = 历史轮次）
   const [sourceIndex, setSourceIndex] = useState(0);
+
   let t1;
+  // $[0] 槽：缓存静态 {type:"current"} 对象，只创建一次
   if ($[0] === Symbol.for("react.memo_cache_sentinel")) {
     t1 = {
       type: "current"
@@ -73,7 +175,9 @@ export function DiffDialog(t0) {
     t1 = $[0];
   }
   let t2;
+  // $[1]-$[2] 槽：turnDiffs 变化时重建 sources 数组
   if ($[1] !== turnDiffs) {
+    // sources = [{type:'current'}, ...turnDiffs 映射为 {type:'turn', turn}]
     t2 = [t1, ...turnDiffs.map(_temp)];
     $[1] = turnDiffs;
     $[2] = t2;
@@ -81,10 +185,16 @@ export function DiffDialog(t0) {
     t2 = $[2];
   }
   const sources = t2;
+
+  // 当前选中的数据源对象
   const currentSource = sources[sourceIndex];
+  // 若当前源为历史轮次则取 turn，否则为 null（表示使用 git diff）
   const currentTurn = currentSource?.type === "turn" ? currentSource.turn : null;
+
   let t3;
+  // $[3]-$[5] 槽：currentTurn 或 gitDiffData 变化时重新计算 diffData
   if ($[3] !== currentTurn || $[4] !== gitDiffData) {
+    // 历史轮次：转换格式；当前源：直接使用 gitDiffData
     t3 = currentTurn ? turnDiffToDiffData(currentTurn) : gitDiffData;
     $[3] = currentTurn;
     $[4] = gitDiffData;
@@ -93,9 +203,14 @@ export function DiffDialog(t0) {
     t3 = $[5];
   }
   const diffData = t3;
+
+  // 当前选中的文件元数据对象
   const selectedFile = diffData.files[selectedIndex];
+
   let t4;
+  // $[6]-$[8] 槽：diffData.hunks 或 selectedFile 变化时重新取 hunks
   if ($[6] !== diffData.hunks || $[7] !== selectedFile) {
+    // 取选中文件的 hunks 数组；无选中文件时返回空数组
     t4 = selectedFile ? diffData.hunks.get(selectedFile.path) || [] : [];
     $[6] = diffData.hunks;
     $[7] = selectedFile;
@@ -104,15 +219,18 @@ export function DiffDialog(t0) {
     t4 = $[8];
   }
   const selectedHunks = t4;
+
   let t5;
   let t6;
+  // $[9]-$[12] 槽：sourceIndex 或 sources.length 变化时重建 useEffect1 回调和依赖数组
   if ($[9] !== sourceIndex || $[10] !== sources.length) {
+    // useEffect1：sources 缩小时将 sourceIndex 收缩到合法范围
     t5 = () => {
       if (sourceIndex >= sources.length) {
         setSourceIndex(Math.max(0, sources.length - 1));
       }
     };
-    t6 = [sources.length, sourceIndex];
+    t6 = [sources.length, sourceIndex]; // 依赖数组
     $[9] = sourceIndex;
     $[10] = sources.length;
     $[11] = t5;
@@ -122,17 +240,21 @@ export function DiffDialog(t0) {
     t6 = $[12];
   }
   useEffect(t5, t6);
+
+  // prevSourceIndex ref：跟踪上一次的 sourceIndex，用于切源检测
   const prevSourceIndex = useRef(sourceIndex);
   let t7;
   let t8;
+  // $[13]-$[15] 槽：sourceIndex 变化时重建 useEffect2 回调
   if ($[13] !== sourceIndex) {
+    // useEffect2：sourceIndex 实际变化时（通过 ref 比较）重置文件选中状态
     t7 = () => {
       if (prevSourceIndex.current !== sourceIndex) {
-        setSelectedIndex(0);
-        prevSourceIndex.current = sourceIndex;
+        setSelectedIndex(0); // 切换数据源后重置到第一个文件
+        prevSourceIndex.current = sourceIndex; // 同步 ref
       }
     };
-    t8 = [sourceIndex];
+    t8 = [sourceIndex]; // 依赖数组
     $[13] = sourceIndex;
     $[14] = t7;
     $[15] = t8;
@@ -141,19 +263,25 @@ export function DiffDialog(t0) {
     t8 = $[15];
   }
   useEffect(t7, t8);
+
+  // 注册为模态 overlay，阻止 Chat 层键盘绑定和取消请求处理器穿透
   useRegisterOverlay("diff-dialog");
+
   let t10;
   let t9;
+  // $[16]-$[19] 槽：sources.length 或 viewMode 变化时重建 previousSource/nextSource 回调
   if ($[16] !== sources.length || $[17] !== viewMode) {
+    // diff:previousSource（左箭头）：详情模式 → 返回列表；列表模式 → 切换到上一个数据源
     t9 = () => {
       if (viewMode === "detail") {
         setViewMode("list");
       } else {
         if (viewMode === "list" && sources.length > 1) {
-          setSourceIndex(_temp2);
+          setSourceIndex(_temp2); // _temp2: prev => Math.max(0, prev - 1)
         }
       }
     };
+    // diff:nextSource（右箭头）：列表模式且有多个源时，切换到下一个数据源
     t10 = () => {
       if (viewMode === "list" && sources.length > 1) {
         setSourceIndex(prev_0 => Math.min(sources.length - 1, prev_0 + 1));
@@ -167,8 +295,11 @@ export function DiffDialog(t0) {
     t10 = $[18];
     t9 = $[19];
   }
+
   let t11;
+  // $[20]-$[21] 槽：viewMode 变化时重建 back 回调
   if ($[20] !== viewMode) {
+    // diff:back：详情模式时返回列表视图
     t11 = () => {
       if (viewMode === "detail") {
         setViewMode("list");
@@ -179,8 +310,11 @@ export function DiffDialog(t0) {
   } else {
     t11 = $[21];
   }
+
   let t12;
+  // $[22]-$[24] 槽：selectedFile 或 viewMode 变化时重建 viewDetails 回调
   if ($[22] !== selectedFile || $[23] !== viewMode) {
+    // diff:viewDetails（Enter）：列表模式且有选中文件时进入详情视图
     t12 = () => {
       if (viewMode === "list" && selectedFile) {
         setViewMode("detail");
@@ -192,11 +326,14 @@ export function DiffDialog(t0) {
   } else {
     t12 = $[24];
   }
+
   let t13;
+  // $[25]-$[26] 槽：viewMode 变化时重建 previousFile 回调
   if ($[25] !== viewMode) {
+    // diff:previousFile（上箭头）：列表模式时向上移动文件光标，最小值 0
     t13 = () => {
       if (viewMode === "list") {
-        setSelectedIndex(_temp3);
+        setSelectedIndex(_temp3); // _temp3: prev => Math.max(0, prev - 1)
       }
     };
     $[25] = viewMode;
@@ -204,8 +341,11 @@ export function DiffDialog(t0) {
   } else {
     t13 = $[26];
   }
+
   let t14;
+  // $[27]-$[29] 槽：diffData.files.length 或 viewMode 变化时重建 nextFile 回调
   if ($[27] !== diffData.files.length || $[28] !== viewMode) {
+    // diff:nextFile（下箭头）：列表模式时向下移动文件光标，最大值为文件总数-1
     t14 = () => {
       if (viewMode === "list") {
         setSelectedIndex(prev_2 => Math.min(diffData.files.length - 1, prev_2 + 1));
@@ -217,7 +357,9 @@ export function DiffDialog(t0) {
   } else {
     t14 = $[29];
   }
+
   let t15;
+  // $[30]-$[36] 槽：任意一个回调变化时重建 keybindings 映射对象
   if ($[30] !== t10 || $[31] !== t11 || $[32] !== t12 || $[33] !== t13 || $[34] !== t14 || $[35] !== t9) {
     t15 = {
       "diff:previousSource": t9,
@@ -237,18 +379,24 @@ export function DiffDialog(t0) {
   } else {
     t15 = $[36];
   }
+
   let t16;
+  // $[37] 槽：静态 keybindings 选项对象，只创建一次（sentinel 缓存）
   if ($[37] === Symbol.for("react.memo_cache_sentinel")) {
     t16 = {
-      context: "DiffDialog"
+      context: "DiffDialog" // 绑定到 DiffDialog 上下文，避免与全局绑定冲突
     };
     $[37] = t16;
   } else {
     t16 = $[37];
   }
+  // 注册所有 6 个 DiffDialog 键盘绑定
   useKeybindings(t15, t16);
+
   let t17;
+  // $[38]-$[39] 槽：diffData.stats 变化时重建 subtitle JSX
   if ($[38] !== diffData.stats) {
+    // subtitle：展示 "N files changed +X -Y"（stats 存在时）
     t17 = diffData.stats ? <Text dimColor={true}>{diffData.stats.filesCount} {plural(diffData.stats.filesCount, "file")}{" "}changed{diffData.stats.linesAdded > 0 && <Text color="diffAddedWord"> +{diffData.stats.linesAdded}</Text>}{diffData.stats.linesRemoved > 0 && <Text color="diffRemovedWord"> -{diffData.stats.linesRemoved}</Text>}</Text> : null;
     $[38] = diffData.stats;
     $[39] = t17;
@@ -256,10 +404,16 @@ export function DiffDialog(t0) {
     t17 = $[39];
   }
   const subtitle = t17;
+
+  // headerTitle：历史轮次显示 "Turn N"，当前源显示 "Uncommitted changes"
   const headerTitle = currentTurn ? `Turn ${currentTurn.turnIndex}` : "Uncommitted changes";
+  // headerSubtitle：历史轮次显示用户提示预览（带引号），当前源显示 "(git diff HEAD)"
   const headerSubtitle = currentTurn ? currentTurn.userPromptPreview ? `"${currentTurn.userPromptPreview}"` : "" : "(git diff HEAD)";
+
   let t18;
+  // $[40]-$[42] 槽：sourceIndex 或 sources 变化时重建 sourceSelector JSX
   if ($[40] !== sourceIndex || $[41] !== sources) {
+    // sourceSelector：多个数据源时渲染带左右箭头的标签页（◀ Current · T1 · T2 ▶）
     t18 = sources.length > 1 ? <Box>{sourceIndex > 0 && <Text dimColor={true}>◀ </Text>}{sources.map((source, i) => {
         const isSelected = i === sourceIndex;
         const label = source.type === "current" ? "Current" : `T${source.turn.turnIndex}`;
@@ -272,34 +426,48 @@ export function DiffDialog(t0) {
     t18 = $[42];
   }
   const sourceSelector = t18;
+
+  // 获取 dismiss（关闭）快捷键的显示文本（如 "esc"），用于 inputGuide 提示
   const dismissShortcut = useShortcutDisplay("diff:dismiss", "DiffDialog", "esc");
+
   let t19;
+  // bb0 标记块：React Compiler 将 IIFE 转换为带标签的 break 块，计算 emptyMessage
   bb0: {
+    // 情况1：数据加载中
     if (diffData.loading) {
-      t19 = "Loading diff\u2026";
+      t19 = "Loading diff\u2026"; // "Loading diff…"
       break bb0;
     }
+    // 情况2：历史轮次但没有文件变更
     if (currentTurn) {
       t19 = "No file changes in this turn";
       break bb0;
     }
+    // 情况3：有 stats 但文件列表为空（文件数过多，超出展示限制）
     if (diffData.stats && diffData.stats.filesCount > 0 && diffData.files.length === 0) {
       t19 = "Too many files to display details";
       break bb0;
     }
+    // 情况4：工作区干净，无任何变更
     t19 = "Working tree is clean";
   }
   const emptyMessage = t19;
+
   let t20;
+  // $[43]-$[44] 槽：headerSubtitle 变化时重建副标题 Text JSX
   if ($[43] !== headerSubtitle) {
+    // 有副标题时渲染暗色文本（空字符串时渲染 null）
     t20 = headerSubtitle && <Text dimColor={true}> {headerSubtitle}</Text>;
     $[43] = headerSubtitle;
     $[44] = t20;
   } else {
     t20 = $[44];
   }
+
   let t21;
+  // $[45]-$[47] 槽：headerTitle 或 t20 变化时重建 title JSX
   if ($[45] !== headerTitle || $[46] !== t20) {
+    // title = "Uncommitted changes (git diff HEAD)" 或 "Turn N "用户提示预览""
     t21 = <Text>{headerTitle}{t20}</Text>;
     $[45] = headerTitle;
     $[46] = t20;
@@ -308,14 +476,17 @@ export function DiffDialog(t0) {
     t21 = $[47];
   }
   const title = t21;
+
   let t22;
+  // $[48]-$[50] 槽：onDone 或 viewMode 变化时重建 handleCancel 函数
   if ($[48] !== onDone || $[49] !== viewMode) {
+    // handleCancel：详情模式 → 返回列表；列表模式 → 关闭对话框（调用 onDone）
     t22 = function handleCancel() {
       if (viewMode === "detail") {
         setViewMode("list");
       } else {
         onDone("Diff dialog dismissed", {
-          display: "system"
+          display: "system" // 以系统消息形式通知关闭
         });
       }
     };
@@ -326,8 +497,14 @@ export function DiffDialog(t0) {
     t22 = $[50];
   }
   const handleCancel = t22;
+
   let t23;
+  // $[51]-$[54] 槽：dismissShortcut/sources.length/viewMode 变化时重建 inputGuide 函数
   if ($[51] !== dismissShortcut || $[52] !== sources.length || $[53] !== viewMode) {
+    // inputGuide 函数：根据 exitState.pending 和 viewMode 动态渲染底部操作提示
+    // - pending=true：显示"再按一次退出"提示
+    // - list 模式：显示 ←/→ source（多源时）、↑/↓ select、Enter view、esc close
+    // - detail 模式：显示 ← back、esc close
     t23 = exitState => exitState.pending ? <Text>Press {exitState.keyName} again to exit</Text> : viewMode === "list" ? <Byline>{sources.length > 1 && <Text>←/→ source</Text>}<Text>↑/↓ select</Text><Text>Enter view</Text><Text>{dismissShortcut} close</Text></Byline> : <Byline><Text>← back</Text><Text>{dismissShortcut} close</Text></Byline>;
     $[51] = dismissShortcut;
     $[52] = sources.length;
@@ -336,8 +513,11 @@ export function DiffDialog(t0) {
   } else {
     t23 = $[54];
   }
+
   let t24;
+  // $[55]-$[65] 槽：10 个差异数据字段任一变化时重建内容区 JSX
   if ($[55] !== diffData.files || $[56] !== emptyMessage || $[57] !== selectedFile?.isBinary || $[58] !== selectedFile?.isLargeFile || $[59] !== selectedFile?.isTruncated || $[60] !== selectedFile?.isUntracked || $[61] !== selectedFile?.path || $[62] !== selectedHunks || $[63] !== selectedIndex || $[64] !== viewMode) {
+    // 三路分支：空文件列表 → 显示 emptyMessage；list 视图 → DiffFileList；detail 视图 → DiffDetailView
     t24 = diffData.files.length === 0 ? <Box marginTop={1}><Text dimColor={true}>{emptyMessage}</Text></Box> : viewMode === "list" ? <Box flexDirection="column" marginTop={1}><DiffFileList files={diffData.files} selectedIndex={selectedIndex} /></Box> : <Box flexDirection="column" marginTop={1}><DiffDetailView filePath={selectedFile?.path || ""} hunks={selectedHunks} isLargeFile={selectedFile?.isLargeFile} isBinary={selectedFile?.isBinary} isTruncated={selectedFile?.isTruncated} isUntracked={selectedFile?.isUntracked} /></Box>;
     $[55] = diffData.files;
     $[56] = emptyMessage;
@@ -353,8 +533,11 @@ export function DiffDialog(t0) {
   } else {
     t24 = $[65];
   }
+
   let t25;
+  // $[66]-$[72] 槽：任意显示依赖变化时重建最终 Dialog JSX
   if ($[66] !== handleCancel || $[67] !== sourceSelector || $[68] !== subtitle || $[69] !== t23 || $[70] !== t24 || $[71] !== title) {
+    // 渲染 Dialog，包含：sourceSelector（数据源选择器）、subtitle（统计信息）、内容区（文件列表/详情/空提示）
     t25 = <Dialog title={title} onCancel={handleCancel} color="background" inputGuide={t23}>{sourceSelector}{subtitle}{t24}</Dialog>;
     $[66] = handleCancel;
     $[67] = sourceSelector;
@@ -368,12 +551,39 @@ export function DiffDialog(t0) {
   }
   return t25;
 }
+
+/**
+ * _temp3（React Compiler 提取的辅助函数）
+ *
+ * 整体流程：
+ *   - 原始源码：setSelectedIndex(prev => Math.max(0, prev - 1))
+ *   - React Compiler 提取为模块作用域函数，避免每次渲染创建新的函数引用
+ *   - 用于 diff:previousFile 按键绑定，向上移动文件光标（不低于 0）
+ */
 function _temp3(prev_1) {
   return Math.max(0, prev_1 - 1);
 }
+
+/**
+ * _temp2（React Compiler 提取的辅助函数）
+ *
+ * 整体流程：
+ *   - 原始源码：setSourceIndex(prev => Math.max(0, prev - 1))
+ *   - React Compiler 提取为模块作用域函数，避免闭包重建
+ *   - 用于 diff:previousSource 按键绑定，向左切换数据源（不低于 0）
+ */
 function _temp2(prev) {
   return Math.max(0, prev - 1);
 }
+
+/**
+ * _temp（React Compiler 提取的辅助函数）
+ *
+ * 整体流程：
+ *   - 原始源码：turnDiffs.map(turn => ({type: 'turn', turn}))
+ *   - React Compiler 提取为模块作用域函数，提供稳定的 map 回调引用
+ *   - 将 TurnDiff 包装为 DiffSource 对象，加入 sources 数组
+ */
 function _temp(turn) {
   return {
     type: "turn",

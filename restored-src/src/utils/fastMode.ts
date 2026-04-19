@@ -1,3 +1,23 @@
+/**
+ * 快速模式（Fast Mode）管理模块。
+ *
+ * 在 Claude Code 系统中，该模块负责管理"快速模式"功能的状态与切换，
+ * 快速模式允许用户在 claude.ai 订阅下使用更高速的推理模型（如 haiku 系列），
+ * 以牺牲部分能力换取更快的响应速度和更低的额外用量消耗：
+ * - 通过 GrowthBook 特征标志与 OAuth 鉴权判断快速模式可用性
+ * - 从全局配置持久化快速模式开关状态
+ * - 提供快速模式下的模型选择与 API 请求头注入逻辑
+ */
+/**
+ * 快速模式（Fast Mode）管理模块。
+ *
+ * 在 Claude Code 系统中，该模块负责管理"快速模式"功能的状态与切换，
+ * 快速模式允许用户在 claude.ai 订阅下使用更高速的推理模型（如 haiku 系列），
+ * 以牺牲部分能力换取更快的响应速度和更低的额外用量消耗：
+ * - 通过 GrowthBook 特征标志与 OAuth 鉴权判断快速模式可用性
+ * - 从全局配置持久化快速模式开关状态
+ * - 提供快速模式下的模型选择与 API 请求头注入逻辑
+ */
 import axios from 'axios'
 import { getOauthConfig, OAUTH_BETA_HEADER } from 'src/constants/oauth.js'
 import { getFeatureValue_CACHED_MAY_BE_STALE } from 'src/services/analytics/growthbook.js'

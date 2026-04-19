@@ -1,3 +1,25 @@
+/**
+ * 文件系统操作核心模块。
+ *
+ * 在 Claude Code 系统中，该模块提供文件读写、路径解析、编码检测等核心文件系统操作，
+ * 是工具（Tool）层访问本地文件的主要入口：
+ * - 文件读取：支持 UTF-8 / Latin-1 编码自动检测，处理 BOM、CRLF 等格式差异
+ * - 文件写入：支持原子写入、权限设置、备份与回滚
+ * - 路径工具：路径规范化、home 目录展开、安全路径验证
+ * - 目录操作：递归创建、存在性检查、stat 信息获取
+ * - 通过 fileReadCache 缓存热点文件内容，减少重复 I/O
+ */
+/**
+ * 文件系统操作核心模块。
+ *
+ * 在 Claude Code 系统中，该模块提供文件读写、路径解析、编码检测等核心文件系统操作，
+ * 是工具（Tool）层访问本地文件的主要入口：
+ * - 文件读取：支持 UTF-8 / Latin-1 编码自动检测，处理 BOM、CRLF 等格式差异
+ * - 文件写入：支持原子写入、权限设置、备份与回滚
+ * - 路径工具：路径规范化、home 目录展开、安全路径验证
+ * - 目录操作：递归创建、存在性检查、stat 信息获取
+ * - 通过 fileReadCache 缓存热点文件内容，减少重复 I/O
+ */
 import { chmodSync, writeFileSync as fsWriteFileSync } from 'fs'
 import { realpath, stat } from 'fs/promises'
 import { homedir } from 'os'

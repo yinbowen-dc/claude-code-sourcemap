@@ -1,3 +1,25 @@
+/**
+ * AgentTool 提示构建模块
+ *
+ * 在 Claude Code AgentTool 层中，该模块负责构建 Agent 工具的提示文本——
+ * 包括工具描述、Agent 列表格式化、提示注入方式选择，以及完整的工具提示组装。
+ *
+ * 核心职责：
+ * 1. `getToolsDescription()` — 根据工具白名单/黑名单规则生成工具描述字符串
+ * 2. `formatAgentLine()` — 将单个 Agent 格式化为 agent_listing_delta 附件消息的一行
+ * 3. `shouldInjectAgentListInMessages()` — 决定 Agent 列表是否通过附件消息而非内联方式注入
+ * 4. `getPrompt()` — 异步组装完整的 Agent 工具提示（含条件区块、示例、用法说明）
+ *
+ * 设计说明：
+ * - Agent 列表曾是工具描述中的动态内容，占 fleet cache_creation token 的约 10.2%。
+ *   通过 shouldInjectAgentListInMessages() 将其移至附件消息，使工具描述保持静态，
+ *   避免 MCP 连接/插件重载/权限变更导致的工具 schema 缓存失效。
+ * - Fork 特性启用时，提示中增加"When to fork"区块和 fork 专属示例；
+ *   Coordinator 模式使用精简提示（仅共享核心区块，不含完整用法说明）。
+ * - 嵌入式搜索工具（Ant 原生构建）使用 find/grep via Bash，
+ *   而非专用的 Glob/Grep 工具。
+ */
+
 import { getFeatureValue_CACHED_MAY_BE_STALE } from '../../services/analytics/growthbook.js'
 import { getSubscriptionType } from '../../utils/auth.js'
 import { hasEmbeddedSearchTools } from '../../utils/embeddedTools.js'
@@ -12,33 +34,49 @@ import { AGENT_TOOL_NAME } from './constants.js'
 import { isForkSubagentEnabled } from './forkSubagent.js'
 import type { AgentDefinition } from './loadAgentsDir.js'
 
+/**
+ * 根据 Agent 的工具白名单和黑名单生成工具描述字符串。
+ *
+ * 逻辑规则：
+ * - 白名单 + 黑名单同时存在：先过滤黑名单，输出有效工具列表（或 'None'）
+ * - 仅白名单：直接输出允许的工具列表
+ * - 仅黑名单：输出 "All tools except X, Y, Z"
+ * - 无限制：输出 "All tools"
+ *
+ * @param agent Agent 定义
+ * @returns 工具描述字符串
+ */
 function getToolsDescription(agent: AgentDefinition): string {
   const { tools, disallowedTools } = agent
   const hasAllowlist = tools && tools.length > 0
   const hasDenylist = disallowedTools && disallowedTools.length > 0
 
   if (hasAllowlist && hasDenylist) {
-    // Both defined: filter allowlist by denylist to match runtime behavior
+    // 白名单和黑名单同时存在：过滤黑名单，输出有效工具列表（与运行时行为一致）
     const denySet = new Set(disallowedTools)
     const effectiveTools = tools.filter(t => !denySet.has(t))
     if (effectiveTools.length === 0) {
-      return 'None'
+      return 'None'  // 所有白名单工具均被黑名单排除
     }
     return effectiveTools.join(', ')
   } else if (hasAllowlist) {
-    // Allowlist only: show the specific tools available
+    // 仅白名单：直接显示可用工具列表
     return tools.join(', ')
   } else if (hasDenylist) {
-    // Denylist only: show "All tools except X, Y, Z"
+    // 仅黑名单：显示"除了 X, Y, Z 外的所有工具"
     return `All tools except ${disallowedTools.join(', ')}`
   }
-  // No restrictions
+  // 无任何限制：所有工具可用
   return 'All tools'
 }
 
 /**
- * Format one agent line for the agent_listing_delta attachment message:
- * `- type: whenToUse (Tools: ...)`.
+ * 将单个 Agent 格式化为 agent_listing_delta 附件消息的一行。
+ *
+ * 输出格式：`- type: whenToUse (Tools: ...)`
+ *
+ * @param agent Agent 定义
+ * @returns 格式化后的单行 Agent 描述字符串
  */
 export function formatAgentLine(agent: AgentDefinition): string {
   const toolsDescription = getToolsDescription(agent)
@@ -46,37 +84,65 @@ export function formatAgentLine(agent: AgentDefinition): string {
 }
 
 /**
- * Whether the agent list should be injected as an attachment message instead
- * of embedded in the tool description. When true, getPrompt() returns a static
- * description and attachments.ts emits an agent_listing_delta attachment.
+ * 决定 Agent 列表是否通过附件消息注入，而非内联到工具描述中。
  *
- * The dynamic agent list was ~10.2% of fleet cache_creation tokens: MCP async
- * connect, /reload-plugins, or permission-mode changes mutate the list →
- * description changes → full tool-schema cache bust.
+ * 当返回 true 时，getPrompt() 返回静态描述，attachments.ts 发出 agent_listing_delta 附件。
  *
- * Override with CLAUDE_CODE_AGENT_LIST_IN_MESSAGES=true/false for testing.
+ * 背景：动态 Agent 列表占 fleet cache_creation token 的约 10.2%。
+ * MCP 异步连接、/reload-plugins 或权限模式变更都会改变列表内容，
+ * 从而导致工具描述变化 → 完整工具 schema 缓存失效。
+ * 将列表移至附件消息可使工具描述保持静态，避免频繁缓存失效。
+ *
+ * 通过 CLAUDE_CODE_AGENT_LIST_IN_MESSAGES=true/false 环境变量覆盖（用于测试）。
+ *
+ * @returns 是否通过附件消息注入 Agent 列表
  */
 export function shouldInjectAgentListInMessages(): boolean {
+  // 环境变量强制启用
   if (isEnvTruthy(process.env.CLAUDE_CODE_AGENT_LIST_IN_MESSAGES)) return true
+  // 环境变量强制禁用
   if (isEnvDefinedFalsy(process.env.CLAUDE_CODE_AGENT_LIST_IN_MESSAGES))
     return false
+  // GrowthBook A/B 测试控制（默认关闭）
   return getFeatureValue_CACHED_MAY_BE_STALE('tengu_agent_list_attach', false)
 }
 
+/**
+ * 异步构建完整的 Agent 工具提示字符串。
+ *
+ * 提示组成：
+ * 1. `shared`：核心区块（工具简介 + Agent 列表 + subagent_type 说明）
+ * 2. Coordinator 模式：仅返回 shared（coordinator 系统提示已包含完整用法说明）
+ * 3. 非 Coordinator 模式：追加以下区块：
+ *    - `whenNotToUseSection`（fork 模式下省略）
+ *    - `concurrencyNote`（非 pro 订阅用户 + 非附件列表模式时显示）
+ *    - 后台任务说明（非禁用后台任务 + 非 in-process teammate + 非 fork 模式时显示）
+ *    - SendMessage 工具使用说明
+ *    - worktree/remote 隔离说明
+ *    - teammate 限制说明
+ *    - `whenToForkSection`（fork 模式下显示）
+ *    - `writingThePromptSection`
+ *    - 示例（fork 模式使用 forkExamples，否则使用 currentExamples）
+ *
+ * @param agentDefinitions 当前会话中可用的 Agent 定义列表
+ * @param isCoordinator 是否为 Coordinator 模式（使用精简提示）
+ * @param allowedAgentTypes 允许生成的 Agent 类型白名单（Agent(x,y) 调用时限制子 Agent 类型）
+ * @returns 完整的 Agent 工具提示字符串
+ */
 export async function getPrompt(
   agentDefinitions: AgentDefinition[],
   isCoordinator?: boolean,
   allowedAgentTypes?: string[],
 ): Promise<string> {
-  // Filter agents by allowed types when Agent(x,y) restricts which agents can be spawned
+  // 当 Agent(x,y) 限制可生成的子 Agent 类型时，按白名单过滤
   const effectiveAgents = allowedAgentTypes
     ? agentDefinitions.filter(a => allowedAgentTypes.includes(a.agentType))
     : agentDefinitions
 
-  // Fork subagent feature: when enabled, insert the "When to fork" section
-  // (fork semantics, directive-style prompts) and swap in fork-aware examples.
+  // Fork 子 Agent 特性：启用时插入"When to fork"区块和 fork 专属示例
   const forkEnabled = isForkSubagentEnabled()
 
+  // "When to fork"区块（仅 fork 模式下显示）
   const whenToForkSection = forkEnabled
     ? `
 
@@ -96,6 +162,7 @@ Forks are cheap because they share your prompt cache. Don't set \`model\` on a f
 `
     : ''
 
+  // "Writing the prompt"区块（所有模式均显示）
   const writingThePromptSection = `
 
 ## Writing the prompt
@@ -112,6 +179,7 @@ ${forkEnabled ? 'For fresh agents, terse' : 'Terse'} command-style prompts produ
 **Never delegate understanding.** Don't write "based on your findings, fix the bug" or "based on the research, implement it." Those phrases push synthesis onto the agent instead of doing it yourself. Write prompts that prove you understood: include file paths, line numbers, what specifically to change.
 `
 
+  // Fork 模式专属示例（含 fork 语义说明和"不要预测结果"示例）
   const forkExamples = `Example usage:
 
 <example>
@@ -153,6 +221,7 @@ ${AGENT_TOOL_NAME}({
 </example>
 `
 
+  // 当前模式（非 fork）的标准示例
   const currentExamples = `Example usage:
 
 <example_agent_descriptions>
@@ -187,18 +256,18 @@ assistant: "I'm going to use the ${AGENT_TOOL_NAME} tool to launch the greeting-
 </example>
 `
 
-  // When the gate is on, the agent list lives in an agent_listing_delta
-  // attachment (see attachments.ts) instead of inline here. This keeps the
-  // tool description static across MCP/plugin/permission changes so the
-  // tools-block prompt cache doesn't bust every time an agent loads.
+  // 当特性开关启用时，Agent 列表通过 agent_listing_delta 附件消息注入（见 attachments.ts），
+  // 而非内联到工具描述中。这使工具描述在 MCP/插件/权限变更时保持静态，
+  // 避免 tools-block 提示缓存因 Agent 列表变化而频繁失效。
   const listViaAttachment = shouldInjectAgentListInMessages()
 
+  // Agent 列表区块：附件模式使用 system-reminder 引用，内联模式直接列出所有 Agent
   const agentListSection = listViaAttachment
     ? `Available agent types are listed in <system-reminder> messages in the conversation.`
     : `Available agent types and the tools they have access to:
 ${effectiveAgents.map(agent => formatAgentLine(agent)).join('\n')}`
 
-  // Shared core prompt used by both coordinator and non-coordinator modes
+  // 共享核心区块：Coordinator 和非 Coordinator 模式均使用
   const shared = `Launch a new agent to handle complex, multi-step tasks autonomously.
 
 The ${AGENT_TOOL_NAME} tool launches specialized agents (subprocesses) that autonomously handle complex tasks. Each agent type has specific capabilities and tools available to it.
@@ -211,24 +280,22 @@ ${
     : `When using the ${AGENT_TOOL_NAME} tool, specify a subagent_type parameter to select which agent type to use. If omitted, the general-purpose agent is used.`
 }`
 
-  // Coordinator mode gets the slim prompt -- the coordinator system prompt
-  // already covers usage notes, examples, and when-not-to-use guidance.
+  // Coordinator 模式使用精简提示——coordinator 系统提示已包含用法说明、示例和"何时不用"引导
   if (isCoordinator) {
     return shared
   }
 
-  // Ant-native builds alias find/grep to embedded bfs/ugrep and remove the
-  // dedicated Glob/Grep tools, so point at find via Bash instead.
+  // Ant 原生构建使用嵌入式 find/grep（通过 Bash 工具），而非专用 Glob/Grep 工具
   const embedded = hasEmbeddedSearchTools()
   const fileSearchHint = embedded
     ? '`find` via the Bash tool'
     : `the ${GLOB_TOOL_NAME} tool`
-  // The "class Foo" example is about content search. Non-embedded stays Glob
-  // (original intent: find-the-file-containing). Embedded gets grep because
-  // find -name doesn't look at file contents.
+  // 内容搜索提示：非嵌入式构建使用 Glob（原意：查找包含内容的文件），嵌入式使用 grep
   const contentSearchHint = embedded
     ? '`grep` via the Bash tool'
     : `the ${GLOB_TOOL_NAME} tool`
+
+  // "何时不用 Agent 工具"区块（fork 模式下省略，因为 fork 替代了大部分场景）
   const whenNotToUseSection = forkEnabled
     ? ''
     : `
@@ -239,16 +306,15 @@ When NOT to use the ${AGENT_TOOL_NAME} tool:
 - Other tasks that are not related to the agent descriptions above
 `
 
-  // When listing via attachment, the "launch multiple agents" note is in the
-  // attachment message (conditioned on subscription there). When inline, keep
-  // the existing per-call getSubscriptionType() check.
+  // 并发启动提示：仅在非附件列表模式且非 pro 订阅时显示
+  // （附件模式下，并发提示在附件消息中按订阅类型条件显示）
   const concurrencyNote =
     !listViaAttachment && getSubscriptionType() !== 'pro'
       ? `
 - Launch multiple agents concurrently whenever possible, to maximize performance; to do that, use a single message with multiple tool uses`
       : ''
 
-  // Non-coordinator gets the full prompt with all sections
+  // 非 Coordinator 模式：返回包含所有区块的完整提示
   return `${shared}
 ${whenNotToUseSection}
 

@@ -1,3 +1,43 @@
+/**
+ * replBridge.ts — Bootstrap-free REPL Bridge 核心实现（v1 env-based + v2 CCR）
+ *
+ * 在 Claude Code 系统流程中的位置：
+ *   Bridge 层核心模块
+ *     ├─> initReplBridge.ts（读取 bootstrap 状态，调用 initBridgeCore）
+ *     ├─> remoteBridgeCore.ts（env-less Bridge v2，调用 initBridgeCore）
+ *     ├─> bridgeMain.ts（standalone bridge，调用 initBridgeCore）
+ *     └─> replBridge.ts（本文件）——无状态核心，所有上下文通过参数注入
+ *
+ * 主要功能：
+ *   - initBridgeCore：Bootstrap-free Bridge 核心初始化
+ *     1. POST /bridge/register → 注册 Bridge 环境（获取 environmentId + environmentSecret）
+ *     2. POST /v1/sessions → 创建 Bridge 会话（获取 sessionId）
+ *     3. 写入崩溃恢复指针（bridgePointer.json）
+ *     4. 启动工作轮询循环（startWorkPollLoop）
+ *     5. 工作到达时连接入口传输层（v1 HybridTransport 或 v2 CCR SSE+HTTP）
+ *     6. 返回 BridgeCoreHandle（含 writeMessages/writeSdkMessages/teardown 等方法）
+ *   - startWorkPollLoop：持续轮询工作项的后台循环
+ *     - 空闲时以 poll_interval_ms_not_at_capacity 频率轮询
+ *     - 有工作时以 poll_interval_ms_at_capacity 心跳（保持租约 < 300s TTL）
+ *     - 环境 404 时触发 onEnvironmentLost → 重新注册+重连会话（最多 3 次）
+ *     - 致命错误（401/403/404/410）时触发 onFatalError → 完整 teardown
+ *
+ * 关键设计：
+ *   - Bootstrap-free：不直接读取 bootstrap 状态/sessionStorage，所有依赖通过 BridgeCoreParams 注入
+ *   - 依赖注入（createSession/archiveSession/toSDKMessages/onAuth401 等）：
+ *     避免把 REPL 的 React 树/命令注册表拖入 Agent SDK bundle（bun --outfile 行为）
+ *   - v1/v2 双路传输：server 通过 work secret 的 use_code_sessions 字段决定；
+ *     CLAUDE_BRIDGE_USE_CCR_V2 env var 可供 ant 开发者强制切换到 v2
+ *   - 崩溃恢复（bridgePointer）：写入 {dir}/bridge-pointer.json，kill -9 后下次启动可恢复
+ *   - perpetual 模式（daemon）：teardown 保留服务端会话，下次启动 reconnectSession 重入队列
+ *   - 重连策略（doReconnect）：
+ *     策略 1（reconnect-in-place）：环境存活→ reconnectSession 重入队列，URL 不变
+ *     策略 2（fresh session）：环境已过期 → archive + createSession，最多 3 次
+ *   - BoundedUUIDSet：2000 容量环形缓冲，防止自身消息回声 + 传输层竞争去重
+ *   - FlushGate：初始刷新期间门控 writeMessages()，避免历史与新消息在服务端交叉
+ *   - SSE 序列号（lastTransportSequenceNum）：跨传输交换保持高水位，避免服务端重放全历史
+ *   - CapacityWake：满载时心跳 + 传输丢失时提前唤醒轮询循环
+ */
 // biome-ignore-all assist/source/organizeImports: ANT-ONLY import markers must not be reordered
 import { randomUUID } from 'crypto'
 import {

@@ -1,3 +1,14 @@
+/**
+ * 带缓冲的写入器工厂模块。
+ *
+ * 在 Claude Code 系统中，该模块提供 BufferedWriter 对象，
+ * 将频繁的小写入聚合后批量刷新到底层 writeFn，以减少 I/O 次数：
+ * - 定时刷新（flushIntervalMs，默认 1 秒）
+ * - 超出条数（maxBufferSize，默认 100 条）或字节上限时触发异步溢出刷新（flushDeferred）
+ * - immediateMode：直接透传，不缓冲（用于非交互场景）
+ * - flush()：同步强制刷新；dispose()：等同于 flush，用于清理时调用
+ * - 溢出写入使用 setImmediate 延迟，避免阻塞当前 tick（如渲染或键盘响应）
+ */
 type WriteFn = (content: string) => void
 
 export type BufferedWriter = {
@@ -6,6 +17,14 @@ export type BufferedWriter = {
   dispose: () => void
 }
 
+/**
+ * 创建带缓冲的写入器。
+ * @param writeFn - 实际执行写入的函数（如 appendFileSync 包装）
+ * @param flushIntervalMs - 定时刷新间隔（默认 1000ms）
+ * @param maxBufferSize - 触发溢出刷新的最大缓冲条数（默认 100）
+ * @param maxBufferBytes - 触发溢出刷新的最大缓冲字节数（默认无限制）
+ * @param immediateMode - 若为 true 则直接透传，不缓冲
+ */
 export function createBufferedWriter({
   writeFn,
   flushIntervalMs = 1000,

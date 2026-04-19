@@ -1,3 +1,27 @@
+/**
+ * AgentsMenu.tsx — Agent 管理菜单主组件
+ *
+ * 【在 Claude Code 系统流程中的位置】
+ * 本文件是 Agent 管理功能的顶层路由组件，位于 src/components/agents/ 目录下。
+ * 由 `/agents` 命令触发后渲染，承担所有 Agent 管理子视图的状态路由与页面切换。
+ * 接收 tools（可用工具列表）和 onExit（退出回调）两个 props。
+ *
+ * 【主要功能】
+ * 1. 状态路由（ModeState）：通过 modeState.mode 在 6 种视图间切换：
+ *    - list-agents：展示所有 Agent 列表（AgentsList）
+ *    - create-agent：新建 Agent 向导（CreateAgentWizard）
+ *    - agent-menu：单个 Agent 操作菜单（查看/编辑/删除/返回）
+ *    - view-agent：查看 Agent 详情（AgentDetail）
+ *    - delete-confirm：删除确认对话框
+ *    - edit-agent：编辑 Agent（AgentEditor）
+ * 2. agentsBySource 映射：按 SettingSource 分类缓存所有 Agent
+ * 3. handleAgentCreated：新建/编辑完成后，添加变更记录并返回列表
+ * 4. handleAgentDeleted：删除 Agent 后更新 AppState 并返回列表
+ * 5. changes 变更历史：退出时汇总所有操作记录并通过 onExit 传出
+ * 6. React Compiler 优化：使用 _c(157) 分配 157 个缓存槽，
+ *    配合 Symbol.for("react.memo_cache_sentinel") 实现精细化记忆
+ * 7. _temp/_temp0~_temp9：提升到模块级的 AppState 选择器和 Agent 来源过滤函数
+ */
 import { c as _c } from "react/compiler-runtime";
 import chalk from 'chalk';
 import * as React from 'react';
@@ -22,18 +46,30 @@ import { AgentsList } from './AgentsList.js';
 import { deleteAgentFromFile } from './agentFileUtils.js';
 import { CreateAgentWizard } from './new-agent-creation/CreateAgentWizard.js';
 import type { ModeState } from './types.js';
+// Props 类型：tools 为可用工具集合，onExit 为退出回调（可携带操作摘要和显示选项）
 type Props = {
   tools: Tools;
   onExit: (result?: string, options?: {
     display?: CommandResultDisplay;
   }) => void;
 };
+/**
+ * AgentsMenu 组件 — Agent 管理界面的状态机主控组件
+ *
+ * 通过 modeState.mode 在各子视图间路由。
+ * 使用 React Compiler 分配 157 个缓存槽（$[0]~$[156]），
+ * 对所有派生状态（agentsBySource、回调函数、JSX 节点）进行精细化记忆。
+ */
 export function AgentsMenu(t0) {
+  // React Compiler 分配 157 个缓存槽，用于精细化记忆所有派生值
   const $ = _c(157);
+  // 解构 props
   const {
     tools,
     onExit
   } = t0;
+  // 初始化 modeState：首次渲染时创建默认值（list-agents + all），
+  // 后续渲染直接复用缓存的对象引用，避免无谓的 re-render
   let t1;
   if ($[0] === Symbol.for("react.memo_cache_sentinel")) {
     t1 = {
@@ -44,15 +80,21 @@ export function AgentsMenu(t0) {
   } else {
     t1 = $[0];
   }
+  // modeState：当前视图模式状态机，控制渲染哪个子视图
   const [modeState, setModeState] = useState(t1);
+  // 从 AppState 中选取 agentDefinitions（包含 allAgents 和 activeAgents）
   const agentDefinitions = useAppState(_temp);
+  // 从 AppState 中选取 MCP 工具列表
   const mcpTools = useAppState(_temp2);
+  // 从 AppState 中选取工具权限上下文
   const toolPermissionContext = useAppState(_temp3);
   const setAppState = useSetAppState();
+  // 解构 agentDefinitions：allAgents 为全集，agents（activeAgents）为激活的 Agent 列表
   const {
     allAgents,
     activeAgents: agents
   } = agentDefinitions;
+  // 初始化 changes 数组：首次渲染时创建空数组，后续复用缓存引用
   let t2;
   if ($[1] === Symbol.for("react.memo_cache_sentinel")) {
     t2 = [];
@@ -60,9 +102,14 @@ export function AgentsMenu(t0) {
   } else {
     t2 = $[1];
   }
+  // changes：记录本次会话内所有变更操作的字符串数组（用于退出时汇总显示）
   const [changes, setChanges] = useState(t2);
+  // 合并 tools（内置工具）与 mcpTools（MCP 工具），得到完整工具列表
   const mergedTools = useMergedTools(tools, mcpTools, toolPermissionContext);
+  // 注册 Ctrl+C/D 退出确认钩子（在底部 AgentNavigationFooter 中显示确认提示）
   useExitOnCtrlCDWithKeybindings();
+  // 按 source 分类过滤 allAgents，每类缓存独立更新：
+  // t3: built-in Agent 列表
   let t3;
   if ($[2] !== allAgents) {
     t3 = allAgents.filter(_temp4);
@@ -71,6 +118,7 @@ export function AgentsMenu(t0) {
   } else {
     t3 = $[3];
   }
+  // t4: userSettings Agent 列表
   let t4;
   if ($[4] !== allAgents) {
     t4 = allAgents.filter(_temp5);

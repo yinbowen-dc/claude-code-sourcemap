@@ -1,3 +1,11 @@
+/**
+ * Computer Use 单轮清理模块。
+ *
+ * 在 Claude Code 系统中，该模块在每次 Computer Use 工具调用轮次结束后执行清理：
+ * - cleanupComputerUseAfterTurn()：取消隐藏本轮被隐藏的应用（最多等待 UNHIDE_TIMEOUT_MS = 5000ms）、
+ *   释放 computer-use.lock 文件锁、向操作系统发送"已完成使用您的计算机"通知，
+ *   并注销 Esc 全局热键。
+ */
 import type { ToolUseContext } from '../../Tool.js'
 
 import { logForDebugging } from '../debug.js'
@@ -6,26 +14,24 @@ import { withResolvers } from '../withResolvers.js'
 import { isLockHeldLocally, releaseComputerUseLock } from './computerUseLock.js'
 import { unregisterEscHotkey } from './escHotkey.js'
 
-// cu.apps.unhide is NOT one of the four @MainActor methods wrapped by
-// drainRunLoop's 30s backstop. On abort paths (where the user hit Ctrl+C
-// because something was slow) a hang here would wedge the abort. Generous
-// timeout — unhide should be ~instant; if it takes 5s something is wrong
-// and proceeding is better than waiting. The Swift call continues in the
-// background regardless; we just stop blocking on it.
+// cu.apps.unhide 不在 drainRunLoop 30 秒兜底机制保护的四个 @MainActor 方法之列。
+// 在中止路径（用户因操作缓慢按下 Ctrl+C）中，若此处挂起会导致中止流程卡死。
+// 设置宽松超时 —— 取消隐藏应该是瞬时的；若超过 5 秒则说明出现异常，
+// 继续执行优于无限等待。Swift 调用会在后台继续运行；我们只是停止阻塞等待它。
 const UNHIDE_TIMEOUT_MS = 5000
 
 /**
- * Turn-end cleanup for the chicago MCP surface: auto-unhide apps that
- * `prepareForAction` hid, then release the file-based lock.
+ * chicago MCP surface 的轮次结束清理：自动取消隐藏
+ * `prepareForAction` 隐藏的应用，然后释放基于文件的锁。
  *
- * Called from three sites: natural turn end (`stopHooks.ts`), abort during
- * streaming (`query.ts` aborted_streaming), abort during tool execution
- * (`query.ts` aborted_tools). All three reach this via dynamic import gated
- * on `feature('CHICAGO_MCP')`. `executor.js` (which pulls both native
- * modules) is dynamic-imported below so non-CU turns don't load native
- * modules just to no-op.
+ * 在三处被调用：正常轮次结束（`stopHooks.ts`）、
+ * 流式传输中的中止（`query.ts` aborted_streaming）、
+ * 工具执行中的中止（`query.ts` aborted_tools）。
+ * 三者均通过受 `feature('CHICAGO_MCP')` 门控的动态 import 到达此处。
+ * 下方动态导入 `executor.js`（包含两个 native 模块），
+ * 使非 CU 轮次不会因加载 native 模块只是 no-op 而产生开销。
  *
- * No-ops cheaply on non-CU turns: both gate checks are zero-syscall.
+ * 对非 CU 轮次低开销 no-op：两个门控检查均无系统调用。
  */
 export async function cleanupComputerUseAfterTurn(
   ctx: Pick<
@@ -61,14 +67,14 @@ export async function cleanupComputerUseAfterTurn(
     )
   }
 
-  // Zero-syscall pre-check so non-CU turns don't touch disk. Release is still
-  // idempotent (returns false if already released or owned by another session).
+  // 零系统调用预检查，使非 CU 轮次不触及磁盘。释放操作幂等
+  // （若已释放或由其他 session 持有，返回 false）。
   if (!isLockHeldLocally()) return
 
-  // Unregister before lock release so the pump-retain drops as soon as the
-  // CU session ends. Idempotent — no-ops if registration failed at acquire.
-  // Swallow throws so a NAPI unregister error never prevents lock release —
-  // a held lock blocks the next CU session with "in use by another session".
+  // 在锁释放前注销热键，确保泵保持（pump-retain）在 CU session 结束时立即释放。
+  // 幂等 —— 若获取时注册失败则 no-op。
+  // 吞掉抛出的错误，防止 NAPI 注销错误阻止锁释放 ——
+  // 锁被持有会在下次 CU session 时提示"已被其他 session 使用"。
   try {
     unregisterEscHotkey()
   } catch (err) {

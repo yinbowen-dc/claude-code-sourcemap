@@ -1,400 +1,164 @@
-import memoize from 'lodash-es/memoize.js'
-import type { HookEvent } from 'src/entrypoints/agentSdkTypes.js'
-import { getRegisteredHooks } from '../../bootstrap/state.js'
-import type { AppState } from '../../state/AppState.js'
-import {
-  getAllHooks,
-  type IndividualHookConfig,
-  sortMatchersByPriority,
-} from './hooksSettings.js'
+/**
+ * 【Hook 配置策略管理模块】
+ *
+ * 本文件在 Claude Code 系统流中的位置：
+ *   应用启动 / 设置变更 → hooksConfigManager（当前文件）→ hooksConfigSnapshot → Hook 执行引擎
+ *
+ * 主要职责：
+ * 1. 实现完整的 Hook 配置策略层级：policySettings > userSettings > projectSettings > localSettings
+ * 2. 提供 shouldAllowManagedHooksOnly()：检查是否只允许托管 Hook 运行
+ * 3. 提供 shouldDisableAllHooksIncludingManaged()：检查是否禁用所有 Hook（含托管 Hook）
+ * 4. 提供快照管理函数：captureHooksConfigSnapshot、updateHooksConfigSnapshot、
+ *    getHooksConfigFromSnapshot、resetHooksConfigSnapshot
+ *
+ * 策略层级说明：
+ * - policySettings.disableAllHooks = true → 完全禁用所有 Hook（包括托管 Hook）
+ * - policySettings.allowManagedHooksOnly = true → 仅允许托管 Hook
+ * - 非托管设置中 disableAllHooks = true → 禁用用户/项目/本地 Hook，托管 Hook 仍运行
+ * - isRestrictedToPluginOnly('hooks') → 严格插件模式，非策略 Hook 被屏蔽
+ *
+ * 设计要点：
+ * - 以 `* as settingsModule` 方式导入，确保测试中 spyOn 能正常拦截
+ */
 
-export type MatcherMetadata = {
-  fieldToMatch: string
-  values: string[]
-}
+import { resetSdkInitState } from '../../bootstrap/state.js'
+import { isRestrictedToPluginOnly } from '../settings/pluginOnlyPolicy.js'
+// 以模块对象方式导入，确保测试中 spyOn 能正常拦截（直接导入会绕过 spy）
+import * as settingsModule from '../settings/settings.js'
+import { resetSettingsCache } from '../settings/settingsCache.js'
+import type { HooksSettings } from '../settings/types.js'
 
-export type HookEventMetadata = {
-  summary: string
-  description: string
-  matcherMetadata?: MatcherMetadata
-}
+// 会话启动时捕获的 Hook 配置快照（null 表示尚未初始化）
+let initialHooksConfig: HooksSettings | null = null
 
-// Hook event metadata configuration.
-// Resolver uses sorted-joined string key so that callers passing a fresh
-// toolNames array each render (e.g. HooksConfigMenu) hit the cache instead
-// of leaking a new entry per call.
-export const getHookEventMetadata = memoize(
-  function (toolNames: string[]): Record<HookEvent, HookEventMetadata> {
-    return {
-      PreToolUse: {
-        summary: 'Before tool execution',
-        description:
-          'Input to command is JSON of tool call arguments.\nExit code 0 - stdout/stderr not shown\nExit code 2 - show stderr to model and block tool call\nOther exit codes - show stderr to user only but continue with tool call',
-        matcherMetadata: {
-          fieldToMatch: 'tool_name',
-          values: toolNames,
-        },
-      },
-      PostToolUse: {
-        summary: 'After tool execution',
-        description:
-          'Input to command is JSON with fields "inputs" (tool call arguments) and "response" (tool call response).\nExit code 0 - stdout shown in transcript mode (ctrl+o)\nExit code 2 - show stderr to model immediately\nOther exit codes - show stderr to user only',
-        matcherMetadata: {
-          fieldToMatch: 'tool_name',
-          values: toolNames,
-        },
-      },
-      PostToolUseFailure: {
-        summary: 'After tool execution fails',
-        description:
-          'Input to command is JSON with tool_name, tool_input, tool_use_id, error, error_type, is_interrupt, and is_timeout.\nExit code 0 - stdout shown in transcript mode (ctrl+o)\nExit code 2 - show stderr to model immediately\nOther exit codes - show stderr to user only',
-        matcherMetadata: {
-          fieldToMatch: 'tool_name',
-          values: toolNames,
-        },
-      },
-      PermissionDenied: {
-        summary: 'After auto mode classifier denies a tool call',
-        description:
-          'Input to command is JSON with tool_name, tool_input, tool_use_id, and reason.\nReturn {"hookSpecificOutput":{"hookEventName":"PermissionDenied","retry":true}} to tell the model it may retry.\nExit code 0 - stdout shown in transcript mode (ctrl+o)\nOther exit codes - show stderr to user only',
-        matcherMetadata: {
-          fieldToMatch: 'tool_name',
-          values: toolNames,
-        },
-      },
-      Notification: {
-        summary: 'When notifications are sent',
-        description:
-          'Input to command is JSON with notification message and type.\nExit code 0 - stdout/stderr not shown\nOther exit codes - show stderr to user only',
-        matcherMetadata: {
-          fieldToMatch: 'notification_type',
-          values: [
-            'permission_prompt',
-            'idle_prompt',
-            'auth_success',
-            'elicitation_dialog',
-            'elicitation_complete',
-            'elicitation_response',
-          ],
-        },
-      },
-      UserPromptSubmit: {
-        summary: 'When the user submits a prompt',
-        description:
-          'Input to command is JSON with original user prompt text.\nExit code 0 - stdout shown to Claude\nExit code 2 - block processing, erase original prompt, and show stderr to user only\nOther exit codes - show stderr to user only',
-      },
-      SessionStart: {
-        summary: 'When a new session is started',
-        description:
-          'Input to command is JSON with session start source.\nExit code 0 - stdout shown to Claude\nBlocking errors are ignored\nOther exit codes - show stderr to user only',
-        matcherMetadata: {
-          fieldToMatch: 'source',
-          values: ['startup', 'resume', 'clear', 'compact'],
-        },
-      },
-      Stop: {
-        summary: 'Right before Claude concludes its response',
-        description:
-          'Exit code 0 - stdout/stderr not shown\nExit code 2 - show stderr to model and continue conversation\nOther exit codes - show stderr to user only',
-      },
-      StopFailure: {
-        summary: 'When the turn ends due to an API error',
-        description:
-          'Fires instead of Stop when an API error (rate limit, auth failure, etc.) ended the turn. Fire-and-forget — hook output and exit codes are ignored.',
-        matcherMetadata: {
-          fieldToMatch: 'error',
-          values: [
-            'rate_limit',
-            'authentication_failed',
-            'billing_error',
-            'invalid_request',
-            'server_error',
-            'max_output_tokens',
-            'unknown',
-          ],
-        },
-      },
-      SubagentStart: {
-        summary: 'When a subagent (Agent tool call) is started',
-        description:
-          'Input to command is JSON with agent_id and agent_type.\nExit code 0 - stdout shown to subagent\nBlocking errors are ignored\nOther exit codes - show stderr to user only',
-        matcherMetadata: {
-          fieldToMatch: 'agent_type',
-          values: [], // Will be populated with available agent types
-        },
-      },
-      SubagentStop: {
-        summary:
-          'Right before a subagent (Agent tool call) concludes its response',
-        description:
-          'Input to command is JSON with agent_id, agent_type, and agent_transcript_path.\nExit code 0 - stdout/stderr not shown\nExit code 2 - show stderr to subagent and continue having it run\nOther exit codes - show stderr to user only',
-        matcherMetadata: {
-          fieldToMatch: 'agent_type',
-          values: [], // Will be populated with available agent types
-        },
-      },
-      PreCompact: {
-        summary: 'Before conversation compaction',
-        description:
-          'Input to command is JSON with compaction details.\nExit code 0 - stdout appended as custom compact instructions\nExit code 2 - block compaction\nOther exit codes - show stderr to user only but continue with compaction',
-        matcherMetadata: {
-          fieldToMatch: 'trigger',
-          values: ['manual', 'auto'],
-        },
-      },
-      PostCompact: {
-        summary: 'After conversation compaction',
-        description:
-          'Input to command is JSON with compaction details and the summary.\nExit code 0 - stdout shown to user\nOther exit codes - show stderr to user only',
-        matcherMetadata: {
-          fieldToMatch: 'trigger',
-          values: ['manual', 'auto'],
-        },
-      },
-      SessionEnd: {
-        summary: 'When a session is ending',
-        description:
-          'Input to command is JSON with session end reason.\nExit code 0 - command completes successfully\nOther exit codes - show stderr to user only',
-        matcherMetadata: {
-          fieldToMatch: 'reason',
-          values: ['clear', 'logout', 'prompt_input_exit', 'other'],
-        },
-      },
-      PermissionRequest: {
-        summary: 'When a permission dialog is displayed',
-        description:
-          'Input to command is JSON with tool_name, tool_input, and tool_use_id.\nOutput JSON with hookSpecificOutput containing decision to allow or deny.\nExit code 0 - use hook decision if provided\nOther exit codes - show stderr to user only',
-        matcherMetadata: {
-          fieldToMatch: 'tool_name',
-          values: toolNames,
-        },
-      },
-      Setup: {
-        summary: 'Repo setup hooks for init and maintenance',
-        description:
-          'Input to command is JSON with trigger (init or maintenance).\nExit code 0 - stdout shown to Claude\nBlocking errors are ignored\nOther exit codes - show stderr to user only',
-        matcherMetadata: {
-          fieldToMatch: 'trigger',
-          values: ['init', 'maintenance'],
-        },
-      },
-      TeammateIdle: {
-        summary: 'When a teammate is about to go idle',
-        description:
-          'Input to command is JSON with teammate_name and team_name.\nExit code 0 - stdout/stderr not shown\nExit code 2 - show stderr to teammate and prevent idle (teammate continues working)\nOther exit codes - show stderr to user only',
-      },
-      TaskCreated: {
-        summary: 'When a task is being created',
-        description:
-          'Input to command is JSON with task_id, task_subject, task_description, teammate_name, and team_name.\nExit code 0 - stdout/stderr not shown\nExit code 2 - show stderr to model and prevent task creation\nOther exit codes - show stderr to user only',
-      },
-      TaskCompleted: {
-        summary: 'When a task is being marked as completed',
-        description:
-          'Input to command is JSON with task_id, task_subject, task_description, teammate_name, and team_name.\nExit code 0 - stdout/stderr not shown\nExit code 2 - show stderr to model and prevent task completion\nOther exit codes - show stderr to user only',
-      },
-      Elicitation: {
-        summary: 'When an MCP server requests user input (elicitation)',
-        description:
-          'Input to command is JSON with mcp_server_name, message, and requested_schema.\nOutput JSON with hookSpecificOutput containing action (accept/decline/cancel) and optional content.\nExit code 0 - use hook response if provided\nExit code 2 - deny the elicitation\nOther exit codes - show stderr to user only',
-        matcherMetadata: {
-          fieldToMatch: 'mcp_server_name',
-          values: [],
-        },
-      },
-      ElicitationResult: {
-        summary: 'After a user responds to an MCP elicitation',
-        description:
-          'Input to command is JSON with mcp_server_name, action, content, mode, and elicitation_id.\nOutput JSON with hookSpecificOutput containing optional action and content to override the response.\nExit code 0 - use hook response if provided\nExit code 2 - block the response (action becomes decline)\nOther exit codes - show stderr to user only',
-        matcherMetadata: {
-          fieldToMatch: 'mcp_server_name',
-          values: [],
-        },
-      },
-      ConfigChange: {
-        summary: 'When configuration files change during a session',
-        description:
-          'Input to command is JSON with source (user_settings, project_settings, local_settings, policy_settings, skills) and file_path.\nExit code 0 - allow the change\nExit code 2 - block the change from being applied to the session\nOther exit codes - show stderr to user only',
-        matcherMetadata: {
-          fieldToMatch: 'source',
-          values: [
-            'user_settings',
-            'project_settings',
-            'local_settings',
-            'policy_settings',
-            'skills',
-          ],
-        },
-      },
-      InstructionsLoaded: {
-        summary: 'When an instruction file (CLAUDE.md or rule) is loaded',
-        description:
-          'Input to command is JSON with file_path, memory_type (User, Project, Local, Managed), load_reason (session_start, nested_traversal, path_glob_match, include, compact), globs (optional — the paths: frontmatter patterns that matched), trigger_file_path (optional — the file Claude touched that caused the load), and parent_file_path (optional — the file that @-included this one).\nExit code 0 - command completes successfully\nOther exit codes - show stderr to user only\nThis hook is observability-only and does not support blocking.',
-        matcherMetadata: {
-          fieldToMatch: 'load_reason',
-          values: [
-            'session_start',
-            'nested_traversal',
-            'path_glob_match',
-            'include',
-            'compact',
-          ],
-        },
-      },
-      WorktreeCreate: {
-        summary: 'Create an isolated worktree for VCS-agnostic isolation',
-        description:
-          'Input to command is JSON with name (suggested worktree slug).\nStdout should contain the absolute path to the created worktree directory.\nExit code 0 - worktree created successfully\nOther exit codes - worktree creation failed',
-      },
-      WorktreeRemove: {
-        summary: 'Remove a previously created worktree',
-        description:
-          'Input to command is JSON with worktree_path (absolute path to worktree).\nExit code 0 - worktree removed successfully\nOther exit codes - show stderr to user only',
-      },
-      CwdChanged: {
-        summary: 'After the working directory changes',
-        description:
-          'Input to command is JSON with old_cwd and new_cwd.\nCLAUDE_ENV_FILE is set — write bash exports there to apply env to subsequent BashTool commands.\nHook output can include hookSpecificOutput.watchPaths (array of absolute paths) to register with the FileChanged watcher.\nExit code 0 - command completes successfully\nOther exit codes - show stderr to user only',
-      },
-      FileChanged: {
-        summary: 'When a watched file changes',
-        description:
-          'Input to command is JSON with file_path and event (change, add, unlink).\nCLAUDE_ENV_FILE is set — write bash exports there to apply env to subsequent BashTool commands.\nThe matcher field specifies filenames to watch in the current directory (e.g. ".envrc|.env").\nHook output can include hookSpecificOutput.watchPaths (array of absolute paths) to dynamically update the watch list.\nExit code 0 - command completes successfully\nOther exit codes - show stderr to user only',
-      },
-    }
-  },
-  toolNames => toolNames.slice().sort().join(','),
-)
+/**
+ * 从允许的配置源中获取 Hook 配置，实现完整策略层级。
+ *
+ * 策略优先级（从高到低）：
+ * 1. policySettings.disableAllHooks = true → 返回空对象（完全禁用）
+ * 2. policySettings.allowManagedHooksOnly = true → 仅返回 policySettings.hooks
+ * 3. isRestrictedToPluginOnly('hooks') → 仅返回 policySettings.hooks
+ * 4. 非托管设置中 disableAllHooks = true → 仅返回 policySettings.hooks（托管 Hook 仍运行）
+ * 5. 其他情况 → 返回所有来源合并后的 hooks（向后兼容）
+ *
+ * 注意：Plugin hooks 和 agent frontmatter hooks 在各自注册点独立控制，不受此函数影响。
+ */
+function getHooksFromAllowedSources(): HooksSettings {
+  const policySettings = settingsModule.getSettingsForSource('policySettings')
 
-// Group hooks by event and matcher
-export function groupHooksByEventAndMatcher(
-  appState: AppState,
-  toolNames: string[],
-): Record<HookEvent, Record<string, IndividualHookConfig[]>> {
-  const grouped: Record<HookEvent, Record<string, IndividualHookConfig[]>> = {
-    PreToolUse: {},
-    PostToolUse: {},
-    PostToolUseFailure: {},
-    PermissionDenied: {},
-    Notification: {},
-    UserPromptSubmit: {},
-    SessionStart: {},
-    SessionEnd: {},
-    Stop: {},
-    StopFailure: {},
-    SubagentStart: {},
-    SubagentStop: {},
-    PreCompact: {},
-    PostCompact: {},
-    PermissionRequest: {},
-    Setup: {},
-    TeammateIdle: {},
-    TaskCreated: {},
-    TaskCompleted: {},
-    Elicitation: {},
-    ElicitationResult: {},
-    ConfigChange: {},
-    WorktreeCreate: {},
-    WorktreeRemove: {},
-    InstructionsLoaded: {},
-    CwdChanged: {},
-    FileChanged: {},
+  // 规则 1：托管设置完全禁用所有 Hook
+  if (policySettings?.disableAllHooks === true) {
+    return {}
   }
 
-  const metadata = getHookEventMetadata(toolNames)
-
-  // Include hooks from settings files
-  getAllHooks(appState).forEach(hook => {
-    const eventGroup = grouped[hook.event]
-    if (eventGroup) {
-      // For events without matchers, use empty string as key
-      const matcherKey =
-        metadata[hook.event].matcherMetadata !== undefined
-          ? hook.matcher || ''
-          : ''
-      if (!eventGroup[matcherKey]) {
-        eventGroup[matcherKey] = []
-      }
-      eventGroup[matcherKey].push(hook)
-    }
-  })
-
-  // Include registered hooks (e.g., plugin hooks)
-  const registeredHooks = getRegisteredHooks()
-  if (registeredHooks) {
-    for (const [event, matchers] of Object.entries(registeredHooks)) {
-      const hookEvent = event as HookEvent
-      const eventGroup = grouped[hookEvent]
-      if (!eventGroup) continue
-
-      for (const matcher of matchers) {
-        const matcherKey = matcher.matcher || ''
-
-        // Only PluginHookMatcher has pluginRoot; HookCallbackMatcher (internal
-        // callbacks like attributionHooks, sessionFileAccessHooks) does not.
-        if ('pluginRoot' in matcher) {
-          eventGroup[matcherKey] ??= []
-          for (const hook of matcher.hooks) {
-            eventGroup[matcherKey].push({
-              event: hookEvent,
-              config: hook,
-              matcher: matcher.matcher,
-              source: 'pluginHook',
-              pluginName: matcher.pluginId,
-            })
-          }
-        } else if (process.env.USER_TYPE === 'ant') {
-          eventGroup[matcherKey] ??= []
-          for (const _hook of matcher.hooks) {
-            eventGroup[matcherKey].push({
-              event: hookEvent,
-              config: {
-                type: 'command',
-                command: '[ANT-ONLY] Built-in Hook',
-              },
-              matcher: matcher.matcher,
-              source: 'builtinHook',
-            })
-          }
-        }
-      }
-    }
+  // 规则 2：仅允许托管 Hook（allowManagedHooksOnly 由策略层设置）
+  if (policySettings?.allowManagedHooksOnly === true) {
+    return policySettings.hooks ?? {}
   }
 
-  return grouped
+  // 规则 3：严格插件专用模式（用户/项目/本地 Hook 被屏蔽）
+  // Plugin hooks 通过独立通道注册，不受此处限制
+  // Agent frontmatter hooks 在注册时（runAgent.ts）按来源判断，不在此处拦截
+  if (isRestrictedToPluginOnly('hooks')) {
+    return policySettings?.hooks ?? {}
+  }
+
+  const mergedSettings = settingsModule.getSettings_DEPRECATED()
+
+  // 规则 4：非托管设置禁用 Hook，但托管 Hook 仍可运行
+  if (mergedSettings.disableAllHooks === true) {
+    return policySettings?.hooks ?? {}
+  }
+
+  // 规则 5：默认情况，返回所有来源合并后的 Hook（向后兼容）
+  return mergedSettings.hooks ?? {}
 }
 
-// Get sorted matchers for a specific event
-export function getSortedMatchersForEvent(
-  hooksByEventAndMatcher: Record<
-    HookEvent,
-    Record<string, IndividualHookConfig[]>
-  >,
-  event: HookEvent,
-): string[] {
-  const matchers = Object.keys(hooksByEventAndMatcher[event] || {})
-  return sortMatchersByPriority(matchers, hooksByEventAndMatcher, event)
+/**
+ * 检查是否只允许托管 Hook 运行。
+ *
+ * 返回 true 的两种情况：
+ * 1. policySettings.allowManagedHooksOnly = true（显式策略限制）
+ * 2. 非托管设置中 disableAllHooks = true，但托管设置未禁用（隐式降级为托管专用）
+ *
+ * @returns true 表示只有托管 Hook 可以运行
+ */
+export function shouldAllowManagedHooksOnly(): boolean {
+  const policySettings = settingsModule.getSettingsForSource('policySettings')
+  // 情况 1：策略层明确限制只允许托管 Hook
+  if (policySettings?.allowManagedHooksOnly === true) {
+    return true
+  }
+  // 情况 2：非托管设置禁用了 Hook，但托管设置未禁用
+  // 效果：非托管 Hook 被禁用，托管 Hook 仍运行（降级为托管专用模式）
+  if (
+    settingsModule.getSettings_DEPRECATED().disableAllHooks === true &&
+    policySettings?.disableAllHooks !== true
+  ) {
+    return true
+  }
+  return false
 }
 
-// Get hooks for a specific event and matcher
-export function getHooksForMatcher(
-  hooksByEventAndMatcher: Record<
-    HookEvent,
-    Record<string, IndividualHookConfig[]>
-  >,
-  event: HookEvent,
-  matcher: string | null,
-): IndividualHookConfig[] {
-  // For events without matchers, hooks are stored with empty string as key
-  // because the record keys must be strings.
-  const matcherKey = matcher ?? ''
-  return hooksByEventAndMatcher[event]?.[matcherKey] ?? []
+/**
+ * 检查是否应禁用所有 Hook（包括托管 Hook）。
+ * 仅当 policySettings.disableAllHooks = true 时返回 true。
+ * 非托管设置中的 disableAllHooks 不能禁用托管 Hook，因此不影响此函数。
+ *
+ * @returns true 表示所有 Hook（含托管 Hook）都应被禁用
+ */
+export function shouldDisableAllHooksIncludingManaged(): boolean {
+  // 只有托管/策略设置有权禁用托管 Hook
+  return (
+    settingsModule.getSettingsForSource('policySettings')?.disableAllHooks ===
+    true
+  )
 }
 
-// Get metadata for a specific event's matcher
-export function getMatcherMetadata(
-  event: HookEvent,
-  toolNames: string[],
-): MatcherMetadata | undefined {
-  return getHookEventMetadata(toolNames)[event].matcherMetadata
+/**
+ * 捕获当前 Hook 配置快照。
+ * 应在应用启动时调用一次，将当前配置缓存到 initialHooksConfig。
+ * 快照机制确保 Hook 执行期间使用一致的配置，不受运行时设置变更影响。
+ */
+export function captureHooksConfigSnapshot(): void {
+  initialHooksConfig = getHooksFromAllowedSources()
+}
+
+/**
+ * 更新 Hook 配置快照（用于设置变更后刷新）。
+ * 在通过 /hooks 命令修改设置后调用。
+ *
+ * 工作流程：
+ * 1. 重置设置缓存（强制从磁盘重新读取，处理外部编辑 settings.json 的场景）
+ * 2. 重新捕获快照
+ *
+ * 注意：若不先重置缓存，文件监听器的稳定性延迟可能导致读取到过期数据。
+ */
+export function updateHooksConfigSnapshot(): void {
+  // 重置会话缓存，确保读取最新设置（处理外部编辑且文件监听器尚未触发的情况）
+  resetSettingsCache()
+  initialHooksConfig = getHooksFromAllowedSources()
+}
+
+/**
+ * 获取 Hook 配置快照（懒初始化）。
+ * 若快照尚未初始化，则自动触发捕获。
+ *
+ * @returns 当前 Hook 配置，若尚未配置则返回 null
+ */
+export function getHooksConfigFromSnapshot(): HooksSettings | null {
+  // 懒初始化：首次调用时自动捕获快照
+  if (initialHooksConfig === null) {
+    captureHooksConfigSnapshot()
+  }
+  return initialHooksConfig
+}
+
+/**
+ * 重置 Hook 配置快照（用于测试隔离）。
+ * 同时重置 SDK 初始化状态，防止测试间的状态污染。
+ */
+export function resetHooksConfigSnapshot(): void {
+  initialHooksConfig = null    // 清除快照，下次访问时重新捕获
+  resetSdkInitState()          // 重置 SDK 初始化状态，防止测试污染
 }

@@ -1,48 +1,109 @@
+/**
+ * 【文件概述】AnimatedAsterisk.tsx
+ *
+ * 在 Claude Code 系统流程中的位置：
+ *   欢迎屏幕（LogoV2）→ 通知类组件（VoiceModeNotice / Opus1mMergeNotice 等）
+ *   → 本组件（带动画的星号字符）
+ *
+ * 主要职责：
+ *   渲染一个带彩虹色扫描动画的星号字符。动画完成后静止显示为灰色。
+ *   用于在通知条目前面吸引用户注意力。
+ *
+ * 动画参数：
+ *   - SWEEP_DURATION_MS = 1500ms：单次彩虹色扫描时长
+ *   - SWEEP_COUNT = 2：扫描次数
+ *   - TOTAL_ANIMATION_MS = 3000ms：总动画时长
+ *   - SETTLED_GREY：动画结束后的静止灰色（RGB 153,153,153）
+ *
+ * 关键设计：
+ *   - 使用 useRef 保存动画开始时刻，确保色相从 0 起始（不受挂载时机影响）
+ *   - 使用 useAnimationFrame（视口感知）防止进入 scrollback 后持续闪烁
+ *   - 尊重 prefersReducedMotion 设置，若开启则跳过动画直接显示静止灰色
+ */
 import * as React from 'react';
 import { useEffect, useRef, useState } from 'react';
 import { TEARDROP_ASTERISK } from '../../constants/figures.js';
 import { Box, Text, useAnimationFrame } from '../../ink.js';
 import { getInitialSettings } from '../../utils/settings/settings.js';
 import { hueToRgb, toRGBColor } from '../Spinner/utils.js';
+
+// 单次彩虹色扫描持续时间（毫秒）
 const SWEEP_DURATION_MS = 1500;
+// 扫描次数
 const SWEEP_COUNT = 2;
+// 总动画时长 = 单次扫描时长 × 扫描次数
 const TOTAL_ANIMATION_MS = SWEEP_DURATION_MS * SWEEP_COUNT;
+// 动画结束后的静止颜色：中性灰（153, 153, 153）
 const SETTLED_GREY = toRGBColor({
   r: 153,
   g: 153,
   b: 153
 });
+
+/**
+ * AnimatedAsterisk — 彩虹扫描动画星号组件
+ *
+ * Props：
+ *   char — 要显示的字符，默认为 TEARDROP_ASTERISK（✻）
+ *
+ * 整体流程：
+ *   1. 挂载时读取一次 prefersReducedMotion 设置
+ *      - 若已设置减弱动画，则直接进入"完成"状态（跳过动画）
+ *   2. done 状态控制两条渲染路径：
+ *      - done=true：渲染静止灰色星号
+ *      - done=false：按当前帧时间计算色相，渲染彩虹色星号
+ *   3. useEffect 在 done=false 时设置定时器，TOTAL_ANIMATION_MS 后将 done 设为 true
+ *   4. useAnimationFrame(done ? null : 50)：
+ *      - done=false 时每 50ms 触发一帧更新色相
+ *      - done=true 时传 null 停止动画（防止进入 scrollback 后依然刷新）
+ *   5. ref 绑定到 Box，使 useAnimationFrame 的视口感知能检测元素是否在屏幕内
+ */
 export function AnimatedAsterisk({
-  char = TEARDROP_ASTERISK
+  char = TEARDROP_ASTERISK // 默认使用泪滴星号字符
 }: {
   char?: string;
 }): React.ReactNode {
-  // Read prefersReducedMotion once at mount — no useSettings() subscription,
-  // since that would re-render whenever settings change.
+  // 挂载时一次性读取减弱动画设置，不订阅后续变更（避免设置变更时触发重渲染）
   const [reducedMotion] = useState(() => getInitialSettings().prefersReducedMotion ?? false);
+
+  // done 状态：reducedMotion 为 true 时直接初始化为 true（跳过动画）
   const [done, setDone] = useState(reducedMotion);
-  // useAnimationFrame's clock is shared — capture our start offset so the
-  // sweep always begins at hue 0 regardless of when we mount.
+
+  // 记录本组件动画开始时的时间戳
+  // useAnimationFrame 的时钟是全局共享的，需要记录相对起点以确保色相从 0 开始
   const startTimeRef = useRef<number | null>(null);
-  // Wire the ref so useAnimationFrame's viewport-pause kicks in: if the
-  // user submits a message before the sweep finishes, the clock stops
-  // automatically once this row enters scrollback (prevents flicker).
+
+  // 绑定视口感知动画帧：done=true 时传 null 停止；done=false 时以 50ms 间隔刷新
+  // ref 用于让 Ink 的视口检测知道此元素位置，进入 scrollback 后自动暂停动画
   const [ref, time] = useAnimationFrame(done ? null : 50);
+
+  // 动画完成计时器：在 TOTAL_ANIMATION_MS 后将 done 设为 true
   useEffect(() => {
-    if (done) return;
+    if (done) return; // 已完成（或 reducedMotion 模式）则无需设置计时器
     const t = setTimeout(setDone, TOTAL_ANIMATION_MS, true);
-    return () => clearTimeout(t);
+    return () => clearTimeout(t); // 组件卸载时清除定时器
   }, [done]);
+
+  // 渲染路径 1：动画已完成，显示静止灰色星号
   if (done) {
     return <Box ref={ref}>
         <Text color={SETTLED_GREY}>{char}</Text>
       </Box>;
   }
+
+  // 首帧：记录动画开始时间（以当前帧时间为基准）
   if (startTimeRef.current === null) {
     startTimeRef.current = time;
   }
+
+  // 计算自动画开始以来经过的时间（毫秒）
   const elapsed = time - startTimeRef.current;
+
+  // 将 elapsed 映射为 0–360 的色相值（HSV 色相循环）
+  // elapsed / SWEEP_DURATION_MS 得到扫描进度（0→1→2…），× 360 得到色相，% 360 循环
   const hue = elapsed / SWEEP_DURATION_MS * 360 % 360;
+
+  // 渲染路径 2：动画进行中，根据当前色相渲染彩虹色星号
   return <Box ref={ref}>
       <Text color={toRGBColor(hueToRgb(hue))}>{char}</Text>
     </Box>;

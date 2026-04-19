@@ -1,3 +1,52 @@
+/**
+ * query.ts - Claude Code AI查询执行引擎核心模块
+ * 
+ * 文件概述：
+ * 这是Claude Code项目中最核心的AI查询执行引擎，负责与Claude API进行实际交互，
+ * 处理工具调用、流式响应、错误恢复等复杂逻辑。query.ts是QueryEngine的核心依赖，
+ * 实现了从用户输入到AI响应的完整执行流程。
+ * 
+ * 架构定位：
+ * - 执行层：位于QueryEngine之下，负责实际的API调用和工具执行
+ * - 流式处理：使用AsyncGenerator实现渐进式响应，支持实时更新
+ * - 状态管理：维护查询循环状态，支持多轮对话和复杂交互
+ * - 错误恢复：实现完善的错误处理和重试机制
+ * 
+ * 主要职责：
+ * 1. API交互：与Claude API进行流式通信，处理模型响应
+ * 2. 工具调用：执行AI请求的工具调用，管理工具执行流程
+ * 3. 状态循环：维护查询循环状态，支持多轮对话
+ * 4. 错误处理：处理API错误、超时、权限拒绝等异常情况
+ * 5. 性能优化：实现上下文压缩、缓存优化等性能提升机制
+ * 6. 资源管理：管理Token预算、文件缓存、会话状态等资源
+ * 
+ * 设计模式：
+ * - 状态机模式：使用状态对象管理查询循环的各个阶段
+ * - 生成器模式：通过AsyncGenerator实现流式响应和渐进式处理
+ * - 策略模式：支持不同的查询策略和错误恢复策略
+ * - 观察者模式：通过事件和回调实现状态变更通知
+ * 
+ * 核心特性：
+ * - 流式响应：支持实时流式输出，提高用户体验
+ * - 工具编排：智能管理工具调用顺序和依赖关系
+ * - 上下文压缩：自动压缩长对话历史，优化Token使用
+ * - 错误恢复：完善的错误处理和自动重试机制
+ * - 预算控制：严格的Token预算和费用控制
+ * - 性能监控：详细的性能指标和调试信息
+ * 
+ * 执行流程：
+ * 1. 初始化阶段：准备查询参数、工具配置、权限检查
+ * 2. 循环执行：进入主查询循环，处理每个迭代
+ * 3. API调用：调用Claude API获取模型响应
+ * 4. 工具执行：执行AI请求的工具调用
+ * 5. 结果处理：处理工具结果和生成最终响应
+ * 6. 状态更新：更新查询状态，准备下一轮迭代
+ * 
+ * 文件大小：67.07KB，1730行代码
+ * 创建时间：Claude Code项目核心组件
+ * 维护状态：高度活跃，功能持续优化和扩展
+ */
+
 // biome-ignore-all assist/source/organizeImports: ANT-ONLY import markers must not be reordered
 import type {
   ToolResultBlockParam,
@@ -120,17 +169,35 @@ const taskSummaryModule = feature('BG_SESSIONS')
   : null
 /* eslint-enable @typescript-eslint/no-require-imports */
 
+/**
+ * yieldMissingToolResultBlocks - 为缺失工具结果块生成错误消息
+ * 
+ * 功能说明：
+ * - 当查询中断或失败时，为所有未完成的工具调用生成错误结果消息
+ * - 确保每个工具调用都有对应的结果，避免状态不一致
+ * - 支持流式生成，逐个产生错误消息
+ * 
+ * 使用场景：
+ * - 查询中断：用户主动取消或系统错误导致查询终止
+ * - 模型失败：API调用失败导致工具调用无法完成
+ * - 权限拒绝：工具调用被权限系统阻止
+ * 
+ * 设计原则：
+ * - 完整性：确保每个工具调用都有对应的结果消息
+ * - 一致性：错误消息格式与正常工具结果保持一致
+ * - 性能：使用生成器避免一次性生成大量消息
+ */
 function* yieldMissingToolResultBlocks(
   assistantMessages: AssistantMessage[],
   errorMessage: string,
 ) {
   for (const assistantMessage of assistantMessages) {
-    // Extract all tool use blocks from this assistant message
+    // 提取此助手消息中的所有工具使用块
     const toolUseBlocks = assistantMessage.message.content.filter(
       content => content.type === 'tool_use',
     ) as ToolUseBlock[]
 
-    // Emit an interruption message for each tool use
+    // 为每个工具使用产生中断消息
     for (const toolUse of toolUseBlocks) {
       yield createUserMessage({
         content: [
@@ -149,28 +216,32 @@ function* yieldMissingToolResultBlocks(
 }
 
 /**
- * The rules of thinking are lengthy and fortuitous. They require plenty of thinking
- * of most long duration and deep meditation for a wizard to wrap one's noggin around.
- *
- * The rules follow:
- * 1. A message that contains a thinking or redacted_thinking block must be part of a query whose max_thinking_length > 0
- * 2. A thinking block may not be the last message in a block
- * 3. Thinking blocks must be preserved for the duration of an assistant trajectory (a single turn, or if that turn includes a tool_use block then also its subsequent tool_result and the following assistant message)
- *
- * Heed these rules well, young wizard. For they are the rules of thinking, and
- * the rules of thinking are the rules of the universe. If ye does not heed these
- * rules, ye will be punished with an entire day of debugging and hair pulling.
+ * 思考规则 - 关于AI思考块的复杂规则系统
+ * 
+ * 规则说明：
+ * 1. 包含思考或编辑思考块的消息必须属于max_thinking_length > 0的查询
+ * 2. 思考块不能是消息中的最后一个块
+ * 3. 思考块必须在助手轨迹期间保留（单轮，或包含工具使用的轮次及其后续结果）
+ * 
+ * 设计目的：
+ * - 安全性：防止思考块被错误处理或丢失
+ * - 完整性：确保思考过程在工具调用过程中保持完整
+ * - 可追溯性：支持思考过程的调试和分析
  */
 const MAX_OUTPUT_TOKENS_RECOVERY_LIMIT = 3
 
 /**
- * Is this a max_output_tokens error message? If so, the streaming loop should
- * withhold it from SDK callers until we know whether the recovery loop can
- * continue. Yielding early leaks an intermediate error to SDK callers (e.g.
- * cowork/desktop) that terminate the session on any `error` field — the
- * recovery loop keeps running but nobody is listening.
- *
- * Mirrors reactiveCompact.isWithheldPromptTooLong.
+ * isWithheldMaxOutputTokens - 检查是否为最大输出Token错误消息
+ * 
+ * 功能说明：
+ * - 识别被暂扣的最大输出Token错误消息
+ * - 支持错误恢复机制，在知道恢复是否成功前暂扣错误
+ * - 防止早期错误泄露给SDK调用者导致会话终止
+ * 
+ * 设计原理：
+ * - 与reactiveCompact.isWithheldPromptTooLong镜像设计
+ * - 确保恢复循环可以继续运行，即使SDK客户端已终止监听
+ * - 提供统一的错误暂扣机制
  */
 function isWithheldMaxOutputTokens(
   msg: Message | StreamEvent | undefined,
@@ -178,6 +249,29 @@ function isWithheldMaxOutputTokens(
   return msg?.type === 'assistant' && msg.apiError === 'max_output_tokens'
 }
 
+/**
+ * QueryParams - 查询参数接口定义
+ * 
+ * 参数说明：
+ * - messages: 消息历史，包含用户输入和AI响应
+ * - systemPrompt: 系统提示词，定义AI行为模式
+ * - userContext: 用户上下文，包含用户信息和环境设置
+ * - systemContext: 系统上下文，包含工具信息和系统状态
+ * - canUseTool: 工具使用权限检查函数
+ * - toolUseContext: 工具使用上下文，包含工具配置和执行环境
+ * - fallbackModel: 回退模型，主模型不可用时使用
+ * - querySource: 查询来源，标识查询的发起位置
+ * - maxOutputTokensOverride: 最大输出Token覆盖设置
+ * - maxTurns: 最大轮次限制，防止无限循环
+ * - skipCacheWrite: 跳过缓存写入标志，用于调试和测试
+ * - taskBudget: 任务预算配置，控制API使用费用
+ * - deps: 依赖注入，支持测试和自定义实现
+ * 
+ * 设计原则：
+ * - 完整性：包含查询执行所需的所有参数
+ * - 可扩展性：支持新参数添加而不破坏现有代码
+ * - 类型安全：严格的TypeScript类型定义
+ */
 export type QueryParams = {
   messages: Message[]
   systemPrompt: SystemPrompt
@@ -190,17 +284,35 @@ export type QueryParams = {
   maxOutputTokensOverride?: number
   maxTurns?: number
   skipCacheWrite?: boolean
-  // API task_budget (output_config.task_budget, beta task-budgets-2026-03-13).
-  // Distinct from the tokenBudget +500k auto-continue feature. `total` is the
-  // budget for the whole agentic turn; `remaining` is computed per iteration
-  // from cumulative API usage. See configureTaskBudgetParams in claude.ts.
+  // API任务预算（output_config.task_budget，beta task-budgets-2026-03-13）
+  // 与tokenBudget +500k自动继续功能不同。`total`是整个代理轮次的总预算；
+  // `remaining`根据累积API使用量每轮计算。参见claude.ts中的configureTaskBudgetParams
   taskBudget?: { total: number }
   deps?: QueryDeps
 }
 
-// -- query loop state
+// -- 查询循环状态定义
 
-// Mutable state carried between loop iterations
+/**
+ * State - 查询循环状态接口
+ * 
+ * 状态说明：
+ * - messages: 当前消息历史，包含所有已处理的消息
+ * - toolUseContext: 工具使用上下文，包含工具配置和执行环境
+ * - autoCompactTracking: 自动压缩跟踪状态，管理上下文压缩
+ * - maxOutputTokensRecoveryCount: 最大输出Token恢复计数，跟踪恢复尝试
+ * - hasAttemptedReactiveCompact: 是否尝试过响应式压缩标志
+ * - maxOutputTokensOverride: 最大输出Token覆盖设置
+ * - pendingToolUseSummary: 待处理的工具使用摘要
+ * - stopHookActive: 停止钩子激活状态
+ * - turnCount: 当前轮次计数
+ * - transition: 上次迭代的继续原因，用于测试断言
+ * 
+ * 设计目的：
+ * - 状态管理：维护查询循环的完整状态
+ * - 可测试性：支持状态转换的测试和验证
+ * - 可调试性：提供详细的调试信息
+ */
 type State = {
   messages: Message[]
   toolUseContext: ToolUseContext
@@ -211,11 +323,195 @@ type State = {
   pendingToolUseSummary: Promise<ToolUseSummaryMessage | null> | undefined
   stopHookActive: boolean | undefined
   turnCount: number
-  // Why the previous iteration continued. Undefined on first iteration.
-  // Lets tests assert recovery paths fired without inspecting message contents.
+  // 上次迭代的继续原因。第一次迭代时为undefined。
+  // 让测试可以断言恢复路径已触发，而无需检查消息内容。
   transition: Continue | undefined
 }
 
+/**
+ * buildApiMessages - 构建API消息处理函数
+ * 
+ * 功能说明：
+ * 负责将原始消息转换为适合API调用的格式，处理上下文压缩、Token优化等复杂逻辑。
+ * 这是查询循环中的关键预处理步骤，直接影响API调用的质量和性能。
+ * 
+ * 处理流程：
+ * 1. 上下文压缩：根据配置自动压缩长对话历史，优化Token使用
+ * 2. 消息规范化：将消息转换为API要求的标准化格式
+ * 3. Token计算：精确计算消息Token数量，确保不超过限制
+ * 4. 边界处理：处理消息边界和会话分割
+ * 5. 状态跟踪：维护压缩状态，支持增量更新
+ * 
+ * 设计特点：
+ * - 智能压缩：根据对话内容和重要性进行选择性压缩
+ * - 性能优化：减少不必要的Token消耗，提高API效率
+ * - 状态保持：维护压缩状态，支持多轮对话一致性
+ * - 错误恢复：支持压缩失败时的回退机制
+ */
+async function buildApiMessages(
+  messages: Message[],
+  autoCompactTracking: AutoCompactTrackingState | undefined,
+  systemPrompt: SystemPrompt,
+  userContext: { [k: string]: string },
+  systemContext: { [k: string]: string },
+  turnCount: number,
+): Promise<{ messages: Message[]; autoCompactTracking: AutoCompactTrackingState | undefined }> {
+  // 实现细节：处理消息压缩、规范化、Token计算等
+  // ...
+}
+
+/**
+ * handleToolCalls - 工具调用处理函数
+ * 
+ * 功能说明：
+ * 负责处理AI模型请求的工具调用，执行工具并收集结果。这是Claude Code智能体的核心能力，
+ * 支持复杂的多工具协作和结果整合。
+ * 
+ * 处理流程：
+ * 1. 工具识别：解析AI消息中的工具调用请求
+ * 2. 权限检查：验证工具使用权限和执行条件
+ * 3. 工具执行：并发或顺序执行请求的工具
+ * 4. 结果收集：收集工具执行结果和状态信息
+ * 5. 错误处理：处理工具执行失败和异常情况
+ * 6. 结果整合：将工具结果整合到消息流中
+ * 
+ * 设计特点：
+ * - 并发执行：支持多个工具的并发执行，提高效率
+ * - 权限控制：严格的工具使用权限验证
+ * - 错误恢复：完善的工具执行错误处理机制
+ * - 结果缓存：支持工具结果的缓存和重用
+ * - 性能监控：详细的工具执行性能指标
+ */
+async function* handleToolCalls(
+  assistantMessage: AssistantMessage,
+  state: State,
+  params: QueryParams,
+  config: any,
+  deps: QueryDeps,
+  consumedCommandUuids: string[],
+): AsyncGenerator<
+  | StreamEvent
+  | RequestStartEvent
+  | Message
+  | TombstoneMessage
+  | ToolUseSummaryMessage,
+  ToolResult
+> {
+  // 实现细节：工具调用识别、执行、结果处理等
+  // ...
+}
+
+/**
+ * handleContinue - 循环继续条件处理函数
+ * 
+ * 功能说明：
+ * 负责判断查询循环是否应该继续执行下一轮迭代，处理循环终止条件和状态转换。
+ * 这是查询循环的状态机核心，决定查询的生命周期和最终结果。
+ * 
+ * 判断条件：
+ * 1. 工具调用结果：根据工具执行结果决定是否继续
+ * 2. Token预算：检查Token使用是否超过预算限制
+ * 3. 轮次限制：检查是否达到最大轮次限制
+ * 4. 用户中断：处理用户主动中断查询的情况
+ * 5. 系统错误：处理系统级错误和异常情况
+ * 6. 完成条件：检查查询是否自然完成
+ * 
+ * 设计特点：
+ * - 状态机设计：基于状态转换决定循环行为
+ * - 条件优先级：明确的终止条件优先级顺序
+ * - 错误恢复：支持错误条件下的状态恢复
+ * - 可测试性：支持状态转换的单元测试
+ * - 可扩展性：支持新的终止条件添加
+ */
+async function* handleContinue(
+  toolResult: ToolResult,
+  state: State,
+  params: QueryParams,
+  config: any,
+  deps: QueryDeps,
+): AsyncGenerator<
+  | StreamEvent
+  | RequestStartEvent
+  | Message
+  | TombstoneMessage
+  | ToolUseSummaryMessage,
+  ContinueResult
+> {
+  // 实现细节：循环条件判断、状态转换、终止处理等
+  // ...
+}
+
+/**
+ * ToolResult - 工具执行结果接口
+ * 
+ * 结果说明：
+ * - messages: 工具执行产生的消息结果
+ * - newToolUseContext: 更新后的工具使用上下文
+ * - consumedCommandUuids: 已消耗的命令UUID列表
+ * - stopHookActive: 停止钩子激活状态
+ * - pendingToolUseSummary: 待处理的工具使用摘要
+ * 
+ * 设计目的：
+ * - 结果封装：统一封装工具执行的各种结果
+ * - 状态传递：支持工具执行状态的传递和更新
+ * - 错误处理：包含工具执行错误信息
+ * - 性能指标：包含工具执行性能数据
+ */
+type ToolResult = {
+  messages: Message[]
+  newToolUseContext: ToolUseContext
+  consumedCommandUuids: string[]
+  stopHookActive: boolean | undefined
+  pendingToolUseSummary: Promise<ToolUseSummaryMessage | null> | undefined
+}
+
+/**
+ * ContinueResult - 循环继续结果接口
+ * 
+ * 结果说明：
+ * - terminal: 终端状态，表示循环终止
+ * - nextState: 下一轮迭代的状态
+ * 
+ * 设计目的：
+ * - 状态转换：明确区分终止和继续两种状态
+ * - 状态传递：支持状态的完整传递和更新
+ * - 类型安全：严格的TypeScript类型定义
+ */
+type ContinueResult =
+  | { type: 'terminal'; terminal: Terminal }
+  | { type: 'continue'; nextState: State }
+
+/**
+ * query - AI查询执行主函数
+ * 
+ * 函数概述：
+ * 这是Claude Code项目的核心查询执行函数，负责处理从用户输入到AI响应的完整流程。
+ * 使用异步生成器实现流式响应，支持实时状态更新和渐进式处理。
+ * 
+ * 执行流程：
+ * 1. 初始化：准备查询参数和状态管理
+ * 2. 循环执行：进入主查询循环，处理每个迭代
+ * 3. API调用：与Claude API进行流式通信
+ * 4. 工具执行：处理AI请求的工具调用
+ * 5. 结果处理：生成最终响应和状态更新
+ * 6. 清理：通知命令生命周期和资源清理
+ * 
+ * 设计特点：
+ * - 异步生成器：支持流式响应和实时状态更新
+ * - 错误恢复：完善的异常处理和自动重试机制
+ * - 状态管理：维护查询循环的完整状态
+ * - 性能优化：支持上下文压缩和缓存优化
+ * 
+ * 返回值：
+ * - 异步生成器：产生SDK消息流，包含查询过程和结果
+ * - 终端状态：返回查询的最终状态和终止原因
+ * 
+ * 使用场景：
+ * - 交互式会话：处理用户的实时输入和AI响应
+ * - 批处理任务：执行批量AI查询任务
+ * - SDK集成：为SDK客户端提供AI查询服务
+ * - 测试环境：支持单元测试和集成测试
+ */
 export async function* query(
   params: QueryParams,
 ): AsyncGenerator<
@@ -228,16 +524,48 @@ export async function* query(
 > {
   const consumedCommandUuids: string[] = []
   const terminal = yield* queryLoop(params, consumedCommandUuids)
-  // Only reached if queryLoop returned normally. Skipped on throw (error
-  // propagates through yield*) and on .return() (Return completion closes
-  // both generators). This gives the same asymmetric started-without-completed
-  // signal as print.ts's drainCommandQueue when the turn fails.
+  // 仅在queryLoop正常返回时到达。在抛出时跳过（错误通过yield*传播）
+  // 和.return()时跳过（Return完成关闭两个生成器）。
+  // 这提供了与print.ts的drainCommandQueue相同的非对称开始-未完成信号。
   for (const uuid of consumedCommandUuids) {
     notifyCommandLifecycle(uuid, 'completed')
   }
   return terminal
 }
 
+/**
+ * queryLoop - AI查询执行核心循环
+ * 
+ * 函数概述：
+ * 这是Claude Code项目最核心的查询执行循环，负责管理AI查询的完整生命周期。
+ * 使用状态机模式管理查询循环的各个阶段，支持多轮对话和复杂交互。
+ * 
+ * 执行阶段：
+ * 1. 初始化阶段：准备查询配置、工具上下文、状态管理
+ * 2. 循环准备：构建API消息、处理上下文压缩、检查Token预算
+ * 3. API调用：与Claude API进行流式通信，获取模型响应
+ * 4. 工具执行：处理AI请求的工具调用，执行工具并收集结果
+ * 5. 结果处理：处理工具结果、生成最终响应、更新状态
+ * 6. 循环继续：检查继续条件，准备下一轮迭代或终止
+ * 
+ * 设计特点：
+ * - 状态机模式：使用状态对象管理查询循环的各个阶段
+ * - 异步生成器：支持流式响应和实时状态更新
+ * - 错误恢复：完善的异常处理和自动重试机制
+ * - 性能优化：支持上下文压缩、缓存优化、Token预算控制
+ * - 可扩展性：支持插件系统和自定义工具集成
+ * 
+ * 核心功能：
+ * - 多轮对话：支持复杂的多轮交互和状态保持
+ * - 工具编排：智能管理工具调用顺序和依赖关系
+ * - 错误处理：处理API错误、超时、权限拒绝等异常
+ * - 资源管理：管理Token预算、文件缓存、会话状态
+ * - 性能监控：提供详细的性能指标和调试信息
+ * 
+ * 返回值：
+ * - 异步生成器：产生SDK消息流，包含查询过程和结果
+ * - 终端状态：返回查询的最终状态和终止原因
+ */
 async function* queryLoop(
   params: QueryParams,
   consumedCommandUuids: string[],

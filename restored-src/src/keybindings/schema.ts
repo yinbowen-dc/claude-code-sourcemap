@@ -1,6 +1,21 @@
 /**
- * Zod schema for keybindings.json configuration.
- * Used for validation and JSON schema generation.
+ * 键位绑定配置 Zod Schema 定义模块
+ *
+ * 【在 Claude Code 键位绑定系统中的位置与作用】
+ * 本文件使用 Zod v4 定义 keybindings.json 的结构约束，
+ * 同时导出供验证和模板生成使用的常量：
+ *
+ *   schema（本文件，定义结构 schema + 常量）
+ *     → validate（使用 schema 中的常量进行校验，报告错误和警告）
+ *     → template（引用 NON_REBINDABLE 过滤保留键后生成模板文件）
+ *
+ * 核心导出：
+ *  - KEYBINDING_CONTEXTS：所有合法的上下文名称（'Global' / 'Chat' / ...）
+ *  - KEYBINDING_CONTEXT_DESCRIPTIONS：各上下文的人类可读描述
+ *  - KEYBINDING_ACTIONS：所有合法的动作标识符（如 'app:toggleTodos' / 'chat:submit' ...）
+ *  - KeybindingBlockSchema：单个绑定块的 Zod schema（context + bindings 对象）
+ *  - KeybindingsSchema：整个 keybindings.json 文件的 Zod schema（包含 $schema / $docs 元数据）
+ *  - KeybindingsSchemaType：从 schema 推导的 TypeScript 类型
  */
 
 import { z } from 'zod/v4'

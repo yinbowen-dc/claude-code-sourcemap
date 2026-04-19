@@ -1,3 +1,21 @@
+/**
+ * API 工具函数模块（工具 Schema 序列化与上下文处理）。
+ *
+ * 在 Claude Code 系统中，该模块负责将内部工具定义转换为 Anthropic API
+ * 可接受的 BetaTool Schema，并处理系统提示分段、缓存控制及上下文注入。
+ *
+ * 主要功能：
+ * 1. toolToAPISchema()：将 Tool 转换为 BetaTool Schema，支持会话稳定缓存、
+ *    严格模式（tengu_tool_pear）、细粒度流式传输（tengu_fgts）、
+ *    defer_loading（工具搜索功能）及 swarm 字段过滤
+ * 2. splitSysPromptPrefix()：将系统提示按 Attribution Header、前缀和其余内容
+ *    三段拆分，根据 Feature Flag 选择 org 级或 global 级缓存策略
+ * 3. logAPIPrefix()：记录系统提示首块摘要，用于前缀匹配配置分析
+ * 4. logContextMetrics()：统计 MCP 工具数量、token 估算及文件数量，上报遥测
+ * 5. normalizeToolInput()：对特定工具输入进行规范化（注入 plan、规范化命令、
+ *    修复文件路径等）
+ * 6. appendSystemContext() / prependUserContext()：向请求追加系统/用户上下文
+ */
 import type Anthropic from '@anthropic-ai/sdk'
 import type {
   BetaTool,
@@ -266,6 +284,7 @@ export async function toolToAPISchema(
 }
 
 let loggedStrip = false
+/** 仅记录一次已剥离的实验性 Beta 字段列表，避免日志重复刷屏。 */
 function logStripOnce(stripped: string[]): void {
   if (loggedStrip) return
   loggedStrip = true
@@ -275,6 +294,9 @@ function logStripOnce(stripped: string[]): void {
 }
 
 /**
+ * 记录系统提示首块的统计信息，用于分析前缀匹配配置。
+ * 包含前 20 字符片段、长度和 SHA-256 哈希，上报至 tengu_sysprompt_block 事件。
+ *
  * Log stats about first block for analyzing prefix matching config
  * (see https://console.statsig.com/4aF3Ewatb6xPVpCwxb5nA3/dynamic_configs/claude_cli_system_prompt_prefixes)
  */
@@ -294,29 +316,17 @@ export function logAPIPrefix(systemPrompt: SystemPrompt): void {
 }
 
 /**
+ * 将系统提示按内容类型拆分为多个块，用于 API 匹配与缓存控制。
+ *
+ * 根据 Feature Flag 和选项，有三种行为模式：
+ * 1. 存在 MCP 工具（skipGlobalCacheForSystemPrompt=true）：
+ *    返回最多 3 块，使用 org 级缓存（系统提示不使用 global 缓存）
+ * 2. global 缓存模式（仅 1P）且找到边界标记：
+ *    返回最多 4 块，边界前用 global 缓存，边界后不缓存
+ * 3. 默认模式（3P 或无边界标记）：
+ *    返回最多 3 块，使用 org 级缓存
+ *
  * Split system prompt blocks by content type for API matching and cache control.
- * See https://console.statsig.com/4aF3Ewatb6xPVpCwxb5nA3/dynamic_configs/claude_cli_system_prompt_prefixes
- *
- * Behavior depends on feature flags and options:
- *
- * 1. MCP tools present (skipGlobalCacheForSystemPrompt=true):
- *    Returns up to 3 blocks with org-level caching (no global cache on system prompt):
- *    - Attribution header (cacheScope=null)
- *    - System prompt prefix (cacheScope='org')
- *    - Everything else concatenated (cacheScope='org')
- *
- * 2. Global cache mode with boundary marker (1P only, boundary found):
- *    Returns up to 4 blocks:
- *    - Attribution header (cacheScope=null)
- *    - System prompt prefix (cacheScope=null)
- *    - Static content before boundary (cacheScope='global')
- *    - Dynamic content after boundary (cacheScope=null)
- *
- * 3. Default mode (3P providers, or boundary missing):
- *    Returns up to 3 blocks with org-level caching:
- *    - Attribution header (cacheScope=null)
- *    - System prompt prefix (cacheScope='org')
- *    - Everything else concatenated (cacheScope='org')
  */
 export function splitSysPromptPrefix(
   systemPrompt: SystemPrompt,
@@ -434,6 +444,10 @@ export function splitSysPromptPrefix(
   return result
 }
 
+/**
+ * 向系统提示追加额外上下文键值对，格式为 "key: value" 每行一条。
+ * 返回过滤空字符串后的新系统提示数组。
+ */
 export function appendSystemContext(
   systemPrompt: SystemPrompt,
   context: { [k: string]: string },
@@ -446,6 +460,10 @@ export function appendSystemContext(
   ].filter(Boolean)
 }
 
+/**
+ * 在消息列表头部插入一条包含用户上下文的系统提示消息（isMeta=true）。
+ * 在测试环境或上下文为空时直接返回原消息列表，不做修改。
+ */
 export function prependUserContext(
   messages: Message[],
   context: { [k: string]: string },
@@ -474,6 +492,11 @@ export function prependUserContext(
 }
 
 /**
+ * 记录上下文与系统提示大小的度量数据，上报至 tengu_context_size 事件。
+ * 统计内容包括：gitStatus/claudeMd 大小、项目文件数（取整至10的幂）、
+ * MCP 工具数量及 token 估算、非 MCP 工具数量及 token 估算。
+ * 分析禁用时提前返回。
+ *
  * Log metrics about context and system prompt size
  */
 export async function logContextMetrics(
@@ -563,6 +586,14 @@ export async function logContextMetrics(
 }
 
 // TODO: Generalize this to all tools
+/**
+ * 对特定工具的输入进行规范化处理：
+ * - ExitPlanModeV2：注入当前 plan 内容和文件路径
+ * - BashTool：去除冗余的 `cd <cwd> && ` 前缀、修复 `\\;` 转义、记录纯 echo 命令
+ * - FileEditTool：规范化文件路径和编辑块（调用 normalizeFileEditInput）
+ * - FileWriteTool：去除行尾空白（调用 stripTrailingWhitespace）
+ * - 其他工具：原样返回输入
+ */
 export function normalizeToolInput<T extends Tool>(
   tool: T,
   input: z.infer<T['inputSchema']>,

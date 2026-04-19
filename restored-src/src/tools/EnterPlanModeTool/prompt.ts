@@ -1,6 +1,26 @@
+/**
+ * 【EnterPlanModeTool 提示词模块】
+ *
+ * 在 Claude Code 系统流程中的位置：
+ *   本文件为 EnterPlanModeTool 提供发送给 Claude 模型的工具使用指南（system prompt 片段）。
+ *   根据用户类型（USER_TYPE=ant 内部用户 vs 外部用户）以及是否启用了"面试阶段"
+ *   （isPlanModeInterviewPhaseEnabled），导出不同版本的提示词内容。
+ *
+ * 主要功能：
+ *   - WHAT_HAPPENS_SECTION：描述计划模式中 AI 应执行的六个步骤（探索→设计→提呈方案）
+ *   - getEnterPlanModeToolPromptExternal()：外部用户版，倾向于在大多数非平凡任务中主动使用计划模式
+ *   - getEnterPlanModeToolPromptAnt()：内部用户版，更保守，仅在存在真正歧义时使用计划模式
+ *   - getEnterPlanModeToolPrompt()：入口函数，按 USER_TYPE 分发两个版本
+ */
+
 import { isPlanModeInterviewPhaseEnabled } from '../../utils/planModeV2.js'
 import { ASK_USER_QUESTION_TOOL_NAME } from '../AskUserQuestionTool/prompt.js'
 
+/**
+ * 计划模式中的行为说明章节（六步流程）。
+ * 仅在未启用面试阶段（interview phase）时追加到提示词中；
+ * 面试阶段启用时，详细工作流由 plan_mode 附件（messages.ts）在运行时注入。
+ */
 const WHAT_HAPPENS_SECTION = `## What Happens in Plan Mode
 
 In plan mode, you'll:
@@ -13,9 +33,16 @@ In plan mode, you'll:
 
 `
 
+/**
+ * 外部用户版提示词：鼓励在大多数非平凡任务中主动进入计划模式。
+ *
+ * 涵盖七种应使用计划模式的场景（新功能/多方案/代码修改/架构决策/多文件改动/需求不清/用户偏好），
+ * 并列举不应使用的简单情况（单行修改/小调整/明确指令等），附有正反案例。
+ *
+ * 若面试阶段已启用，则省略 WHAT_HAPPENS_SECTION（避免重复）。
+ */
 function getEnterPlanModeToolPromptExternal(): string {
-  // When interview phase is enabled, omit the "What Happens" section —
-  // detailed workflow instructions arrive via the plan_mode attachment (messages.ts).
+  // 面试阶段启用时，省略"计划模式中的步骤"说明章节，避免与附件内容重复
   const whatHappens = isPlanModeInterviewPhaseEnabled()
     ? ''
     : WHAT_HAPPENS_SECTION
@@ -98,9 +125,14 @@ User: "What files handle routing?"
 `
 }
 
+/**
+ * 内部用户（ant）版提示词：更保守，仅在存在真正架构歧义或需求不明确时使用计划模式。
+ *
+ * 强调"当能合理推断方向时应直接开始工作"，避免不必要的计划开销。
+ * 当面试阶段启用时同样省略 WHAT_HAPPENS_SECTION。
+ */
 function getEnterPlanModeToolPromptAnt(): string {
-  // When interview phase is enabled, omit the "What Happens" section —
-  // detailed workflow instructions arrive via the plan_mode attachment (messages.ts).
+  // 面试阶段启用时，省略步骤说明章节
   const whatHappens = isPlanModeInterviewPhaseEnabled()
     ? ''
     : WHAT_HAPPENS_SECTION
@@ -163,6 +195,12 @@ User: "Fix the typo in the README"
 `
 }
 
+/**
+ * 工具提示词入口函数：根据 USER_TYPE 环境变量分发不同版本的提示词。
+ *
+ * - USER_TYPE === 'ant'：返回 Anthropic 内部用户版（更保守的计划模式指南）
+ * - 其他（外部用户）：返回完整的主动规划指南
+ */
 export function getEnterPlanModeToolPrompt(): string {
   return process.env.USER_TYPE === 'ant'
     ? getEnterPlanModeToolPromptAnt()

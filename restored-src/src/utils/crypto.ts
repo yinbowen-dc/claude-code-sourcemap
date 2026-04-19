@@ -1,3 +1,11 @@
+/**
+ * 加密模块适配层。
+ *
+ * 在 Claude Code 系统中，该模块作为 package.json "browser" 字段的间接层，
+ * 当 Bun 以 --target browser 构建 browser-sdk.js 时，
+ * 替换为 crypto.browser.ts 以避免引入约 500KB 的 crypto-browserify polyfill。
+ * Node/Bun 构建直接使用本文件（转发 Node.js crypto 模块）。
+ */
 // Indirection point for the package.json "browser" field. When bun builds
 // browser-sdk.js with --target browser, this file is swapped for
 // crypto.browser.ts — avoiding a ~500KB crypto-browserify polyfill that Bun

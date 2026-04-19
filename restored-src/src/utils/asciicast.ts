@@ -1,3 +1,19 @@
+/**
+ * Asciicast 终端录制模块。
+ *
+ * 在 Claude Code 系统中，该模块为内部用户（USER_TYPE=ant）提供终端会话录制功能。
+ * 通过拦截 process.stdout.write，将所有终端输出以 asciicast v2 格式记录到 .cast 文件，
+ * 供后续回放或上传（/share 命令）使用。
+ *
+ * 主要功能：
+ * 1. getRecordFilePath()：获取录制文件路径（惰性计算并缓存）
+ * 2. installAsciicastRecorder()：安装录制器（拦截 stdout.write，写入 asciicast v2 header）
+ * 3. flushAsciicastRecorder()：将缓冲数据强制写入磁盘（/share 前调用）
+ * 4. getSessionRecordingPaths()：获取当前会话的所有 .cast 文件路径
+ * 5. renameRecordingForSession()：--resume 后将录制文件重命名以匹配新会话 ID
+ *
+ * 注意：仅在 CLAUDE_CODE_TERMINAL_RECORDING=1 且 USER_TYPE=ant 时启用录制。
+ */
 import { appendFile, rename } from 'fs/promises'
 import { basename, dirname, join } from 'path'
 import { getOriginalCwd, getSessionId } from '../bootstrap/state.js'
@@ -16,10 +32,11 @@ const recordingState: { filePath: string | null; timestamp: number } = {
 }
 
 /**
+ * 获取 asciicast 录制文件路径。
+ * 仅在 USER_TYPE=ant 且 CLAUDE_CODE_TERMINAL_RECORDING=1 时返回路径，否则返回 null。
+ * 路径首次计算后缓存在 recordingState 中，路径格式为 {sessionId}-{timestamp}.cast。
+ *
  * Get the asciicast recording file path.
- * For ants with CLAUDE_CODE_TERMINAL_RECORDING=1: returns a path.
- * Otherwise: returns null.
- * The path is computed once and cached in recordingState.
  */
 export function getRecordFilePath(): string | null {
   if (recordingState.filePath !== null) {
@@ -49,8 +66,9 @@ export function _resetRecordingStateForTesting(): void {
 }
 
 /**
+ * 获取当前会话的所有 .cast 录制文件路径，按文件名（时间戳后缀）升序排列。
+ *
  * Find all .cast files for the current session.
- * Returns paths sorted by filename (chronological by timestamp suffix).
  */
 export function getSessionRecordingPaths(): string[] {
   const sessionId = getSessionId()
@@ -74,10 +92,11 @@ export function getSessionRecordingPaths(): string[] {
 }
 
 /**
+ * 将录制文件重命名以匹配当前会话 ID。
+ * --resume/--continue 后会话 ID 变更时调用，确保 getSessionRecordingPaths() 能找到文件。
+ * 重命名前先 flush 缓冲写入。
+ *
  * Rename the recording file to match the current session ID.
- * Called after --resume/--continue changes the session ID via switchSession().
- * The recorder was installed with the initial (random) session ID; this renames
- * the file so getSessionRecordingPaths() can find it by the resumed session ID.
  */
 export async function renameRecordingForSession(): Promise<void> {
   const oldPath = recordingState.filePath
@@ -125,17 +144,21 @@ function getTerminalSize(): { cols: number; rows: number } {
 }
 
 /**
+ * 将缓冲的录制数据强制写入磁盘。
+ * 在读取 .cast 文件（如 /share 命令上传前）调用。
+ *
  * Flush pending recording data to disk.
- * Call before reading the .cast file (e.g., during /share).
  */
 export async function flushAsciicastRecorder(): Promise<void> {
   await recorder?.flush()
 }
 
 /**
+ * 安装 asciicast 录制器。
+ * 拦截 process.stdout.write 以捕获所有终端输出并附加时间戳。
+ * 必须在 Ink 挂载之前调用。写入使用缓冲写入器（500ms 或 10MB 触发 flush）。
+ *
  * Install the asciicast recorder.
- * Wraps process.stdout.write to capture all terminal output with timestamps.
- * Must be called before Ink mounts.
  */
 export function installAsciicastRecorder(): void {
   const filePath = getRecordFilePath()

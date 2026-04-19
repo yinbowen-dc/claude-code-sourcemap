@@ -1,3 +1,51 @@
+/**
+ * 键位绑定 React Hook 模块
+ *
+ * 【在 Claude Code 键位绑定系统中的位置与作用】
+ * 本文件是键位绑定系统的"React 集成层"，提供两个 Hook，
+ * 将 Ink 的底层按键输入事件桥接到应用的业务逻辑：
+ *
+ *   loadUserBindings（加载绑定列表）
+ *   resolver（按键 → 动作裁决）
+ *     → useKeybinding / useKeybindings（本文件，React Hook 层）
+ *       ← 各 UI 组件通过这两个 Hook 注册快捷键处理函数
+ *
+ * 核心导出：
+ *  - useKeybinding(action, handler, options)：
+ *    为单个动作注册处理函数，支持和弦序列（如 "ctrl+k ctrl+s"）
+ *  - useKeybindings(handlers, options)：
+ *    为多个动作批量注册处理函数（减少 useInput 调用次数，提升性能）
+ *
+ * 设计要点：
+ *  - 处理函数返回 false 表示"事件未消费"，允许事件向下传播给后续 Handler
+ *  - 和弦状态通过 KeybindingContext.setPendingChord() 跨 Hook 共享
+ *  - 使用 stopImmediatePropagation() 阻止同一按键被多个 Handler 重复处理
+ */
+
+/**
+ * 键位绑定 React Hook 模块
+ *
+ * 【在 Claude Code 键位绑定系统中的位置与作用】
+ * 本文件是键位绑定系统的"React 集成层"，提供两个 Hook，
+ * 将 Ink 的底层按键输入事件桥接到应用的业务逻辑：
+ *
+ *   loadUserBindings（加载绑定列表）
+ *   resolver（按键 → 动作裁决）
+ *     → useKeybinding / useKeybindings（本文件，React Hook 层）
+ *       ← 各 UI 组件通过这两个 Hook 注册快捷键处理函数
+ *
+ * 核心导出：
+ *  - useKeybinding(action, handler, options)：
+ *    为单个动作注册处理函数，支持和弦序列（如 "ctrl+k ctrl+s"）
+ *  - useKeybindings(handlers, options)：
+ *    为多个动作批量注册处理函数（减少 useInput 调用次数，提升性能）
+ *
+ * 设计要点：
+ *  - 处理函数返回 false 表示"事件未消费"，允许事件向下传播给后续 Handler
+ *  - 和弦状态通过 KeybindingContext.setPendingChord() 跨 Hook 共享
+ *  - 使用 stopImmediatePropagation() 阻止同一按键被多个 Handler 重复处理
+ */
+
 import { useCallback, useEffect } from 'react'
 import type { InputEvent } from '../ink/events/input-event.js'
 import { type Key, useInput } from '../ink.js'

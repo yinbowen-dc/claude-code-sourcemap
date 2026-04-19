@@ -1,3 +1,26 @@
+/**
+ * replBridgeTransport.ts — REPL Bridge Transport 抽象层
+ *
+ * 在 Claude Code 系统流程中的位置：
+ *   REPL Bridge 传输层（replBridge.ts / remoteBridgeCore.ts）
+ *     └─> replBridgeTransport.ts（本文件）——统一 v1 HybridTransport 和 v2 SSETransport+CCRClient 的接口
+ *
+ * 主要功能：
+ *   - ReplBridgeTransport：接口定义，封装 replBridge.ts 所需的全部传输操作
+ *   - createV1ReplTransport：将 v1 HybridTransport（WS 读 + POST 写）适配为 ReplBridgeTransport
+ *   - createV2ReplTransport：创建 v2 适配器（SSETransport 读流 + CCRClient 写路径），含 worker 注册
+ *
+ * v1 vs v2 传输路径：
+ *   - v1：HybridTransport（WebSocket 读 + session-ingress POST 写）
+ *   - v2：SSETransport（读流）+ CCRClient（写：POST /worker/events，心跳：PUT /worker）
+ *     - 写路径经由 CCRClient.writeEvent → SerialBatchEventUploader，而非 SSETransport.write()
+ *     - SSETransport.write() 目标格式与 CCR v2 不兼容
+ *
+ * v2 特殊关闭码：
+ *   - 4090：epoch superseded（工作代次被取代，需重新注册 worker）
+ *   - 4091：CCRClient 初始化失败（ccr.initialize() rejected）
+ *   - 4092：SSE 重连次数耗尽（SSETransport 关闭预算耗尽）
+ */
 import type { StdoutMessage } from 'src/entrypoints/sdk/controlTypes.js'
 import { CCRClient } from '../cli/transports/ccrClient.js'
 import type { HybridTransport } from '../cli/transports/HybridTransport.js'
@@ -9,16 +32,19 @@ import type { SessionState } from '../utils/sessionState.js'
 import { registerWorker } from './workSecret.js'
 
 /**
- * Transport abstraction for replBridge. Covers exactly the surface that
- * replBridge.ts uses against HybridTransport so the v1/v2 choice is
- * confined to the construction site.
+ * REPL Bridge Transport 接口。
  *
- * - v1: HybridTransport (WS reads + POST writes to Session-Ingress)
- * - v2: SSETransport (reads) + CCRClient (writes to CCR v2 /worker/*)
+ * 统一封装 v1（HybridTransport）和 v2（SSETransport + CCRClient）的公共操作面，
+ * 使 replBridge.ts 的 transport 变量类型保持单一，无需关心底层实现差异。
  *
- * The v2 write path goes through CCRClient.writeEvent → SerialBatchEventUploader,
- * NOT through SSETransport.write() — SSETransport.write() targets the
- * Session-Ingress POST URL shape, which is wrong for CCR v2.
+ * 主要方法分组：
+ *   - 写操作：write（单消息）、writeBatch（批量消息）
+ *   - 生命周期：connect（建立连接）、close（关闭）、flush（刷新写队列）
+ *   - 状态查询：isConnectedStatus（写就绪）、getStateLabel（调试标签）
+ *   - 回调注册：setOnData / setOnClose / setOnConnect
+ *   - 序列号：getLastSequenceNum（SSE 事件序列号高水位，用于断线续传）
+ *   - 丢弃计数：droppedBatchCount（SerialBatchEventUploader 静默丢弃计数）
+ *   - CCR v2 专属（v1 为空操作）：reportState / reportMetadata / reportDelivery
  */
 export type ReplBridgeTransport = {
   write(message: StdoutMessage): Promise<void>
@@ -31,49 +57,59 @@ export type ReplBridgeTransport = {
   setOnConnect(callback: () => void): void
   connect(): void
   /**
-   * High-water mark of the underlying read stream's event sequence numbers.
-   * replBridge reads this before swapping transports so the new one can
-   * resume from where the old one left off (otherwise the server replays
-   * the entire session history from seq 0).
+   * 底层读流的 SSE 事件序列号高水位。
    *
-   * v1 returns 0 — Session-Ingress WS doesn't use SSE sequence numbers;
-   * replay-on-reconnect is handled by the server-side message cursor.
+   * replBridge 在切换 transport 前读取此值，传给新 transport，
+   * 使新连接从断点续传（否则服务端会从 seq 0 重放整个会话历史）。
+   *
+   * v1 返回 0：Session-Ingress WS 不使用 SSE 序列号，
+   * 重放语义由服务端的消息游标处理。
    */
   getLastSequenceNum(): number
   /**
-   * Monotonic count of batches dropped via maxConsecutiveFailures.
-   * Snapshot before writeBatch() and compare after to detect silent drops
-   * (writeBatch() resolves normally even when batches were dropped).
-   * v2 returns 0 — the v2 write path doesn't set maxConsecutiveFailures.
+   * SerialBatchEventUploader 通过 maxConsecutiveFailures 静默丢弃的批次计数（单调递增）。
+   *
+   * 在 writeBatch() 调用前后对比此值可检测静默丢弃
+   * （writeBatch() 即使批次被丢弃也会正常 resolve）。
+   * v2 返回 0：v2 写路径不设置 maxConsecutiveFailures，不会丢弃批次。
    */
   readonly droppedBatchCount: number
   /**
-   * PUT /worker state (v2 only; v1 is a no-op). `requires_action` tells
-   * the backend a permission prompt is pending — claude.ai shows the
-   * "waiting for input" indicator. REPL/daemon callers don't need this
-   * (user watches the REPL locally); multi-session worker callers do.
+   * PUT /worker state（仅 v2 有效，v1 为空操作）。
+   *
+   * 'requires_action' 告知后端权限提示待处理——claude.ai 显示"等待输入"指示器。
+   * REPL/daemon 调用方不需要此功能（用户在本地 REPL 中直接操作）；
+   * 多会话 worker 调用方需要此功能。
    */
   reportState(state: SessionState): void
-  /** PUT /worker external_metadata (v2 only; v1 is a no-op). */
+  /** PUT /worker external_metadata（仅 v2 有效，v1 为空操作） */
   reportMetadata(metadata: Record<string, unknown>): void
   /**
-   * POST /worker/events/{id}/delivery (v2 only; v1 is a no-op). Populates
-   * CCR's processing_at/processed_at columns. `received` is auto-fired by
-   * CCRClient on every SSE frame and is not exposed here.
+   * POST /worker/events/{id}/delivery（仅 v2 有效，v1 为空操作）。
+   *
+   * 填充 CCR 的 processing_at/processed_at 字段。
+   * 'received' 由 CCRClient 在每个 SSE 帧时自动触发，此处不暴露。
    */
   reportDelivery(eventId: string, status: 'processing' | 'processed'): void
   /**
-   * Drain the write queue before close() (v2 only; v1 resolves
-   * immediately — HybridTransport POSTs are already awaited per-write).
+   * 关闭前刷新写队列（仅 v2 有效，v1 立即 resolve）。
+   *
+   * v1 的 HybridTransport POST 每次写入时已 await，无需额外 flush。
+   * v2 的 SerialBatchEventUploader 内部有队列，flush() 等待所有待发送批次完成。
    */
   flush(): Promise<void>
 }
 
 /**
- * v1 adapter: HybridTransport already has the full surface (it extends
- * WebSocketTransport which has setOnConnect + getStateLabel). This is a
- * no-op wrapper that exists only so replBridge's `transport` variable
- * has a single type.
+ * 创建 v1 ReplBridgeTransport 适配器（HybridTransport 无操作包装）。
+ *
+ * HybridTransport 已实现完整的 ReplBridgeTransport 接口面（继承自 WebSocketTransport），
+ * 此函数仅作类型对齐的薄包装层，使 replBridge 的 `transport` 变量有统一类型。
+ *
+ * v1 特殊处理：
+ *   - getLastSequenceNum 始终返回 0（v1 不使用 SSE 序列号，重放由服务端游标处理）
+ *   - reportState / reportMetadata / reportDelivery 均为空操作
+ *   - flush 直接 resolve（HybridTransport POST 每次写入时已 await）
  */
 export function createV1ReplTransport(
   hybrid: HybridTransport,
@@ -88,69 +124,76 @@ export function createV1ReplTransport(
     setOnClose: cb => hybrid.setOnClose(cb),
     setOnConnect: cb => hybrid.setOnConnect(cb),
     connect: () => void hybrid.connect(),
-    // v1 Session-Ingress WS doesn't use SSE sequence numbers; replay
-    // semantics are different. Always return 0 so the seq-num carryover
-    // logic in replBridge is a no-op for v1.
+    // v1 Session-Ingress WS 不使用 SSE 序列号；重放语义不同。
+    // 始终返回 0，使 replBridge 的序列号续传逻辑对 v1 为空操作。
     getLastSequenceNum: () => 0,
     get droppedBatchCount() {
       return hybrid.droppedBatchCount
     },
-    reportState: () => {},
-    reportMetadata: () => {},
-    reportDelivery: () => {},
-    flush: () => Promise.resolve(),
+    reportState: () => {}, // v1 空操作
+    reportMetadata: () => {}, // v1 空操作
+    reportDelivery: () => {}, // v1 空操作
+    flush: () => Promise.resolve(), // v1 POST 已 await，无需额外 flush
   }
 }
 
 /**
- * v2 adapter: wrap SSETransport (reads) + CCRClient (writes, heartbeat,
- * state, delivery tracking).
+ * 创建 v2 ReplBridgeTransport 适配器（SSETransport + CCRClient）。
  *
- * Auth: v2 endpoints validate the JWT's session_id claim (register_worker.go:32)
- * and worker role (environment_auth.py:856). OAuth tokens have neither.
- * This is the inverse of the v1 replBridge path, which deliberately uses OAuth.
- * The JWT is refreshed when the poll loop re-dispatches work — the caller
- * invokes createV2ReplTransport again with the fresh token.
+ * 创建流程（含 worker 注册）：
+ *   1. 认证头构建：
+ *      - 若提供 getAuthToken：使用 per-instance 闭包（多会话安全）
+ *      - 否则：写入 CLAUDE_CODE_SESSION_ACCESS_TOKEN 环境变量（单会话兼容路径）
+ *   2. 获取 worker epoch：
+ *      - 若提供 opts.epoch（来自 POST /bridge 响应）：直接使用（/bridge 调用即已注册 worker）
+ *      - 否则：调用 registerWorker(sessionUrl, ingressToken) 获取 epoch
+ *   3. 构建 SSE 读流 URL：{sessionUrl}/worker/events/stream
+ *   4. 创建 SSETransport（含 initialSequenceNum 续传支持）
+ *   5. 创建 CCRClient（含 onEpochMismatch 409 处理）
+ *   6. 覆写 SSETransport.setOnEvent：同时 ACK 'received' + 'processed'
+ *      （防止幽灵提示重发——daemon 重启时 reconnectSession 对未 processed 事件重新入队）
+ *   7. 返回 ReplBridgeTransport 对象（connect() 调用时才建立实际连接）
  *
- * Registration happens here (not in the caller) so the entire v2 handshake
- * is one async step. registerWorker failure propagates — replBridge will
- * catch it and stay on the poll loop.
+ * 关闭码语义：
+ *   - 4090：epoch superseded（onEpochMismatch 触发）
+ *   - 4091：CCRClient 初始化失败（ccr.initialize() rejected）
+ *   - 4092：SSE 重连次数耗尽（sse.setOnClose 回调中 code=undefined → 映射为 4092）
+ *
+ * 注意：v2 认证使用 session JWT（而非 OAuth token）——
+ *   JWT 携带 session_id claim 和 worker role，OAuth token 无此信息。
+ *   JWT 在 poll 循环重派发工作时刷新，调用方需重新调用 createV2ReplTransport。
  */
 export async function createV2ReplTransport(opts: {
   sessionUrl: string
   ingressToken: string
   sessionId: string
   /**
-   * SSE sequence-number high-water mark from the previous transport.
-   * Passed to the new SSETransport so its first connect() sends
-   * from_sequence_num / Last-Event-ID and the server resumes from where
-   * the old stream left off. Without this, every transport swap asks the
-   * server to replay the entire session history from seq 0.
+   * 上一个 transport 的 SSE 序列号高水位。
+   * 传入 SSETransport，使新连接的第一次 connect() 携带
+   * from_sequence_num / Last-Event-ID，从断点续传。
+   * 若不传入，服务端会从 seq 0 重放整个会话历史。
    */
   initialSequenceNum?: number
   /**
-   * Worker epoch from POST /bridge response. When provided, the server
-   * already bumped epoch (the /bridge call IS the register — see server
-   * PR #293280). When omitted (v1 CCR-v2 path via replBridge.ts poll loop),
-   * call registerWorker as before.
+   * 来自 POST /bridge 响应的 worker epoch。
+   * 若提供：服务端已在 /bridge 调用时完成注册（参见服务端 PR #293280），直接使用。
+   * 若未提供（v1 CCR v2 路径，通过 replBridge.ts poll 循环）：调用 registerWorker。
    */
   epoch?: number
-  /** CCRClient heartbeat interval. Defaults to 20s when omitted. */
+  /** CCRClient 心跳间隔（毫秒）。未提供时默认 20s。 */
   heartbeatIntervalMs?: number
-  /** ±fraction per-beat jitter. Defaults to 0 (no jitter) when omitted. */
+  /** 每次心跳的随机抖动比例（±fraction）。未提供时默认 0（无抖动）。 */
   heartbeatJitterFraction?: number
   /**
-   * When true, skip opening the SSE read stream — only the CCRClient write
-   * path is activated. Use for mirror-mode attachments that forward events
-   * but never receive inbound prompts or control requests.
+   * 为 true 时跳过 SSE 读流，仅激活 CCRClient 写路径。
+   * 用于镜像模式（转发事件但不接收入站提示或控制请求）。
    */
   outboundOnly?: boolean
   /**
-   * Per-instance auth header source. When provided, CCRClient + SSETransport
-   * read auth from this closure instead of the process-wide
-   * CLAUDE_CODE_SESSION_ACCESS_TOKEN env var. Required for callers managing
-   * multiple concurrent sessions — the env-var path stomps across sessions.
-   * When omitted, falls back to the env var (single-session callers).
+   * per-instance 认证头来源。若提供，CCRClient + SSETransport 从此闭包读取 token，
+   * 而非进程级环境变量 CLAUDE_CODE_SESSION_ACCESS_TOKEN。
+   * 多会话调用方必须提供此参数——环境变量路径在会话间相互覆盖。
+   * 单会话调用方不提供时降级到环境变量。
    */
   getAuthToken?: () => string | undefined
 }): Promise<ReplBridgeTransport> {
@@ -162,34 +205,38 @@ export async function createV2ReplTransport(opts: {
     getAuthToken,
   } = opts
 
-  // Auth header builder. If getAuthToken is provided, read from it
-  // (per-instance, multi-session safe). Otherwise write ingressToken to
-  // the process-wide env var (legacy single-session path — CCRClient's
-  // default getAuthHeaders reads it via getSessionIngressAuthHeaders).
+  // 认证头构建策略：
+  //   - getAuthToken 已提供：per-instance 闭包（多会话安全，避免环境变量跨会话覆盖）
+  //   - 未提供：写入进程级环境变量（单会话兼容路径）
   let getAuthHeaders: (() => Record<string, string>) | undefined
   if (getAuthToken) {
+    // per-instance 认证头：从闭包读取 token，构建 Authorization 头
     getAuthHeaders = (): Record<string, string> => {
       const token = getAuthToken()
       if (!token) return {}
       return { Authorization: `Bearer ${token}` }
     }
   } else {
-    // CCRClient.request() and SSETransport.connect() both read auth via
-    // getSessionIngressAuthHeaders() → this env var. Set it before either
-    // touches the network.
+    // 单会话兼容路径：写入进程级 CLAUDE_CODE_SESSION_ACCESS_TOKEN 环境变量
+    // CCRClient.request() 和 SSETransport.connect() 均通过 getSessionIngressAuthHeaders() 读取
     updateSessionIngressAuthToken(ingressToken)
   }
 
+  // 获取 worker epoch：
+  //   - opts.epoch 已提供（来自 /bridge 响应）：直接使用，无需再次注册
+  //   - 未提供：调用 registerWorker，获取服务端分配的 epoch
   const epoch = opts.epoch ?? (await registerWorker(sessionUrl, ingressToken))
   logForDebugging(
     `[bridge:repl] CCR v2: worker sessionId=${sessionId} epoch=${epoch}${opts.epoch !== undefined ? ' (from /bridge)' : ' (via registerWorker)'}`,
   )
 
-  // Derive SSE stream URL. Same logic as transportUtils.ts:26-33 but
-  // starting from an http(s) base instead of a --sdk-url that might be ws://.
+  // 派生 SSE 读流 URL：{sessionUrl}/worker/events/stream
+  // 与 transportUtils.ts 的逻辑相同，但从 http(s) 基础 URL 出发（而非 ws:// sdk-url）
   const sseUrl = new URL(sessionUrl)
   sseUrl.pathname = sseUrl.pathname.replace(/\/$/, '') + '/worker/events/stream'
 
+  // 创建 SSETransport（读流）
+  // initialSequenceNum：断线续传的起始序列号（新连接从此处继续，避免重放历史）
   const sse = new SSETransport(
     sseUrl,
     {},
@@ -198,171 +245,172 @@ export async function createV2ReplTransport(opts: {
     initialSequenceNum,
     getAuthHeaders,
   )
-  let onCloseCb: ((closeCode?: number) => void) | undefined
+  let onCloseCb: ((closeCode?: number) => void) | undefined // onClose 回调暂存（setOnClose 时注册）
+
+  // 创建 CCRClient（写路径 + 心跳）
   const ccr = new CCRClient(sse, new URL(sessionUrl), {
     getAuthHeaders,
     heartbeatIntervalMs: opts.heartbeatIntervalMs,
     heartbeatJitterFraction: opts.heartbeatJitterFraction,
-    // Default is process.exit(1) — correct for spawn-mode children. In-process,
-    // that kills the REPL. Close instead: replBridge's onClose wakes the poll
-    // loop, which picks up the server's re-dispatch (with fresh epoch).
+    // CCRClient 默认的 onEpochMismatch 调用 process.exit(1)——在 spawn-mode 子进程中正确，
+    // 但在 REPL 进程内这会直接终止整个 REPL。此处改为关闭 transport 并通知 replBridge，
+    // 使 poll 循环恢复（服务端重派发工作时携带新 epoch）。
     onEpochMismatch: () => {
       logForDebugging(
         '[bridge:repl] CCR v2: epoch superseded (409) — closing for poll-loop recovery',
       )
-      // Close resources in a try block so the throw always executes.
-      // If ccr.close() or sse.close() throw, we still need to unwind
-      // the caller (request()) — otherwise handleEpochMismatch's `never`
-      // return type is violated at runtime and control falls through.
+      // 在 try 块中关闭资源，确保 throw 始终执行。
+      // 若 ccr.close() 或 sse.close() 抛出异常，仍需 unwind 调用方（request()），
+      // 否则 handleEpochMismatch 的 `never` 返回类型在运行时被违反，控制流穿透。
       try {
         ccr.close()
         sse.close()
-        onCloseCb?.(4090)
+        onCloseCb?.(4090) // 通知 replBridge：epoch superseded（4090）
       } catch (closeErr: unknown) {
         logForDebugging(
           `[bridge:repl] CCR v2: error during epoch-mismatch cleanup: ${errorMessage(closeErr)}`,
           { level: 'error' },
         )
       }
-      // Don't return — the calling request() code continues after the 409
-      // branch, so callers see the logged warning and a false return. We
-      // throw to unwind; the uploaders catch it as a send failure.
+      // 不能 return——request() 中的 409 分支代码会在之后继续执行，
+      // 调用方会看到日志警告和 false 返回值。抛出异常以 unwind；
+      // uploaders 将其捕获为发送失败。
       throw new Error('epoch superseded')
     },
   })
 
-  // CCRClient's constructor wired sse.setOnEvent → reportDelivery('received').
-  // remoteIO.ts additionally sends 'processing'/'processed' via
-  // setCommandLifecycleListener, which the in-process query loop fires. This
-  // transport's only caller (replBridge/daemonBridge) has no such wiring — the
-  // daemon's agent child is a separate process (ProcessTransport), and its
-  // notifyCommandLifecycle calls fire with listener=null in its own module
-  // scope. So events stay at 'received' forever, and reconnectSession re-queues
-  // them on every daemon restart (observed: 21→24→25 phantom prompts as
-  // "user sent a new message while you were working" system-reminders).
+  // 覆写 SSETransport 的 setOnEvent 回调，同时 ACK 'received' 和 'processed'。
   //
-  // Fix: ACK 'processed' immediately alongside 'received'. The window between
-  // SSE receipt and transcript-write is narrow (queue → SDK → child stdin →
-  // model); a crash there loses one prompt vs. the observed N-prompt flood on
-  // every restart. Overwrite the constructor's wiring to do both — setOnEvent
-  // replaces, not appends (SSETransport.ts:658).
+  // 背景：CCRClient 构造函数已将 sse.setOnEvent 连接到 reportDelivery('received')。
+  // remoteIO.ts 额外通过 setCommandLifecycleListener 发送 'processing'/'processed'，
+  // 但 replBridge/daemonBridge 的调用方没有此机制——daemon 的代理子进程是独立进程
+  // （ProcessTransport），其 notifyCommandLifecycle 调用在自己模块中 listener=null 时触发。
+  // 结果：事件永久停留在 'received' 状态，reconnectSession 在每次 daemon 重启时
+  // 将所有未 processed 事件重新入队（观察到：第 21→24→25 次幽灵提示，
+  // 以 "user sent a new message while you were working" 系统提示的形式出现）。
+  //
+  // 修复方案：接收时立即同时 ACK 'processed'。SSE 接收到写入 transcript 的窗口较窄
+  // （队列 → SDK → 子进程 stdin → 模型），崩溃时最多丢失一次提示，
+  // 优于每次重启时 N 次提示洪泛。
+  // setOnEvent 是替换而非追加（SSETransport.ts:658）——覆写后旧的 'received' ACK 仍保留。
   sse.setOnEvent(event => {
-    ccr.reportDelivery(event.event_id, 'received')
-    ccr.reportDelivery(event.event_id, 'processed')
+    ccr.reportDelivery(event.event_id, 'received') // ACK 接收
+    ccr.reportDelivery(event.event_id, 'processed') // 立即 ACK 处理完成（防幽灵提示重发）
   })
 
-  // Both sse.connect() and ccr.initialize() are deferred to connect() below.
-  // replBridge's calling order is newTransport → setOnConnect → setOnData →
-  // setOnClose → connect(), and both calls need those callbacks wired first:
-  // sse.connect() opens the stream (events flow to onData/onClose immediately),
-  // and ccr.initialize().then() fires onConnectCb.
+  // connect() 和 ccr.initialize() 都延迟到 connect() 调用时执行。
+  // replBridge 的调用顺序是：newTransport → setOnConnect → setOnData → setOnClose → connect()
+  // 两个调用都需要这些回调先注册好：
+  //   sse.connect() 打开流（事件立即通过 onData/onClose 流动）
+  //   ccr.initialize().then() 触发 onConnectCb
   //
-  // onConnect fires once ccr.initialize() resolves. Writes go via
-  // CCRClient HTTP POST (SerialBatchEventUploader), not SSE, so the
-  // write path is ready the moment workerEpoch is set. SSE.connect()
-  // awaits its read loop and never resolves — don't gate on it.
-  // The SSE stream opens in parallel (~30ms) and starts delivering
-  // inbound events via setOnData; outbound doesn't need to wait for it.
+  // onConnect 在 ccr.initialize() resolve 后触发。
+  // 写路径通过 CCRClient HTTP POST（SerialBatchEventUploader），而非 SSE，
+  // 因此写路径在 workerEpoch 设置后立即就绪，无需等待 SSE 连接建立。
+  // SSE 流并行打开（约 30ms 延迟），通过 setOnData 开始传递入站事件；
+  // 出站写入不需要等待 SSE 就绪。
   let onConnectCb: (() => void) | undefined
-  let ccrInitialized = false
-  let closed = false
+  let ccrInitialized = false // CCRClient 是否初始化完成（控制 isConnectedStatus 返回值）
+  let closed = false // 是否已关闭（防止 writeBatch 在 teardown 后发送部分批次）
 
   return {
     write(msg) {
+      // 通过 CCRClient 写事件（→ SerialBatchEventUploader → POST /worker/events）
       return ccr.writeEvent(msg)
     },
     async writeBatch(msgs) {
-      // SerialBatchEventUploader already batches internally (maxBatchSize=100);
-      // sequential enqueue preserves order and the uploader coalesces.
-      // Check closed between writes to avoid sending partial batches after
-      // transport teardown (epoch mismatch, SSE drop).
+      // SerialBatchEventUploader 内部已批量处理（maxBatchSize=100）；
+      // 顺序入队保证消息顺序，uploader 自动合并。
+      // 在写入之间检查 closed，避免 transport teardown（epoch mismatch、SSE 枯竭）后
+      // 发送部分批次。
       for (const m of msgs) {
-        if (closed) break
+        if (closed) break // transport 已关闭，停止发送
         await ccr.writeEvent(m)
       }
     },
     close() {
-      closed = true
-      ccr.close()
-      sse.close()
+      closed = true // 标记为已关闭，防止后续 writeBatch 操作
+      ccr.close() // 停止心跳，关闭写路径
+      sse.close() // 关闭 SSE 读流
     },
     isConnectedStatus() {
-      // Write-readiness, not read-readiness — replBridge checks this
-      // before calling writeBatch. SSE open state is orthogonal.
+      // 检查写就绪状态（而非读就绪）——replBridge 在调用 writeBatch 前检查此值。
+      // SSE 的打开状态与写就绪正交（可以写但还没有读流）。
       return ccrInitialized
     },
     getStateLabel() {
-      // SSETransport doesn't expose its state string; synthesize from
-      // what we can observe. replBridge only uses this for debug logging.
+      // SSETransport 不暴露状态字符串；从可观测状态合成。
+      // replBridge 仅将此用于调试日志。
       if (sse.isClosedStatus()) return 'closed'
       if (sse.isConnectedStatus()) return ccrInitialized ? 'connected' : 'init'
       return 'connecting'
     },
     setOnData(cb) {
+      // 透传到 SSETransport 的 setOnData（入站事件处理）
       sse.setOnData(cb)
     },
     setOnClose(cb) {
-      onCloseCb = cb
-      // SSE reconnect-budget exhaustion fires onClose(undefined) — map to
-      // 4092 so ws_closed telemetry can distinguish it from HTTP-status
-      // closes (SSETransport:280 passes response.status). Stop CCRClient's
-      // heartbeat timer before notifying replBridge. (sse.close() doesn't
-      // invoke this, so the epoch-mismatch path above isn't double-firing.)
+      onCloseCb = cb // 保存回调供 onEpochMismatch 使用
+      // SSE 重连预算耗尽触发 onClose(undefined)——映射到 4092，
+      // 使 ws_closed 遥测可区分于 HTTP 状态关闭（SSETransport:280 传入 response.status）。
+      // 在通知 replBridge 前停止 CCRClient 的心跳定时器。
+      // （sse.close() 不会调用此回调，epoch-mismatch 路径不会重复触发。）
       sse.setOnClose(code => {
-        ccr.close()
-        cb(code ?? 4092)
+        ccr.close() // 停止心跳
+        cb(code ?? 4092) // SSE 重连耗尽映射为 4092
       })
     },
     setOnConnect(cb) {
-      onConnectCb = cb
+      onConnectCb = cb // 保存回调，ccr.initialize() resolve 后调用
     },
     getLastSequenceNum() {
+      // 从 SSETransport 获取最新 SSE 事件序列号（用于断线续传）
       return sse.getLastSequenceNum()
     },
-    // v2 write path (CCRClient) doesn't set maxConsecutiveFailures — no drops.
+    // v2 写路径（CCRClient）不设置 maxConsecutiveFailures，不会静默丢弃批次
     droppedBatchCount: 0,
     reportState(state) {
-      ccr.reportState(state)
+      ccr.reportState(state) // PUT /worker state（告知后端会话状态）
     },
     reportMetadata(metadata) {
-      ccr.reportMetadata(metadata)
+      ccr.reportMetadata(metadata) // PUT /worker external_metadata
     },
     reportDelivery(eventId, status) {
-      ccr.reportDelivery(eventId, status)
+      ccr.reportDelivery(eventId, status) // POST /worker/events/{id}/delivery
     },
     flush() {
-      return ccr.flush()
+      return ccr.flush() // 等待所有待发送批次完成
     },
     connect() {
-      // Outbound-only: skip the SSE read stream entirely — no inbound
-      // events to receive, no delivery ACKs to send. Only the CCRClient
-      // write path (POST /worker/events) and heartbeat are needed.
+      // outboundOnly 模式：跳过 SSE 读流（镜像模式，只需写路径和心跳）
       if (!opts.outboundOnly) {
-        // Fire-and-forget — SSETransport.connect() awaits readStream()
-        // (the read loop) and only resolves on stream close/error. The
-        // spawn-mode path in remoteIO.ts does the same void discard.
+        // Fire-and-forget：SSETransport.connect() 等待 readStream()（读循环），
+        // 仅在流关闭/错误时 resolve。
+        // spawn-mode 的 remoteIO.ts 采用同样的 void 丢弃方式。
         void sse.connect()
       }
+      // 初始化 CCRClient：设置 workerEpoch，启动心跳，就绪后触发 onConnectCb
       void ccr.initialize(epoch).then(
         () => {
-          ccrInitialized = true
+          ccrInitialized = true // 标记写路径就绪
           logForDebugging(
             `[bridge:repl] v2 transport ready for writes (epoch=${epoch}, sse=${sse.isConnectedStatus() ? 'open' : 'opening'})`,
           )
-          onConnectCb?.()
+          onConnectCb?.() // 通知 replBridge：transport 连接就绪
         },
         (err: unknown) => {
+          // ccr.initialize() 失败（如 HTTP 错误、网络超时）
           logForDebugging(
             `[bridge:repl] CCR v2 initialize failed: ${errorMessage(err)}`,
             { level: 'error' },
           )
-          // Close transport resources and notify replBridge via onClose
-          // so the poll loop can retry on the next work dispatch.
-          // Without this callback, replBridge never learns the transport
-          // failed to initialize and sits with transport === null forever.
+          // 关闭 transport 资源并通过 onClose 通知 replBridge，
+          // 使 poll 循环在下次工作派发时重试。
+          // 若不触发此回调，replBridge 永远不知道 transport 初始化失败，
+          // transport 变量将永久停留在 null。
           ccr.close()
           sse.close()
-          onCloseCb?.(4091) // 4091 = init failure, distinguishable from 4090 epoch mismatch
+          onCloseCb?.(4091) // 4091 = 初始化失败（与 4090 epoch superseded 可区分）
         },
       )
     },

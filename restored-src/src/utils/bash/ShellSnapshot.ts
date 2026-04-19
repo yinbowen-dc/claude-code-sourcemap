@@ -1,3 +1,20 @@
+/**
+ * Shell 环境快照模块。
+ *
+ * 在 Claude Code 系统中，该模块负责捕获用户 shell 的环境状态（函数、别名、选项），
+ * 并将其保存为可 source 的快照文件，供 Claude 的子进程以用户环境执行命令：
+ * - createArgv0ShellFunction()（内部）：生成利用 ARGV0 dispatch 调用嵌入式工具
+ *   （rg/bfs/ugrep）的 shell 函数，兼容 zsh/bash/Windows git-bash
+ * - createRipgrepShellIntegration()：为嵌入式 ripgrep 生成 shell 函数或别名片段
+ * - createFindGrepShellIntegration()：为嵌入式 bfs/ugrep 生成 find/grep 覆盖函数，
+ *   注入默认标志以匹配 GlobTool/GrepTool 语义（含 VCS 目录排除、gitignore 支持等）
+ * - getUserSnapshotContent()（内部）：生成捕获用户函数/选项/别名的 shell 脚本片段
+ * - getClaudeCodeSnapshotContent()（内部）：生成 Claude Code 专属快照内容（PATH、rg 等）
+ * - getSnapshotScript()（内部）：组合 source 配置文件 + 捕获环境的完整脚本
+ * - createAndSaveSnapshot()：执行快照脚本并返回快照文件路径；失败时返回 undefined
+ *
+ * 快照创建超时：10 秒；快照文件位于 ~/.claude/shell-snapshots/；会在进程退出时清理。
+ */
 import { execFile } from 'child_process'
 import { execa } from 'execa'
 import { mkdir, stat } from 'fs/promises'
@@ -24,13 +41,16 @@ const LITERAL_BACKSLASH = '\\'
 const SNAPSHOT_CREATION_TIMEOUT = 10000 // 10 seconds
 
 /**
- * Creates a shell function that invokes `binaryPath` with a specific argv[0].
- * This uses the bun-internal ARGV0 dispatch trick: the bun binary checks its
- * argv[0] and runs the embedded tool (rg, bfs, ugrep) that matches.
+ * 生成一个以特定 argv[0] 调用 binaryPath 的 shell 函数。
+ * 利用 bun 内部的 ARGV0 dispatch 机制：bun 二进制检测自身 argv[0]，
+ * 并运行与其匹配的嵌入式工具（rg、bfs、ugrep）。
  *
- * @param prependArgs - Arguments to inject before the user's args (e.g.,
- *   default flags). Injected literally; each element must be a valid shell
- *   word (no spaces/special chars).
+ * 兼容三种执行环境：
+ * - zsh：直接通过 ARGV0 环境变量设置 argv[0]
+ * - Windows git-bash（msys/cygwin）：exec -a 不可用，同样使用 ARGV0 环境变量
+ * - bash（非子 shell）：通过 exec -a 设置 argv[0]，并使用子 shell 包装避免替换当前进程
+ *
+ * @param prependArgs 注入用户参数之前的默认标志列表；每个元素须为合法 shell 词（不含空格或特殊字符）
  */
 function createArgv0ShellFunction(
   funcName: string,
@@ -59,8 +79,11 @@ function createArgv0ShellFunction(
 }
 
 /**
- * Creates ripgrep shell integration (alias or function)
- * @returns Object with type and the shell snippet to use
+ * 为嵌入式 ripgrep 生成 shell 集成片段（函数或别名）。
+ * - 若 ripgrep 是通过 bun ARGV0 dispatch 内嵌的，则生成 shell 函数以正确设置 argv[0]。
+ * - 若使用系统 ripgrep，则生成简单别名目标（含可选的默认参数）。
+ * 返回对象包含类型标记（'alias' | 'function'）和对应的 shell 片段字符串，
+ * 供 getClaudeCodeSnapshotContent() 写入快照文件。
  */
 export function createRipgrepShellIntegration(): {
   type: 'alias' | 'function'
@@ -105,50 +128,14 @@ const VCS_DIRECTORIES_TO_EXCLUDE = [
 ] as const
 
 /**
- * Creates shell integration for `find` and `grep`, backed by bfs and ugrep
- * embedded in the bun binary (ant-native only). Unlike the rg integration,
- * this always shadows the system find/grep since bfs/ugrep are drop-in
- * replacements and we want consistent fast behavior.
+ * 为嵌入式 bfs（find 替换）和 ugrep（grep 替换）生成 shell 集成函数。
+ * 仅在 ant-native 构建（hasEmbeddedSearchTools() 为 true）时生效；否则返回 null。
  *
- * These wrappers replace the GlobTool/GrepTool dedicated tools (which are
- * removed from the tool registry when embedded search tools are available),
- * so they're tuned to match those tools' semantics, not GNU find/grep.
- *
- * `find` ↔ GlobTool:
- * - Inject `-regextype findutils-default`: bfs defaults to POSIX BRE for
- *   -regex, but GNU find defaults to emacs-flavor (which supports `\|`
- *   alternation). Without this, `find . -regex '.*\.\(js\|ts\)'` silently
- *   returns zero results. A later user-supplied -regextype still overrides.
- * - No gitignore filtering: GlobTool passes `--no-ignore` to rg. bfs has no
- *   gitignore support anyway, so this matches by default.
- * - Hidden files included: both GlobTool (`--hidden`) and bfs's default.
- *
- * Caveat: even with findutils-default, Oniguruma (bfs's regex engine) uses
- * leftmost-first alternation, not POSIX leftmost-longest. Patterns where
- * one alternative is a prefix of another (e.g., `\(ts\|tsx\)`) may miss
- * matches that GNU find catches. Workaround: put the longer alternative first.
- *
- * `grep` ↔ GrepTool (file filtering) + GNU grep (regex syntax):
- * - `-G` (basic regex / BRE): GNU grep defaults to BRE where `\|` is
- *   alternation. ugrep defaults to ERE where `|` is alternation and `\|` is a
- *   literal pipe. Without -G, `grep "foo\|bar"` silently returns zero results.
- *   User-supplied `-E`, `-F`, or `-P` later in argv overrides this.
- * - `--ignore-files`: respect .gitignore (GrepTool uses rg's default, which
- *   respects gitignore). Override with `grep --no-ignore-files`.
- * - `--hidden`: include hidden files (GrepTool passes `--hidden` to rg).
- *   Override with `grep --no-hidden`.
- * - `--exclude-dir` for VCS dirs: GrepTool passes `--glob '!.git'` etc. to rg.
- * - `-I`: skip binary files. rg's recursion silently skips binary matches
- *   by default (different from direct-file-arg behavior); ugrep doesn't, so
- *   we inject -I to match. Override with `grep -a`.
- *
- * Not replicated from GrepTool:
- * - `--max-columns 500`: ugrep's `--width` hard-truncates output which could
- *   break pipelines; rg's version replaces the line with a placeholder.
- * - Read deny rules / plugin cache exclusions: require toolPermissionContext
- *   which isn't available at shell-snapshot creation time.
- *
- * Returns null if embedded search tools are not available in this build.
+ * 生成的 find 函数包装 bfs，注入 `-regextype findutils-default` 以匹配
+ * GlobTool 的正则语义；生成的 grep 函数包装 ugrep，注入 `-G`（BRE 模式）、
+ * `--ignore-files`、`--hidden`、`-I` 以及各 VCS 目录的 `--exclude-dir`，
+ * 与 GrepTool 的行为保持一致。
+ * 函数定义前先执行 `unalias find/grep` 以防用户别名（如 `alias find=gfind`）绕过覆盖。
  */
 export function createFindGrepShellIntegration(): string | null {
   if (!hasEmbeddedSearchTools()) {
@@ -178,6 +165,12 @@ export function createFindGrepShellIntegration(): string | null {
   ].join('\n')
 }
 
+/**
+ * 根据 shell 路径推断对应的用户配置文件路径（.zshrc / .bashrc / .profile）。
+ * 以 shell 路径中是否含有 'zsh' 或 'bash' 字样来判断 shell 类型；
+ * 对于其他 shell（如 sh、fish），回退到 .profile。
+ * 返回拼接了用户主目录的完整配置文件路径，供 getSnapshotScript() 决定是否 source。
+ */
 function getConfigFile(shellPath: string): string {
   const fileName = shellPath.includes('zsh')
     ? '.zshrc'
@@ -191,8 +184,14 @@ function getConfigFile(shellPath: string): string {
 }
 
 /**
- * Generates user-specific snapshot content (functions, options, aliases)
- * This content is derived from the user's shell configuration file
+ * 生成捕获用户 shell 环境（函数、选项、别名）的脚本片段。
+ * 仅在用户配置文件存在时调用，针对 zsh 和 bash 分别生成对应的捕获命令：
+ * - 函数：zsh 用 `typeset -f`，bash 用 `declare -F` + base64 编码（避免特殊字符损坏）
+ * - Shell 选项：zsh 用 `setopt`，bash 用 `shopt -p` + `set -o`，
+ *   bash 额外追加 `shopt -s expand_aliases` 以确保别名在子 shell 中生效
+ * - 别名：两者均通过 `alias` 命令导出；在 Windows（msys/cygwin）上过滤
+ *   `winpty` 别名，防止无 TTY 时出现"stdin is not a tty"错误
+ * 输出写入环境变量 $SNAPSHOT_FILE 指定的文件，每节以注释行分隔。
  */
 function getUserSnapshotContent(configFile: string): string {
   const isZsh = configFile.endsWith('.zshrc')
@@ -263,8 +262,14 @@ function getUserSnapshotContent(configFile: string): string {
 }
 
 /**
- * Generates Claude Code specific snapshot content
- * This content is always included regardless of user configuration
+ * 生成 Claude Code 专属的快照内容（与用户配置无关，始终注入）。
+ * 主要包含：
+ * 1. rg 可用性检测：若系统 rg 不存在，写入 rg 的 alias 或函数定义（嵌入式/系统两种）。
+ *    检测前先在子 shell 中 `unalias rg`，防止用户 `alias rg='rg --smart-case'` 遮蔽真实二进制。
+ * 2. find/grep 覆盖（ant-native 构建）：无条件写入 bfs/ugrep 的 shell 函数，
+ *    替换系统 find/grep 以匹配 GlobTool/GrepTool 的语义与性能。
+ * 3. PATH 导出：将当前进程的 PATH（Windows 下读取 Cygwin PATH）写入快照，
+ *    确保子 shell 能找到所有已知命令。
  */
 async function getClaudeCodeSnapshotContent(): Promise<string> {
   // Get the appropriate PATH based on platform
@@ -340,7 +345,14 @@ FIND_GREP_FUNC_END
 }
 
 /**
- * Creates the appropriate shell script for capturing environment
+ * 组合完整的快照脚本：source 用户配置 → 清空快照文件 → 写入环境数据。
+ * 脚本结构：
+ * 1. 若配置文件存在，先 `source "<configFile>" < /dev/null` 加载用户环境。
+ * 2. 创建或清空 $SNAPSHOT_FILE（使用 `>|` 强制覆盖，跳过 noclobber 选项）。
+ * 3. 写入 `unalias -a` 以避免函数定义捕获时别名冻结导致的意外行为。
+ * 4. 写入 getUserSnapshotContent()（函数、选项、别名）。
+ * 5. 写入 getClaudeCodeSnapshotContent()（PATH、rg/find/grep 集成）。
+ * 6. 校验快照文件已生成，否则输出错误并以退出码 1 退出。
  */
 async function getSnapshotScript(
   shellPath: string,
@@ -386,29 +398,19 @@ async function getSnapshotScript(
 }
 
 /**
- * Creates and saves the shell environment snapshot by loading the user's shell configuration
+ * 创建并保存 shell 环境快照，返回快照文件路径；失败时返回 undefined。
  *
- * This function is a critical part of Claude CLI's shell integration strategy. It:
+ * 完整执行流程：
+ * 1. 根据 binShell 路径推断 shellType（zsh/bash/sh）。
+ * 2. 调用 getConfigFile() 定位用户配置文件，并检查其是否存在。
+ * 3. 在 ~/.claude/shell-snapshots/ 下生成带时间戳和随机 ID 的快照文件名。
+ * 4. 调用 getSnapshotScript() 构建快照脚本，通过 execFile() 在用户 shell 中执行。
+ *    执行时注入 CLAUDECODE=1、GIT_EDITOR=true 等环境变量；超时 10 秒。
+ * 5. 执行成功后通过 registerCleanup() 注册进程退出时删除快照文件的清理钩子。
+ * 6. 执行失败时记录详细调试日志、上报 analytics 事件，并 resolve(undefined)。
  *
- * 1. Identifies the user's shell config file (.zshrc, .bashrc, etc.)
- * 2. Creates a temporary script that sources this configuration file
- * 3. Captures the resulting shell environment state including:
- *    - Functions defined in the user's shell configuration
- *    - Shell options and settings that affect command behavior
- *    - Aliases that the user has defined
- *
- * The snapshot is saved to a temporary file that can be sourced by subsequent shell
- * commands, ensuring they run with the user's expected environment, aliases, and functions.
- *
- * This approach allows Claude CLI to execute commands as if they were run in the user's
- * interactive shell, while avoiding the overhead of creating a new login shell for each command.
- * It handles both Bash and Zsh shells with their different syntax for functions, options, and aliases.
- *
- * If the snapshot creation fails (e.g., timeout, permissions issues), the CLI will still
- * function but without the user's custom shell environment, potentially missing aliases
- * and functions the user relies on.
- *
- * @returns Promise that resolves to the snapshot file path or undefined if creation failed
+ * @param binShell 用户 shell 的完整路径（如 /bin/zsh）
+ * @returns 快照文件的绝对路径，或创建失败时的 undefined
  */
 export const createAndSaveSnapshot = async (
   binShell: string,

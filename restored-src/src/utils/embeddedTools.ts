@@ -1,3 +1,10 @@
+/**
+ * 内嵌工具检测模块。
+ *
+ * 在 Claude Code 系统中，该模块检测当前 Bun 构建是否内嵌了 bfs/ugrep 等工具：
+ * - hasEmbeddedBfs()：判断当前构建是否包含内嵌的 bfs（ant-native 独有）
+ * - hasEmbeddedUgrep()：判断当前构建是否包含内嵌的 ugrep（ant-native 独有）
+ */
 import { isEnvTruthy } from './envUtils.js'
 
 /**

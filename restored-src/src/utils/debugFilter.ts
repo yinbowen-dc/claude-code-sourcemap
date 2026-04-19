@@ -1,3 +1,11 @@
+/**
+ * 调试过滤器模块。
+ *
+ * 在 Claude Code 系统中，该模块解析并缓存 DEBUG 环境变量的过滤配置，
+ * 提供 include/exclude 规则判断调试日志消息是否应被记录：
+ * - parseDebugFilter()：解析 DEBUG 环境变量为 DebugFilter 对象
+ * - shouldLog()：根据过滤规则判断消息是否应输出
+ */
 import memoize from 'lodash-es/memoize.js'
 
 export type DebugFilter = {

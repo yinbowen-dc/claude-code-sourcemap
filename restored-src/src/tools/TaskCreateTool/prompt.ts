@@ -1,12 +1,48 @@
+/**
+ * TaskCreateTool/prompt.ts — 任务创建工具的提示词构建
+ *
+ * 在 Claude Code 系统流程中的位置：
+ *   工具层（Tools Layer）→ TaskCreateTool 子模块 → 提示词层
+ *
+ * 主要功能：
+ *   - 导出工具功能简介（DESCRIPTION）
+ *   - 动态构建工具系统提示词（getPrompt），根据是否启用多智能体集群功能决定是否插入 teammate 相关内容
+ *
+ * 设计说明：
+ *   - isAgentSwarmsEnabled()：运行时检查，决定是否添加 teammate 任务分配说明和建议
+ *   - 不启用 swarms 时，提示词专注于单智能体任务管理
+ *   - 启用 swarms 时，追加 teammate 任务分配建议和描述详细度要求
+ */
+
 import { isAgentSwarmsEnabled } from '../../utils/agentSwarmsEnabled.js'
 
+// 工具功能的静态简介，供工具列表和自动分类器使用
 export const DESCRIPTION = 'Create a new task in the task list'
 
+/**
+ * 动态构建 TaskCreate 工具的系统提示词
+ *
+ * 整体流程：
+ *   1. 检查 isAgentSwarmsEnabled() 决定是否追加 teammate 相关文本
+ *   2. 构建 teammateContext（追加到"复杂任务"使用场景描述末尾）
+ *   3. 构建 teammateTips（追加到提示技巧章节）
+ *   4. 将以上内容嵌入完整的 Markdown 提示词模板中并返回
+ *
+ * 提示词包含以下核心章节：
+ *   - 使用场景（When to Use This Tool）：多步骤、复杂任务、规划模式、用户明确要求等
+ *   - 不使用的场景（When NOT to Use This Tool）：单步骤、琐碎任务等
+ *   - 任务字段说明（Task Fields）：subject、description、activeForm
+ *   - 使用技巧（Tips）：含可选 teammate 分配建议
+ *
+ * @returns 完整的提示词字符串
+ */
 export function getPrompt(): string {
+  // 启用多智能体集群时，在使用场景描述中追加"可分配给 teammate"的说明
   const teammateContext = isAgentSwarmsEnabled()
     ? ' and potentially assigned to teammates'
     : ''
 
+  // 启用多智能体集群时，在 Tips 章节追加 teammate 任务描述详细度和分配方式说明
   const teammateTips = isAgentSwarmsEnabled()
     ? `- Include enough detail in the description for another agent to understand and complete the task
 - New tasks are created with status 'pending' and no owner - use TaskUpdate with the \`owner\` parameter to assign them
